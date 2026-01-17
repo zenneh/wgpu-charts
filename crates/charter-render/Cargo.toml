@@ -1,0 +1,13 @@
+[package]
+name = "charter-render"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+charter-core.workspace = true
+charter-indicators.workspace = true
+charter-ta.workspace = true
+wgpu.workspace = true
+bytemuck.workspace = true
+anyhow.workspace = true
+log.workspace = true

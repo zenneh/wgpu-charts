@@ -1,19 +1,37 @@
-[package]
-name = "charter"
+[workspace]
+resolver = "3"
+members = [
+    "crates/charter-core",
+    "crates/charter-data",
+    "crates/charter-indicators",
+    "crates/charter-render",
+    "crates/charter-ui",
+    "crates/charter-ta",
+    "crates/charter",
+]
+
+[workspace.package]
 version = "0.1.0"
 edition = "2024"
 
-[dependencies]
+[workspace.dependencies]
+# Internal crates
+charter-core = { path = "crates/charter-core" }
+charter-data = { path = "crates/charter-data" }
+charter-indicators = { path = "crates/charter-indicators" }
+charter-render = { path = "crates/charter-render" }
+charter-ui = { path = "crates/charter-ui" }
+charter-ta = { path = "crates/charter-ta" }
+
+# External dependencies
 wgpu = "24.0.0"
 winit = { version = "0.30", features = ["android-native-activity"] }
 env_logger = "0.10"
 log = "0.4"
 pollster = "0.3"
-snafu = "0.8.9"
 anyhow = "1.0.100"
-bytemuck = { version = "1.24", features = [ "derive" ] }
+bytemuck = { version = "1.24", features = ["derive"] }
 csv = "1.3"
 egui = "0.31"
 egui-wgpu = "0.31"
 egui-winit = "0.31"
-

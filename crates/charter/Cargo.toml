@@ -1,0 +1,26 @@
+[package]
+name = "charter"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "charter"
+path = "src/main.rs"
+
+[dependencies]
+charter-core.workspace = true
+charter-data.workspace = true
+charter-indicators.workspace = true
+charter-render.workspace = true
+charter-ta.workspace = true
+charter-ui.workspace = true
+wgpu.workspace = true
+winit.workspace = true
+env_logger.workspace = true
+log.workspace = true
+pollster.workspace = true
+anyhow.workspace = true
+egui.workspace = true
+egui-wgpu.workspace = true
+egui-winit.workspace = true
+bytemuck.workspace = true

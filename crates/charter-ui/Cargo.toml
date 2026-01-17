@@ -1,0 +1,10 @@
+[package]
+name = "charter-ui"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+charter-core.workspace = true
+charter-indicators.workspace = true
+charter-render.workspace = true
+egui.workspace = true

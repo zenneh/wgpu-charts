@@ -1,0 +1,7 @@
+[package]
+name = "charter-indicators"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+charter-core.workspace = true

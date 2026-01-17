@@ -1,0 +1,9 @@
+[package]
+name = "charter-data"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+charter-core.workspace = true
+csv.workspace = true
+anyhow.workspace = true

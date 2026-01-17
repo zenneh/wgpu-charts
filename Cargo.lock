@@ -317,16 +317,70 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "bytemuck",
- "csv",
+ "charter-core",
+ "charter-data",
+ "charter-indicators",
+ "charter-render",
+ "charter-ta",
+ "charter-ui",
  "egui",
  "egui-wgpu",
  "egui-winit",
  "env_logger",
  "log",
  "pollster",
- "snafu",
  "wgpu",
  "winit",
+]
+
+[[package]]
+name = "charter-core"
+version = "0.1.0"
+
+[[package]]
+name = "charter-data"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "charter-core",
+ "csv",
+]
+
+[[package]]
+name = "charter-indicators"
+version = "0.1.0"
+dependencies = [
+ "charter-core",
+]
+
+[[package]]
+name = "charter-render"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "bytemuck",
+ "charter-core",
+ "charter-indicators",
+ "charter-ta",
+ "log",
+ "wgpu",
+]
+
+[[package]]
+name = "charter-ta"
+version = "0.1.0"
+dependencies = [
+ "charter-core",
+]
+
+[[package]]
+name = "charter-ui"
+version = "0.1.0"
+dependencies = [
+ "charter-core",
+ "charter-indicators",
+ "charter-render",
+ "egui",
 ]
 
 [[package]]
@@ -2132,27 +2186,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "dd538fb6910ac1099850255cf94a94df6551fbdd602454387d0adb2d1ca6dead"
 dependencies = [
  "serde",
-]
-
-[[package]]
-name = "snafu"
-version = "0.8.9"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6e84b3f4eacbf3a1ce05eac6763b4d629d60cbc94d632e4092c54ade71f1e1a2"
-dependencies = [
- "snafu-derive",
-]
-
-[[package]]
-name = "snafu-derive"
-version = "0.8.9"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c1c97747dbf44bb1ca44a561ece23508e99cb592e862f22222dcf42f51d1e451"
-dependencies = [
- "heck",
- "proc-macro2",
- "quote",
- "syn",
 ]
 
 [[package]]

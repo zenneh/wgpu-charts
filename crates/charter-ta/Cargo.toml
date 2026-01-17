@@ -1,0 +1,10 @@
+[package]
+name = "charter-ta"
+version.workspace = true
+edition.workspace = true
+description = "Rule-based technical analysis for charter"
+
+[dependencies]
+charter-core.workspace = true
+
+[dev-dependencies]
