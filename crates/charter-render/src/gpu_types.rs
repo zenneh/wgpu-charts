@@ -317,43 +317,78 @@ pub struct TrendGpu {
 // Level of Detail (LOD) System
 // ============================================================================
 
-/// LOD levels for candle aggregation.
-/// Each level aggregates N candles into 1.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum LodLevel {
-    /// Full resolution - every candle.
-    Full,
-    /// 10:1 aggregation (10 candles → 1).
-    Low,
-    /// 100:1 aggregation (100 candles → 1).
-    VeryLow,
+/// Configuration for LOD system.
+#[derive(Debug, Clone)]
+pub struct LodConfig {
+    /// LOD factors to generate (e.g., [2, 5, 10, 25, 50, 100, 250, 500]).
+    /// These define the aggregation ratios: factor N means N candles → 1.
+    pub factors: Vec<usize>,
+    /// Minimum candles per pixel thresholds for each LOD level.
+    /// Should have same length as factors. If candles_per_pixel exceeds
+    /// threshold[i], use factors[i].
+    pub thresholds: Vec<f32>,
 }
 
-impl LodLevel {
-    /// Returns the aggregation factor for this LOD level.
-    pub fn factor(&self) -> usize {
-        match self {
-            LodLevel::Full => 1,
-            LodLevel::Low => 10,
-            LodLevel::VeryLow => 100,
-        }
+impl Default for LodConfig {
+    fn default() -> Self {
+        Self::logarithmic(2, 50000, 16)
+    }
+}
+
+impl LodConfig {
+    /// Returns all configured LOD factors.
+    pub fn factors(&self) -> &[usize] {
+        &self.factors
     }
 
-    /// Returns all LOD levels in order.
-    pub fn all() -> [LodLevel; 3] {
-        [LodLevel::Full, LodLevel::Low, LodLevel::VeryLow]
+    /// Choose appropriate LOD factor based on candles per pixel density.
+    pub fn factor_for_density(&self, candles_per_pixel: f32) -> usize {
+        // Find the highest threshold that's exceeded
+        for (i, &threshold) in self.thresholds.iter().enumerate().rev() {
+            if candles_per_pixel > threshold {
+                return self.factors[i];
+            }
+        }
+        // Default to full resolution
+        1
     }
 
-    /// Choose appropriate LOD based on candles per pixel.
-    /// When many candles map to one pixel, use lower LOD.
-    pub fn for_density(candles_per_pixel: f32) -> LodLevel {
-        if candles_per_pixel > 50.0 {
-            LodLevel::VeryLow
-        } else if candles_per_pixel > 5.0 {
-            LodLevel::Low
-        } else {
-            LodLevel::Full
+    /// Create a configuration with evenly spaced factors in log scale.
+    pub fn logarithmic(min_factor: usize, max_factor: usize, num_levels: usize) -> Self {
+        if num_levels == 0 {
+            return Self::default();
         }
+
+        let min_log = (min_factor as f32).ln();
+        let max_log = (max_factor as f32).ln();
+        let step = (max_log - min_log) / (num_levels as f32);
+
+        let mut factors = Vec::with_capacity(num_levels);
+        let mut thresholds = Vec::with_capacity(num_levels);
+
+        for i in 0..num_levels {
+            let factor = (min_log + step * (i as f32 + 1.0)).exp().round() as usize;
+            factors.push(factor);
+            // Threshold is roughly half the factor (when you have factor/2 candles per pixel, switch to this LOD)
+            thresholds.push((factor as f32) / 2.0);
+        }
+
+        Self { factors, thresholds }
+    }
+
+    /// Create a configuration with linear spacing between factors.
+    pub fn linear(min_factor: usize, max_factor: usize, step: usize) -> Self {
+        let mut factors = Vec::new();
+        let mut thresholds = Vec::new();
+
+        let mut factor = min_factor;
+        while factor <= max_factor {
+            factors.push(factor);
+            thresholds.push((factor as f32) / 2.0);
+            factor += step;
+        }
+
+        Self { factors, thresholds }
     }
 }
 
