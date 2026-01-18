@@ -376,17 +376,24 @@ pub fn aggregate_candles_lod(candles: &[CandleGpu], factor: usize) -> Vec<Candle
 }
 
 /// Aggregates volume for LOD rendering.
-pub fn aggregate_volume_lod(volumes: &[VolumeGpu], factor: usize) -> Vec<VolumeGpu> {
+/// The is_bullish flag is determined by comparing the aggregated period's
+/// first open price with the last close price (net price movement).
+pub fn aggregate_volume_lod(volumes: &[VolumeGpu], candles: &[CandleGpu], factor: usize) -> Vec<VolumeGpu> {
     if factor <= 1 {
         return volumes.to_vec();
     }
 
     volumes
         .chunks(factor)
-        .map(|chunk| {
-            let total_volume: f32 = chunk.iter().map(|v| v.volume).sum();
-            // Use the last candle's direction for the aggregated bar
-            let is_bullish = chunk.last().map(|v| v.is_bullish).unwrap_or(1);
+        .zip(candles.chunks(factor))
+        .map(|(vol_chunk, candle_chunk)| {
+            let total_volume: f32 = vol_chunk.iter().map(|v| v.volume).sum();
+
+            // Calculate is_bullish based on aggregated open/close
+            let open = candle_chunk.first().map(|c| c.open).unwrap_or(0.0);
+            let close = candle_chunk.last().map(|c| c.close).unwrap_or(0.0);
+            let is_bullish = if close >= open { 1 } else { 0 };
+
             VolumeGpu {
                 volume: total_volume,
                 is_bullish,

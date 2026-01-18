@@ -298,7 +298,7 @@ impl ChartRenderer {
                 // Aggregate then pack for LOD
                 let lod_candles_gpu = aggregate_candles_lod(&candles_gpu, factor);
                 let lod_packed = price_normalization.pack_candles_gpu(&lod_candles_gpu);
-                let lod_volume = aggregate_volume_lod(&volume_gpu, factor);
+                let lod_volume = aggregate_volume_lod(&volume_gpu, &candles_gpu, factor);
                 let lod_max_volume = lod_volume.iter().map(|v| v.volume).fold(0.0f32, f32::max);
 
                 let lod_candle_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
