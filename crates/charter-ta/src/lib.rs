@@ -47,20 +47,22 @@
 //!
 //! Levels are derived from completed ranges:
 //!
-//! - **Bearish ranges** create resistance levels:
-//!   - Hold level: `min(first_candle_low, last_candle_low)`
-//!   - Greedy hold: `max(first_candle_low, last_candle_low)`
-//!
-//! - **Bullish ranges** create support levels:
+//! - **Bearish ranges** create levels at the highs:
 //!   - Hold level: `max(first_candle_high, last_candle_high)`
 //!   - Greedy hold: `min(first_candle_high, last_candle_high)`
+//!
+//! - **Bullish ranges** create levels at the lows:
+//!   - Hold level: `min(first_candle_low, last_candle_low)`
+//!   - Greedy hold: `max(first_candle_low, last_candle_low)`
 //!
 //! ## Level Interactions
 //!
 //! Levels track how price interacts with them:
 //!
-//! - **Hit**: The wick touches the level, but the body closes on the
-//!   "safe" side (doesn't break through).
+//! - **Bearish level hit**: The wick touches or goes below the level,
+//!   but the body closes above.
+//! - **Bullish level hit**: The wick touches or goes above the level,
+//!   but the body closes below.
 //! - **Broken**: The full body (both open and close) moves through the level.
 //!
 //! # Rules Engine
@@ -97,7 +99,7 @@ pub mod types;
 pub use analyzer::{Analyzer, AnalyzerBuilder, AnalyzerConfig, AnalysisResult};
 pub use types::{
     CandleDirection, CandleMetadata, Level, LevelEvent, LevelHit, LevelId, LevelState, LevelType,
-    Range, RangeId,
+    Range, RangeId, Trend, TrendEvent, TrendHit, TrendId, TrendState,
 };
 
 // Re-export commonly used rules

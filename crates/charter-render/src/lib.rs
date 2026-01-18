@@ -8,8 +8,9 @@ pub mod renderer;
 pub use camera::{Camera, CameraUniform};
 pub use gpu_types::{
     aggregate_candles_lod, aggregate_volume_lod, CandleGpu, GuidelineGpu, GuidelineParams,
-    LevelGpu, LodLevel, RangeGpu, RenderParams, TaRenderParams, VolumeGpu, VolumeRenderParams,
-    MAX_GUIDELINES, MAX_TA_LEVELS, MAX_TA_RANGES,
+    LevelGpu, LodLevel, PackedCandleGpu, PriceNormalization, RangeGpu, RenderParams,
+    TaRenderParams, TrendGpu, VolumeGpu, VolumeRenderParams, MAX_GUIDELINES, MAX_TA_LEVELS,
+    MAX_TA_RANGES, MAX_TA_TRENDS,
 };
 pub use pipeline::{
     CandlePipeline, GuidelinePipeline, IndicatorPipeline, TaPipeline, VolumePipeline,

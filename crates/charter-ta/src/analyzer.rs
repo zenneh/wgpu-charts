@@ -4,7 +4,8 @@ use charter_core::Candle;
 
 use crate::rules::RuleContext;
 use crate::types::{
-    CandleMetadata, Level, LevelEvent, LevelId, LevelTracker, Range, RangeBuilder,
+    CandleMetadata, Level, LevelEvent, LevelId, OptimizedLevelTracker, Range, RangeBuilder,
+    Trend, TrendEvent, TrendId, TrendTracker,
 };
 
 /// Configuration for the analyzer.
@@ -67,6 +68,10 @@ pub struct AnalysisResult {
     pub created_levels: Vec<LevelId>,
     /// Level events (hits, breaks) that occurred.
     pub level_events: Vec<LevelEvent>,
+    /// Trends that were created on this candle.
+    pub created_trends: Vec<TrendId>,
+    /// Trend events (hits, breaks) that occurred.
+    pub trend_events: Vec<TrendEvent>,
 }
 
 impl AnalysisResult {
@@ -83,11 +88,16 @@ impl AnalysisResult {
     pub fn has_level_events(&self) -> bool {
         !self.level_events.is_empty()
     }
+
+    /// Check if any trend events occurred.
+    pub fn has_trend_events(&self) -> bool {
+        !self.trend_events.is_empty()
+    }
 }
 
 /// Main analyzer for technical analysis.
 ///
-/// Processes candles incrementally and tracks ranges, levels, and their interactions.
+/// Processes candles incrementally and tracks ranges, levels, trends, and their interactions.
 pub struct Analyzer {
     config: AnalyzerConfig,
 
@@ -101,8 +111,11 @@ pub struct Analyzer {
     /// All completed ranges.
     ranges: Vec<Range>,
 
-    /// Tracker for active levels.
-    level_tracker: LevelTracker,
+    /// Tracker for active levels (optimized with price bucketing).
+    level_tracker: OptimizedLevelTracker,
+
+    /// Tracker for active trends.
+    trend_tracker: TrendTracker,
 }
 
 impl Analyzer {
@@ -113,7 +126,8 @@ impl Analyzer {
 
     /// Create a new analyzer with custom configuration.
     pub fn with_config(config: AnalyzerConfig) -> Self {
-        let level_tracker = LevelTracker::new(config.level_tolerance, config.create_greedy_levels);
+        let level_tracker = OptimizedLevelTracker::new(config.level_tolerance, config.create_greedy_levels);
+        let trend_tracker = TrendTracker::new(config.level_tolerance);
         let range_builder = RangeBuilder::new(config.doji_threshold);
 
         Self {
@@ -123,6 +137,7 @@ impl Analyzer {
             range_builder,
             ranges: Vec::new(),
             level_tracker,
+            trend_tracker,
         }
     }
 
@@ -137,6 +152,11 @@ impl Analyzer {
     pub fn process_candle(&mut self, candle: Candle) -> AnalysisResult {
         let index = self.candles.len();
         let mut result = AnalysisResult::new();
+
+        // Initialize bucket size on first candle (0.1% of reference price)
+        if index == 0 {
+            self.level_tracker.initialize_bucket_size(candle.close);
+        }
 
         // Compute and store metadata
         let meta = CandleMetadata::from_candle(&candle, self.config.doji_threshold);
@@ -157,6 +177,14 @@ impl Analyzer {
                     result.level_events.push(LevelEvent::Created { level_id: level.id });
                 }
 
+                // Process trend detection (requires two consecutive same-direction ranges)
+                if let Some(trend_event) = self.trend_tracker.process_range(&completed_range, index) {
+                    if let TrendEvent::Created { trend_id } = trend_event {
+                        result.created_trends.push(trend_id);
+                    }
+                    result.trend_events.push(trend_event);
+                }
+
                 result.completed_ranges.push(completed_range.clone());
                 self.ranges.push(completed_range);
             }
@@ -165,6 +193,10 @@ impl Analyzer {
         // Check level interactions
         let level_events = self.level_tracker.check_interactions(index, &self.candles[index]);
         result.level_events.extend(level_events);
+
+        // Check trend interactions
+        let trend_events = self.trend_tracker.check_interactions(index, &self.candles[index]);
+        result.trend_events.extend(trend_events);
 
         result
     }
@@ -231,9 +263,34 @@ impl Analyzer {
         self.level_tracker.levels.iter().find(|l| l.id == id)
     }
 
+    /// Get all active (non-broken) trends.
+    pub fn active_trends(&self) -> impl Iterator<Item = &Trend> {
+        self.trend_tracker.active_trends()
+    }
+
+    /// Get all trends (including broken ones).
+    pub fn all_trends(&self) -> &[Trend] {
+        &self.trend_tracker.trends
+    }
+
+    /// Get a specific trend by ID.
+    pub fn trend(&self, id: TrendId) -> Option<&Trend> {
+        self.trend_tracker.trends.iter().find(|t| t.id == id)
+    }
+
+    /// Number of active trends.
+    pub fn active_trend_count(&self) -> usize {
+        self.trend_tracker.trends.iter().filter(|t| t.is_active()).count()
+    }
+
     /// Remove broken levels from tracking.
     pub fn prune_broken_levels(&mut self) {
         self.level_tracker.prune_broken();
+    }
+
+    /// Remove broken trends from tracking.
+    pub fn prune_broken_trends(&mut self) {
+        self.trend_tracker.prune_broken();
     }
 
     /// Reset the analyzer to initial state.
@@ -243,6 +300,7 @@ impl Analyzer {
         self.range_builder.reset();
         self.ranges.clear();
         self.level_tracker.clear();
+        self.trend_tracker.clear();
     }
 
     /// Get the current configuration.

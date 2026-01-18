@@ -2,7 +2,7 @@
 
 use charter_core::Candle;
 
-/// GPU-compatible candle data for storage buffer.
+/// GPU-compatible candle data for storage buffer (16 bytes).
 #[repr(C)]
 #[derive(Debug, Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct CandleGpu {
@@ -20,6 +20,104 @@ impl From<&Candle> for CandleGpu {
             low: c.low,
             close: c.close,
         }
+    }
+}
+
+/// Packed GPU-compatible candle data (8 bytes) - 50% memory reduction.
+/// Values are normalized to u16 (0-65535) based on price_min and price_range.
+/// Shader denormalizes: price = price_min + (packed_value / 65535.0) * price_range
+#[repr(C)]
+#[derive(Debug, Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct PackedCandleGpu {
+    pub open: u16,
+    pub high: u16,
+    pub low: u16,
+    pub close: u16,
+}
+
+impl PackedCandleGpu {
+    /// Create a packed candle from normalized values.
+    pub fn from_normalized(open: f32, high: f32, low: f32, close: f32) -> Self {
+        Self {
+            open: (open.clamp(0.0, 1.0) * 65535.0) as u16,
+            high: (high.clamp(0.0, 1.0) * 65535.0) as u16,
+            low: (low.clamp(0.0, 1.0) * 65535.0) as u16,
+            close: (close.clamp(0.0, 1.0) * 65535.0) as u16,
+        }
+    }
+}
+
+/// Normalization parameters for packed candles.
+#[derive(Debug, Clone, Copy)]
+pub struct PriceNormalization {
+    pub price_min: f32,
+    pub price_range: f32, // price_max - price_min
+}
+
+impl PriceNormalization {
+    /// Compute normalization parameters from candles.
+    pub fn from_candles(candles: &[Candle]) -> Self {
+        if candles.is_empty() {
+            return Self {
+                price_min: 0.0,
+                price_range: 1.0,
+            };
+        }
+
+        let mut min_price = f32::MAX;
+        let mut max_price = f32::MIN;
+
+        for c in candles {
+            min_price = min_price.min(c.low);
+            max_price = max_price.max(c.high);
+        }
+
+        // Add small padding to avoid edge cases
+        let padding = (max_price - min_price) * 0.001;
+        min_price -= padding;
+        max_price += padding;
+
+        let range = (max_price - min_price).max(0.001); // Avoid division by zero
+
+        Self {
+            price_min: min_price,
+            price_range: range,
+        }
+    }
+
+    /// Normalize a price value to 0.0-1.0 range.
+    pub fn normalize(&self, price: f32) -> f32 {
+        (price - self.price_min) / self.price_range
+    }
+
+    /// Pack candles using this normalization.
+    pub fn pack_candles(&self, candles: &[Candle]) -> Vec<PackedCandleGpu> {
+        candles
+            .iter()
+            .map(|c| {
+                PackedCandleGpu::from_normalized(
+                    self.normalize(c.open),
+                    self.normalize(c.high),
+                    self.normalize(c.low),
+                    self.normalize(c.close),
+                )
+            })
+            .collect()
+    }
+
+    /// Pack CandleGpu values using this normalization.
+    pub fn pack_candles_gpu(&self, candles: &[CandleGpu]) -> Vec<PackedCandleGpu> {
+        candles
+            .iter()
+            .map(|c| {
+                PackedCandleGpu::from_normalized(
+                    self.normalize(c.open),
+                    self.normalize(c.high),
+                    self.normalize(c.low),
+                    self.normalize(c.close),
+                )
+            })
+            .collect()
     }
 }
 
@@ -68,6 +166,11 @@ pub struct RenderParams {
     /// Visible Y range for GPU-side culling.
     pub y_min: f32,
     pub y_max: f32,
+    /// Price denormalization: price = price_min + normalized * price_range
+    pub price_min: f32,
+    pub price_range: f32,
+    pub _padding1: f32,
+    pub _padding2: f32,
 }
 
 /// Guideline GPU struct (16 bytes aligned).
@@ -168,21 +271,47 @@ pub struct TaRenderParams {
     pub range_thickness: f32,
     /// Line thickness for levels.
     pub level_thickness: f32,
-    /// X max for level lines (right edge of chart).
+    /// X max for level/trend lines (right edge of chart).
     pub x_max: f32,
     /// Number of ranges to render.
     pub range_count: u32,
     /// Number of levels to render.
     pub level_count: u32,
-    /// Padding.
-    pub _padding: u32,
+    /// Number of trends to render.
+    pub trend_count: u32,
 }
 
 /// Maximum number of ranges that can be rendered at once.
-pub const MAX_TA_RANGES: usize = 256;
+pub const MAX_TA_RANGES: usize = 4096;
 
 /// Maximum number of levels that can be rendered at once.
-pub const MAX_TA_LEVELS: usize = 128;
+pub const MAX_TA_LEVELS: usize = 4096;
+
+/// Maximum number of trends that can be rendered at once.
+pub const MAX_TA_TRENDS: usize = 2048;
+
+/// GPU struct for rendering a trendline.
+/// Trendlines connect two points and extend to the right.
+#[repr(C)]
+#[derive(Debug, Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct TrendGpu {
+    /// Start X position (candle index * spacing).
+    pub x_start: f32,
+    /// Start Y position (price).
+    pub y_start: f32,
+    /// End X position (candle index * spacing).
+    pub x_end: f32,
+    /// End Y position (price).
+    pub y_end: f32,
+    /// Color red component.
+    pub r: f32,
+    /// Color green component.
+    pub g: f32,
+    /// Color blue component.
+    pub b: f32,
+    /// Alpha transparency.
+    pub a: f32,
+}
 
 // ============================================================================
 // Level of Detail (LOD) System

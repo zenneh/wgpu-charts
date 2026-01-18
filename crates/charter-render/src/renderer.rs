@@ -7,7 +7,8 @@ use charter_core::Candle;
 use crate::camera::{Camera, CameraUniform};
 use crate::gpu_types::{
     aggregate_candles_lod, aggregate_volume_lod, CandleGpu, GuidelineGpu, GuidelineParams,
-    LodLevel, RenderParams, VolumeGpu, VolumeRenderParams, MAX_GUIDELINES,
+    LodLevel, PackedCandleGpu, PriceNormalization, RenderParams, VolumeGpu, VolumeRenderParams,
+    MAX_GUIDELINES,
 };
 use crate::pipeline::{CandlePipeline, GuidelinePipeline, IndicatorPipeline, TaPipeline, VolumePipeline};
 use crate::{BASE_CANDLE_WIDTH, CANDLE_SPACING, MIN_CANDLE_PIXELS, STATS_PANEL_WIDTH, VOLUME_HEIGHT_RATIO};
@@ -26,13 +27,15 @@ pub struct LodData {
 /// Pre-computed timeframe data with GPU buffers for candles, volume, and TA.
 pub struct TimeframeData {
     pub candles: Vec<Candle>,
-    /// Full resolution candle buffer (LOD 0).
+    /// Full resolution candle buffer (LOD 0) - uses packed u16 format.
     pub candle_buffer: wgpu::Buffer,
     pub candle_bind_group: wgpu::BindGroup,
     pub volume_buffer: wgpu::Buffer,
     pub volume_bind_group: wgpu::BindGroup,
     pub count: u32,
     pub max_volume: f32,
+    /// Price normalization parameters for packed candles.
+    pub price_normalization: PriceNormalization,
     /// LOD levels for zoomed-out rendering.
     pub lod_levels: Vec<LodData>,
     /// Current LOD level being used.
@@ -40,10 +43,12 @@ pub struct TimeframeData {
     // TA data
     pub ta_range_buffer: wgpu::Buffer,
     pub ta_level_buffer: wgpu::Buffer,
+    pub ta_trend_buffer: wgpu::Buffer,
     pub ta_params_buffer: wgpu::Buffer,
     pub ta_bind_group: wgpu::BindGroup,
     pub ta_range_count: u32,
     pub ta_level_count: u32,
+    pub ta_trend_count: u32,
 }
 
 impl TimeframeData {
@@ -104,6 +109,7 @@ pub struct ChartRenderer {
     pub guideline_params_buffer: wgpu::Buffer,
     pub guideline_bind_group: wgpu::BindGroup,
     pub guideline_count: u32,
+    pub guideline_values: Vec<f32>, // Y-values for price labels
 
     pub visible_start: u32,
     pub visible_count: u32,
@@ -220,6 +226,7 @@ impl ChartRenderer {
             guideline_params_buffer,
             guideline_bind_group,
             guideline_count: 0,
+            guideline_values: Vec::new(),
             visible_start: 0,
             visible_count: 0,
             current_lod_factor: 1,
@@ -235,10 +242,22 @@ impl ChartRenderer {
         candles: Vec<Candle>,
         label: &str,
     ) -> TimeframeData {
-        let candles_gpu: Vec<CandleGpu> = candles.iter().map(CandleGpu::from).collect();
+        // Compute price normalization for packed candles (50% memory savings)
+        let price_normalization = PriceNormalization::from_candles(&candles);
+
+        // Pack candles to u16 format (8 bytes per candle instead of 16)
+        let packed_candles = price_normalization.pack_candles(&candles);
+
+        // Ensure we have at least one element for GPU buffers (wgpu doesn't allow zero-sized buffers)
+        let candles_for_buffer = if packed_candles.is_empty() {
+            vec![PackedCandleGpu { open: 0, high: 0, low: 0, close: 0 }]
+        } else {
+            packed_candles
+        };
+
         let candle_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some(&format!("Candle Buffer {}", label)),
-            contents: bytemuck::cast_slice(&candles_gpu),
+            contents: bytemuck::cast_slice(&candles_for_buffer),
             usage: wgpu::BufferUsages::STORAGE,
         });
 
@@ -250,9 +269,17 @@ impl ChartRenderer {
 
         let volume_gpu: Vec<VolumeGpu> = candles.iter().map(VolumeGpu::from_candle).collect();
         let max_volume = candles.iter().map(|c| c.volume).fold(0.0f32, f32::max);
+
+        // Ensure we have at least one element for GPU buffers
+        let volume_for_buffer = if volume_gpu.is_empty() {
+            vec![VolumeGpu { volume: 0.0, is_bullish: 1, _padding1: 0.0, _padding2: 0.0 }]
+        } else {
+            volume_gpu.clone()
+        };
+
         let volume_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some(&format!("Volume Buffer {}", label)),
-            contents: bytemuck::cast_slice(&volume_gpu),
+            contents: bytemuck::cast_slice(&volume_for_buffer),
             usage: wgpu::BufferUsages::STORAGE,
         });
 
@@ -262,19 +289,21 @@ impl ChartRenderer {
             &self.volume_params_buffer,
         );
 
-        // Create LOD levels for zoomed-out rendering
+        // Create LOD levels using packed candles
+        let candles_gpu: Vec<CandleGpu> = candles.iter().map(CandleGpu::from).collect();
         let mut lod_levels = Vec::new();
         for lod in [LodLevel::Low, LodLevel::VeryLow] {
             let factor = lod.factor();
             if candles_gpu.len() > factor * 10 {
-                // Only create LOD if we have enough candles to benefit
-                let lod_candles = aggregate_candles_lod(&candles_gpu, factor);
+                // Aggregate then pack for LOD
+                let lod_candles_gpu = aggregate_candles_lod(&candles_gpu, factor);
+                let lod_packed = price_normalization.pack_candles_gpu(&lod_candles_gpu);
                 let lod_volume = aggregate_volume_lod(&volume_gpu, factor);
                 let lod_max_volume = lod_volume.iter().map(|v| v.volume).fold(0.0f32, f32::max);
 
                 let lod_candle_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
                     label: Some(&format!("Candle Buffer {} LOD {}", label, factor)),
-                    contents: bytemuck::cast_slice(&lod_candles),
+                    contents: bytemuck::cast_slice(&lod_packed),
                     usage: wgpu::BufferUsages::STORAGE,
                 });
 
@@ -301,7 +330,7 @@ impl ChartRenderer {
                     candle_bind_group: lod_candle_bind_group,
                     volume_buffer: lod_volume_buffer,
                     volume_bind_group: lod_volume_bind_group,
-                    count: lod_candles.len() as u32,
+                    count: lod_packed.len() as u32,
                     max_volume: lod_max_volume,
                     factor,
                 });
@@ -311,13 +340,17 @@ impl ChartRenderer {
         // Create TA buffers (initially empty, will be populated later)
         let ta_range_buffer = self.ta_pipeline.create_range_buffer(device);
         let ta_level_buffer = self.ta_pipeline.create_level_buffer(device);
+        let ta_trend_buffer = self.ta_pipeline.create_trend_buffer(device);
         let ta_params_buffer = self.ta_pipeline.create_params_buffer(device);
         let ta_bind_group = self.ta_pipeline.create_bind_group(
             device,
             &ta_range_buffer,
             &ta_level_buffer,
             &ta_params_buffer,
+            &ta_trend_buffer,
         );
+
+        let count = candles.len() as u32;
 
         TimeframeData {
             candles,
@@ -325,16 +358,19 @@ impl ChartRenderer {
             candle_bind_group,
             volume_buffer,
             volume_bind_group,
-            count: candles_gpu.len() as u32,
+            count,
             max_volume,
+            price_normalization,
             lod_levels,
             current_lod: LodLevel::Full,
             ta_range_buffer,
             ta_level_buffer,
+            ta_trend_buffer,
             ta_params_buffer,
             ta_bind_group,
             ta_range_count: 0,
             ta_level_count: 0,
+            ta_trend_count: 0,
         }
     }
 
@@ -357,8 +393,9 @@ impl ChartRenderer {
 
         self.volume_camera.position[0] = self.camera.position[0];
         self.volume_camera.scale[0] = self.camera.scale[0];
-        let volume_aspect = chart_width / (self.config_height as f32 * VOLUME_HEIGHT_RATIO);
-        self.volume_camera_uniform.update_view_proj(&self.volume_camera, volume_aspect);
+        // Use the same aspect ratio as the chart for X alignment
+        // The Y scaling is handled by the volume camera's scale[1] and viewport
+        self.volume_camera_uniform.update_view_proj(&self.volume_camera, aspect);
         queue.write_buffer(
             &self.volume_camera_buffer,
             0,
@@ -411,15 +448,16 @@ impl ChartRenderer {
             0
         };
 
-        let world_units_per_pixel = visible_width / self.config_width as f32;
+        let world_units_per_pixel = visible_width / chart_width;
         let min_world_width = MIN_CANDLE_PIXELS * world_units_per_pixel;
         let candle_width = (BASE_CANDLE_WIDTH * self.current_lod_factor as f32).max(min_world_width);
 
-        let base_wick_width = effective_spacing * 0.08;
+        // Wick width: use a fraction of candle width, with minimum pixel visibility
+        let base_wick_width = candle_width * 0.15;
         let min_wick_width = 1.0 * world_units_per_pixel;
         let wick_width = base_wick_width.max(min_wick_width);
 
-        // Pass view bounds to shader for GPU-side culling
+        // Pass view bounds and price normalization to shader
         let render_params = RenderParams {
             first_visible: self.visible_start,
             candle_width,
@@ -429,6 +467,10 @@ impl ChartRenderer {
             x_max,
             y_min,
             y_max,
+            price_min: timeframe.price_normalization.price_min,
+            price_range: timeframe.price_normalization.price_range,
+            _padding1: 0.0,
+            _padding2: 0.0,
         };
 
         queue.write_buffer(
@@ -508,6 +550,7 @@ impl ChartRenderer {
         let line_thickness = (1.5 * world_units_per_pixel).max(price_range * 0.0005);
 
         self.guideline_count = guidelines.len() as u32;
+        self.guideline_values = guidelines.iter().map(|g| g.y_value).collect();
 
         while guidelines.len() < MAX_GUIDELINES {
             guidelines.push(GuidelineGpu {

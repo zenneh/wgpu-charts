@@ -131,6 +131,11 @@ impl CandlePipeline {
             x_max: f32::MAX,
             y_min: 0.0,
             y_max: f32::MAX,
+            // Default price normalization (will be updated per timeframe)
+            price_min: 0.0,
+            price_range: 1.0,
+            _padding1: 0.0,
+            _padding2: 0.0,
         };
         device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("Render Params Buffer"),

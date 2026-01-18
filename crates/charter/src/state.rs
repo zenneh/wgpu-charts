@@ -1,6 +1,8 @@
 //! Application state and orchestration.
 
+use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::Arc;
+use std::thread;
 use std::time::Instant;
 
 use winit::{
@@ -10,15 +12,75 @@ use winit::{
     window::Window,
 };
 
-use charter_core::{aggregate_candles, Timeframe};
+use charter_core::{aggregate_candles, Candle, Timeframe};
 use charter_data::CsvLoader;
 use charter_data::DataSource;
 use charter_render::{
-    ChartRenderer, LevelGpu, RangeGpu, TaRenderParams, TimeframeData, CANDLE_SPACING,
-    MAX_TA_LEVELS, MAX_TA_RANGES, STATS_PANEL_WIDTH, VERTICES_PER_CANDLE, VOLUME_HEIGHT_RATIO,
+    ChartRenderer, LevelGpu, RangeGpu, RenderParams, TaRenderParams, TimeframeData, TrendGpu,
+    VolumeRenderParams, CANDLE_SPACING, MAX_TA_LEVELS, MAX_TA_RANGES, MAX_TA_TRENDS,
+    STATS_PANEL_WIDTH, VERTICES_PER_CANDLE, VOLUME_HEIGHT_RATIO,
 };
-use charter_ta::{Analyzer, AnalyzerConfig, CandleDirection, Level, LevelState, LevelType, Range};
+use charter_ta::{
+    Analyzer, AnalyzerConfig, CandleDirection, Level, LevelState, LevelType, Range, Trend,
+    TrendState,
+};
 use charter_ui::StatsPanel;
+
+/// Loading state for background operations.
+#[derive(Debug, Clone, PartialEq)]
+pub enum LoadingState {
+    /// No loading in progress.
+    Idle,
+    /// Loading data from file.
+    LoadingData,
+    /// Aggregating timeframes.
+    AggregatingTimeframes { current: usize, total: usize },
+    /// Creating GPU buffers.
+    CreatingBuffers { current: usize, total: usize },
+    /// Computing technical analysis.
+    ComputingTa { timeframe: usize },
+}
+
+impl LoadingState {
+    pub fn is_loading(&self) -> bool {
+        !matches!(self, LoadingState::Idle)
+    }
+
+    pub fn message(&self) -> String {
+        match self {
+            LoadingState::Idle => String::new(),
+            LoadingState::LoadingData => "Loading data...".to_string(),
+            LoadingState::AggregatingTimeframes { current, total } => {
+                format!("Aggregating timeframes ({}/{})", current, total)
+            }
+            LoadingState::CreatingBuffers { current, total } => {
+                format!("Creating GPU buffers ({}/{})", current, total)
+            }
+            LoadingState::ComputingTa { timeframe } => {
+                format!("Computing TA for timeframe {}", timeframe)
+            }
+        }
+    }
+}
+
+/// Messages sent from background threads.
+pub enum BackgroundMessage {
+    /// Data loaded from file.
+    DataLoaded(Vec<Candle>),
+    /// A timeframe has been aggregated.
+    TimeframeAggregated { index: usize, candles: Vec<Candle> },
+    /// TA computation complete for a timeframe.
+    TaComputed {
+        timeframe: usize,
+        ranges: Vec<Range>,
+        levels: Vec<Level>,
+        trends: Vec<Trend>,
+    },
+    /// Loading state update.
+    LoadingStateChanged(LoadingState),
+    /// Error occurred.
+    Error(String),
+}
 
 /// Settings for TA display filtering.
 #[derive(Debug, Clone)]
@@ -30,6 +92,10 @@ pub struct TaDisplaySettings {
     pub show_active_levels: bool,
     pub show_hit_levels: bool,
     pub show_broken_levels: bool,
+    pub show_trends: bool,
+    pub show_active_trends: bool,
+    pub show_hit_trends: bool,
+    pub show_broken_trends: bool,
 }
 
 impl Default for TaDisplaySettings {
@@ -42,6 +108,10 @@ impl Default for TaDisplaySettings {
             show_active_levels: true,
             show_hit_levels: true,
             show_broken_levels: false,
+            show_trends: true,
+            show_active_trends: true,
+            show_hit_trends: true,
+            show_broken_trends: false,
         }
     }
 }
@@ -50,6 +120,7 @@ impl Default for TaDisplaySettings {
 pub struct TimeframeTaData {
     pub ranges: Vec<Range>,
     pub levels: Vec<Level>,
+    pub trends: Vec<Trend>,
     pub computed: bool,
 }
 
@@ -72,6 +143,13 @@ pub struct State {
     pub hovered_range: Option<usize>,
     pub hovered_level: Option<usize>,
 
+    // Background loading
+    pub loading_state: LoadingState,
+    pub bg_receiver: Receiver<BackgroundMessage>,
+    pub bg_sender: Sender<BackgroundMessage>,
+    /// Candles waiting to be converted to GPU buffers (index, candles).
+    pub pending_timeframes: Vec<(usize, Vec<Candle>)>,
+
     // Egui integration
     pub egui_ctx: egui::Context,
     pub egui_state: egui_winit::State,
@@ -86,16 +164,23 @@ pub struct State {
     pub last_frame_time: Instant,
     pub frame_count: u32,
     pub fps: f32,
+
+    // Replay mode
+    pub replay_mode: bool,
+    pub replay_index: Option<usize>, // None = cursor following, Some = locked to index
+    pub replay_ta_data: Option<TimeframeTaData>, // TA computed for replay range
+    pub replay_timestamp: Option<f64>, // Current replay position in timestamp
+    pub replay_step_timeframe: Timeframe, // Step size for replay (can be finer than view timeframe)
+    pub replay_candles: Option<Vec<Candle>>, // Cached partial candles for replay
+    pub replay_timeframe_data: Option<TimeframeData>, // GPU data for replay candles
 }
 
 impl State {
     pub async fn new(window: Arc<Window>) -> anyhow::Result<Self> {
         let size = window.inner_size();
 
-        // Load Bitcoin candle data from CSV (1-minute base data)
-        let loader = CsvLoader::new("data/btc-new.csv");
-        let base_candles = loader.load()?;
-        println!("Loaded {} base candles", base_candles.len());
+        // Create background channel
+        let (bg_sender, bg_receiver) = mpsc::channel();
 
         let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
             #[cfg(not(target_arch = "wasm32"))]
@@ -149,37 +234,50 @@ impl State {
             desired_maximum_frame_latency: 2,
         };
 
-        // Create renderer
+        // Start background data loading
+        let sender = bg_sender.clone();
+        thread::spawn(move || {
+            let _ = sender.send(BackgroundMessage::LoadingStateChanged(LoadingState::LoadingData));
+
+            // Load data
+            let loader = CsvLoader::new("data/btc-new.csv");
+            match loader.load() {
+                Ok(base_candles) => {
+                    println!("Loaded {} base candles", base_candles.len());
+                    let _ = sender.send(BackgroundMessage::DataLoaded(base_candles));
+                }
+                Err(e) => {
+                    let _ = sender.send(BackgroundMessage::Error(format!("Failed to load data: {}", e)));
+                }
+            }
+        });
+
+        // Create renderer with empty candle data (will be populated later)
+        let empty_candles: Vec<Candle> = vec![];
         let renderer = ChartRenderer::new(
             &device,
             &queue,
             surface_format,
             size.width,
             size.height,
-            &base_candles,
+            &empty_candles,
         );
 
-        // Pre-compute all timeframes (TA computed lazily on first use)
+        // Create placeholder timeframes (will be populated from background thread)
         let timeframe_types = Timeframe::all();
         let mut timeframes = Vec::new();
         let mut ta_data = Vec::new();
 
         for tf in timeframe_types {
-            let candles = if *tf == Timeframe::Min1 {
-                base_candles.clone()
-            } else {
-                aggregate_candles(&base_candles, *tf)
-            };
-            println!("  {} timeframe: {} candles", tf.label(), candles.len());
-
-            // TA will be computed lazily when first enabled
             ta_data.push(TimeframeTaData {
                 ranges: Vec::new(),
                 levels: Vec::new(),
+                trends: Vec::new(),
                 computed: false,
             });
 
-            let tf_data = renderer.create_timeframe_data(&device, candles, tf.label());
+            // Create empty placeholder timeframe
+            let tf_data = renderer.create_timeframe_data(&device, Vec::new(), tf.label());
             timeframes.push(tf_data);
         }
 
@@ -197,7 +295,7 @@ impl State {
 
         let stats_panel = StatsPanel::default();
 
-        let mut state = Self {
+        let state = Self {
             surface,
             device,
             queue,
@@ -211,6 +309,10 @@ impl State {
             ta_settings: TaDisplaySettings::default(),
             hovered_range: None,
             hovered_level: None,
+            loading_state: LoadingState::LoadingData,
+            bg_receiver,
+            bg_sender,
+            pending_timeframes: Vec::new(),
             egui_ctx,
             egui_state,
             egui_renderer,
@@ -220,9 +322,16 @@ impl State {
             last_frame_time: Instant::now(),
             frame_count: 0,
             fps: 0.0,
+            replay_mode: false,
+            replay_index: None,
+            replay_ta_data: None,
+            replay_timestamp: None,
+            replay_step_timeframe: Timeframe::Min1,
+            replay_candles: None,
+            replay_timeframe_data: None,
         };
 
-        state.update_visible_range();
+        // Don't update visible range yet - data is loading
         Ok(state)
     }
 
@@ -232,6 +341,152 @@ impl State {
         if self.ta_settings.show_ta {
             self.update_ta_buffers();
         }
+    }
+
+    /// Process any pending messages from background threads.
+    /// Returns true if data was updated and view should refresh.
+    pub fn process_background_messages(&mut self) -> bool {
+        let mut updated = false;
+
+        // Process all available messages (non-blocking)
+        while let Ok(msg) = self.bg_receiver.try_recv() {
+            match msg {
+                BackgroundMessage::LoadingStateChanged(state) => {
+                    self.loading_state = state;
+                }
+                BackgroundMessage::DataLoaded(base_candles) => {
+                    // Data loaded - start aggregating timeframes in background
+                    self.loading_state = LoadingState::AggregatingTimeframes {
+                        current: 0,
+                        total: Timeframe::all().len(),
+                    };
+
+                    // Spawn thread to aggregate all timeframes
+                    let sender = self.bg_sender.clone();
+                    thread::spawn(move || {
+                        let timeframe_types = Timeframe::all();
+                        let total = timeframe_types.len();
+
+                        for (i, tf) in timeframe_types.iter().enumerate() {
+                            let _ = sender.send(BackgroundMessage::LoadingStateChanged(
+                                LoadingState::AggregatingTimeframes { current: i + 1, total },
+                            ));
+
+                            let candles = if *tf == Timeframe::Min1 {
+                                base_candles.clone()
+                            } else {
+                                aggregate_candles(&base_candles, *tf)
+                            };
+                            println!("  {} timeframe: {} candles", tf.label(), candles.len());
+
+                            let _ = sender.send(BackgroundMessage::TimeframeAggregated {
+                                index: i,
+                                candles,
+                            });
+                        }
+
+                        // Signal we need to create GPU buffers
+                        let _ = sender.send(BackgroundMessage::LoadingStateChanged(
+                            LoadingState::CreatingBuffers { current: 0, total },
+                        ));
+                    });
+                }
+                BackgroundMessage::TimeframeAggregated { index, candles } => {
+                    // Store candles for GPU buffer creation (must happen on main thread)
+                    self.pending_timeframes.push((index, candles));
+                }
+                BackgroundMessage::TaComputed {
+                    timeframe,
+                    ranges,
+                    levels,
+                    trends,
+                } => {
+                    // TA computation complete
+                    self.ta_data[timeframe] = TimeframeTaData {
+                        ranges,
+                        levels,
+                        trends,
+                        computed: true,
+                    };
+                    self.loading_state = LoadingState::Idle;
+
+                    // Update TA buffers if this is the current timeframe
+                    if timeframe == self.current_timeframe && self.ta_settings.show_ta {
+                        self.update_ta_buffers();
+                    }
+                    updated = true;
+                }
+                BackgroundMessage::Error(err) => {
+                    eprintln!("Background error: {}", err);
+                    self.loading_state = LoadingState::Idle;
+                }
+            }
+        }
+
+        // Process pending timeframes (GPU buffer creation on main thread)
+        if !self.pending_timeframes.is_empty() {
+            let total = Timeframe::all().len();
+            let pending: Vec<_> = self.pending_timeframes.drain(..).collect();
+
+            for (index, candles) in pending {
+                self.loading_state = LoadingState::CreatingBuffers {
+                    current: index + 1,
+                    total,
+                };
+
+                let label = Timeframe::all()[index].label();
+                let tf_data = self.renderer.create_timeframe_data(&self.device, candles, label);
+                self.timeframes[index] = tf_data;
+            }
+
+            // All done - set idle and update view
+            self.loading_state = LoadingState::Idle;
+            self.update_visible_range();
+            updated = true;
+        }
+
+        updated
+    }
+
+    /// Compute TA in background thread for a timeframe.
+    fn compute_ta_background(&self, timeframe: usize) {
+        let candles = self.timeframes[timeframe].candles.clone();
+        let sender = self.bg_sender.clone();
+
+        thread::spawn(move || {
+            let _ = sender.send(BackgroundMessage::LoadingStateChanged(
+                LoadingState::ComputingTa { timeframe },
+            ));
+
+            println!("Computing TA for timeframe {} in background...", timeframe);
+            let start = Instant::now();
+
+            let ta_config = AnalyzerConfig::default();
+            let mut analyzer = Analyzer::with_config(ta_config);
+
+            for candle in &candles {
+                analyzer.process_candle(*candle);
+            }
+
+            let ranges = analyzer.ranges().to_vec();
+            let levels = analyzer.all_levels().to_vec();
+            let trends = analyzer.all_trends().to_vec();
+
+            println!(
+                "  TA computed: {} ranges, {} levels, {} trends in {:.2}s",
+                ranges.len(),
+                levels.len(),
+                trends.len(),
+                start.elapsed().as_secs_f32()
+            );
+
+            let _ = sender.send(BackgroundMessage::TaComputed {
+                timeframe,
+                ranges,
+                levels,
+                trends,
+            });
+        });
     }
 
     pub fn resize(&mut self, width: u32, height: u32) {
@@ -251,6 +506,11 @@ impl State {
             (KeyCode::Escape, true) => event_loop.exit(),
             (KeyCode::KeyF, true) | (KeyCode::Home, true) => self.fit_view(),
             (KeyCode::KeyP, true) => self.toggle_ta(),
+            (KeyCode::KeyR, true) => self.toggle_replay_mode(),
+            (KeyCode::BracketRight, true) => self.replay_step_forward(),
+            (KeyCode::BracketLeft, true) => self.replay_step_backward(),
+            (KeyCode::Comma, true) => self.replay_decrease_step_size(),
+            (KeyCode::Period, true) => self.replay_increase_step_size(),
             (KeyCode::Digit1, true) => self.switch_timeframe(0),
             (KeyCode::Digit2, true) => self.switch_timeframe(1),
             (KeyCode::Digit3, true) => self.switch_timeframe(2),
@@ -269,45 +529,262 @@ impl State {
         self.window.request_redraw();
     }
 
+    fn toggle_replay_mode(&mut self) {
+        self.replay_mode = !self.replay_mode;
+        if self.replay_mode {
+            // Entering replay mode - cursor following until click
+            self.replay_index = None;
+            self.replay_ta_data = None;
+            self.replay_timestamp = None;
+            self.replay_candles = None;
+            self.replay_timeframe_data = None;
+            // Default step size to current timeframe
+            self.replay_step_timeframe = Timeframe::all()[self.current_timeframe];
+        } else {
+            // Exiting replay mode - clear replay state
+            self.replay_index = None;
+            self.replay_ta_data = None;
+            self.replay_timestamp = None;
+            self.replay_candles = None;
+            self.replay_timeframe_data = None;
+            // Refresh TA buffers with full data
+            if self.ta_settings.show_ta {
+                self.update_ta_buffers();
+            }
+        }
+        self.window.request_redraw();
+    }
+
+    fn replay_step_forward(&mut self) {
+        if !self.replay_mode || self.replay_timestamp.is_none() {
+            return;
+        }
+
+        let base_candles = &self.timeframes[0].candles; // 1min candles
+        if base_candles.is_empty() {
+            return;
+        }
+
+        let max_timestamp = base_candles.last().map(|c| c.timestamp).unwrap_or(0.0);
+        let step_seconds = self.replay_step_timeframe.seconds();
+
+        if let Some(ts) = self.replay_timestamp {
+            let new_ts = (ts + step_seconds).min(max_timestamp);
+            if new_ts > ts {
+                self.replay_timestamp = Some(new_ts);
+                self.recompute_replay_candles();
+                self.recompute_replay_ta();
+                self.window.request_redraw();
+            }
+        }
+    }
+
+    fn replay_step_backward(&mut self) {
+        if !self.replay_mode || self.replay_timestamp.is_none() {
+            return;
+        }
+
+        let base_candles = &self.timeframes[0].candles;
+        if base_candles.is_empty() {
+            return;
+        }
+
+        let min_timestamp = base_candles.first().map(|c| c.timestamp).unwrap_or(0.0);
+        let step_seconds = self.replay_step_timeframe.seconds();
+
+        if let Some(ts) = self.replay_timestamp {
+            let new_ts = (ts - step_seconds).max(min_timestamp);
+            if new_ts < ts {
+                self.replay_timestamp = Some(new_ts);
+                self.recompute_replay_candles();
+                self.recompute_replay_ta();
+                self.window.request_redraw();
+            }
+        }
+    }
+
+    fn replay_increase_step_size(&mut self) {
+        if !self.replay_mode {
+            return;
+        }
+        let timeframes = Timeframe::all();
+        let current_idx = timeframes.iter().position(|&t| t == self.replay_step_timeframe).unwrap_or(0);
+        // Increase step size (up to current view timeframe)
+        let max_idx = self.current_timeframe;
+        if current_idx < max_idx {
+            self.replay_step_timeframe = timeframes[current_idx + 1];
+            self.window.request_redraw();
+        }
+    }
+
+    fn replay_decrease_step_size(&mut self) {
+        if !self.replay_mode {
+            return;
+        }
+        let timeframes = Timeframe::all();
+        let current_idx = timeframes.iter().position(|&t| t == self.replay_step_timeframe).unwrap_or(0);
+        // Decrease step size (down to 1min)
+        if current_idx > 0 {
+            self.replay_step_timeframe = timeframes[current_idx - 1];
+            self.window.request_redraw();
+        }
+    }
+
+    fn set_replay_index(&mut self, index: usize) {
+        // Convert candle index to timestamp
+        let candles = &self.timeframes[self.current_timeframe].candles;
+        if candles.is_empty() {
+            return;
+        }
+
+        let clamped_idx = index.min(candles.len().saturating_sub(1));
+        let timestamp = candles[clamped_idx].timestamp;
+
+        // Also set replay_index for backward compatibility with candle limiting
+        self.replay_index = Some(clamped_idx);
+        self.replay_timestamp = Some(timestamp);
+
+        self.recompute_replay_candles();
+        self.recompute_replay_ta();
+        self.window.request_redraw();
+    }
+
+    /// Recompute the replay candles from base 1min data.
+    /// Re-aggregates candles up to replay_timestamp for accurate partial candle display.
+    fn recompute_replay_candles(&mut self) {
+        let Some(replay_ts) = self.replay_timestamp else {
+            self.replay_candles = None;
+            self.replay_index = None;
+            self.replay_timeframe_data = None;
+            return;
+        };
+
+        let base_candles = &self.timeframes[0].candles; // 1min candles
+        if base_candles.is_empty() {
+            self.replay_index = Some(0);
+            self.replay_candles = None;
+            self.replay_timeframe_data = None;
+            return;
+        }
+
+        // Binary search to find the last base candle at or before replay_ts
+        let base_end_idx = base_candles
+            .binary_search_by(|c| c.timestamp.partial_cmp(&replay_ts).unwrap())
+            .unwrap_or_else(|i| i.saturating_sub(1))
+            .min(base_candles.len().saturating_sub(1));
+
+        // Get the current view timeframe
+        let current_tf = Timeframe::all()[self.current_timeframe];
+
+        // If we're on 1min timeframe, just use the index directly
+        if current_tf == Timeframe::Min1 {
+            self.replay_index = Some(base_end_idx);
+            self.replay_candles = None;
+            self.replay_timeframe_data = None;
+            return;
+        }
+
+        // Re-aggregate base candles up to replay_ts into the current timeframe
+        let filtered_base = &base_candles[..=base_end_idx];
+        let aggregated = aggregate_candles(filtered_base, current_tf);
+
+        if aggregated.is_empty() {
+            self.replay_index = Some(0);
+            self.replay_candles = None;
+            self.replay_timeframe_data = None;
+            return;
+        }
+
+        // Update replay_index to the last aggregated candle
+        self.replay_index = Some(aggregated.len().saturating_sub(1));
+
+        // Create GPU buffers for the re-aggregated candles
+        let tf_label = current_tf.label();
+        let tf_data = self.renderer.create_timeframe_data(&self.device, aggregated.clone(), tf_label);
+
+        self.replay_candles = Some(aggregated);
+        self.replay_timeframe_data = Some(tf_data);
+    }
+
+    fn recompute_replay_ta(&mut self) {
+        // Skip TA computation if TA is disabled
+        if !self.ta_settings.show_ta {
+            self.replay_ta_data = None;
+            return;
+        }
+
+        // Use replay_candles if available (re-aggregated data), otherwise use timeframe candles
+        let candles: Vec<Candle> = if let Some(ref replay_candles) = self.replay_candles {
+            replay_candles.clone()
+        } else if let Some(replay_idx) = self.replay_index {
+            let tf_candles = &self.timeframes[self.current_timeframe].candles;
+            if tf_candles.is_empty() || replay_idx == 0 {
+                Vec::new()
+            } else {
+                tf_candles[..=replay_idx.min(tf_candles.len() - 1)].to_vec()
+            }
+        } else {
+            self.replay_ta_data = None;
+            return;
+        };
+
+        if candles.is_empty() {
+            self.replay_ta_data = Some(TimeframeTaData {
+                ranges: Vec::new(),
+                levels: Vec::new(),
+                trends: Vec::new(),
+                computed: true,
+            });
+            self.update_ta_buffers();
+            return;
+        }
+
+        let ta_config = AnalyzerConfig::default();
+        let mut analyzer = Analyzer::with_config(ta_config);
+
+        for candle in &candles {
+            analyzer.process_candle(*candle);
+        }
+
+        self.replay_ta_data = Some(TimeframeTaData {
+            ranges: analyzer.ranges().to_vec(),
+            levels: analyzer.all_levels().to_vec(),
+            trends: analyzer.all_trends().to_vec(),
+            computed: true,
+        });
+
+        self.update_ta_buffers();
+    }
+
     /// Compute TA for current timeframe if not already computed.
+    /// Uses background thread to avoid blocking UI.
     fn ensure_ta_computed(&mut self) {
         let tf_idx = self.current_timeframe;
+
+        // Skip if already computed or currently loading
         if self.ta_data[tf_idx].computed {
             return;
         }
 
-        println!("Computing TA for timeframe {}...", tf_idx);
-        let start = Instant::now();
-
-        let candles = &self.timeframes[tf_idx].candles;
-        let ta_config = AnalyzerConfig::default();
-        let mut analyzer = Analyzer::with_config(ta_config);
-
-        for candle in candles {
-            analyzer.process_candle(*candle);
+        // Skip if data is still loading or no candles yet
+        if self.loading_state.is_loading() || self.timeframes[tf_idx].candles.is_empty() {
+            return;
         }
 
-        let ranges = analyzer.ranges().to_vec();
-        let levels = analyzer.all_levels().to_vec();
-
-        println!(
-            "  TA computed: {} ranges, {} levels in {:.2}s",
-            ranges.len(),
-            levels.len(),
-            start.elapsed().as_secs_f32()
-        );
-
-        self.ta_data[tf_idx] = TimeframeTaData {
-            ranges,
-            levels,
-            computed: true,
-        };
+        // Start background TA computation
+        self.compute_ta_background(tf_idx);
     }
 
     fn update_ta_buffers(&mut self) {
         let tf_idx = self.current_timeframe;
         let tf = &self.timeframes[tf_idx];
-        let ta = &self.ta_data[tf_idx];
+
+        // Use replay TA data if in replay mode with an index set
+        let ta: &TimeframeTaData = if self.replay_mode && self.replay_index.is_some() {
+            self.replay_ta_data.as_ref().unwrap_or(&self.ta_data[tf_idx])
+        } else {
+            &self.ta_data[tf_idx]
+        };
 
         // Convert ranges to GPU format
         let mut range_gpus: Vec<RangeGpu> = ta
@@ -396,6 +873,65 @@ impl State {
             });
         }
 
+        // Filter trends based on settings
+        let filtered_trends: Vec<&Trend> = ta
+            .trends
+            .iter()
+            .filter(|t| {
+                if !self.ta_settings.show_trends {
+                    return false;
+                }
+                match t.state {
+                    TrendState::Active => self.ta_settings.show_active_trends,
+                    TrendState::Hit => self.ta_settings.show_hit_trends,
+                    TrendState::Broken => self.ta_settings.show_broken_trends,
+                }
+            })
+            .take(MAX_TA_TRENDS)
+            .collect();
+
+        let trend_count = filtered_trends.len() as u32;
+
+        // Convert trends to GPU format
+        let mut trend_gpus: Vec<TrendGpu> = filtered_trends
+            .iter()
+            .map(|t| {
+                let (r, g, b, a) = match (t.direction, t.state) {
+                    (CandleDirection::Bullish, TrendState::Active) => (0.0, 0.9, 0.5, 0.8),
+                    (CandleDirection::Bullish, TrendState::Hit) => (0.0, 0.7, 0.4, 0.6),
+                    (CandleDirection::Bullish, TrendState::Broken) => (0.0, 0.4, 0.2, 0.4),
+                    (CandleDirection::Bearish, TrendState::Active) => (0.9, 0.3, 0.3, 0.8),
+                    (CandleDirection::Bearish, TrendState::Hit) => (0.7, 0.2, 0.2, 0.6),
+                    (CandleDirection::Bearish, TrendState::Broken) => (0.4, 0.1, 0.1, 0.4),
+                    (CandleDirection::Doji, _) => (0.5, 0.5, 0.5, 0.5),
+                };
+                TrendGpu {
+                    x_start: t.start.candle_index as f32 * CANDLE_SPACING,
+                    y_start: t.start.price,
+                    x_end: t.end.candle_index as f32 * CANDLE_SPACING,
+                    y_end: t.end.price,
+                    r,
+                    g,
+                    b,
+                    a,
+                }
+            })
+            .collect();
+
+        // Pad to MAX_TA_TRENDS
+        while trend_gpus.len() < MAX_TA_TRENDS {
+            trend_gpus.push(TrendGpu {
+                x_start: 0.0,
+                y_start: 0.0,
+                x_end: 0.0,
+                y_end: 0.0,
+                r: 0.0,
+                g: 0.0,
+                b: 0.0,
+                a: 0.0,
+            });
+        }
+
         // Calculate x_max for rendering
         let x_max = (tf.candles.len() as f32) * CANDLE_SPACING;
 
@@ -416,7 +952,7 @@ impl State {
             x_max,
             range_count,
             level_count,
-            _padding: 0,
+            trend_count,
         };
 
         // Write to GPU buffers
@@ -429,6 +965,11 @@ impl State {
             &tf.ta_level_buffer,
             0,
             bytemuck::cast_slice(&level_gpus),
+        );
+        self.queue.write_buffer(
+            &tf.ta_trend_buffer,
+            0,
+            bytemuck::cast_slice(&trend_gpus),
         );
         self.queue.write_buffer(
             &tf.ta_params_buffer,
@@ -490,6 +1031,14 @@ impl State {
 
     pub fn handle_mouse_input(&mut self, state: ElementState, button: MouseButton) {
         if button == MouseButton::Left {
+            // Handle replay mode click
+            if self.replay_mode && self.replay_index.is_none() && state == ElementState::Pressed {
+                // Set replay index from cursor position
+                let candle_idx = self.get_cursor_candle_index();
+                self.set_replay_index(candle_idx);
+                return;
+            }
+
             self.mouse_pressed = state == ElementState::Pressed;
             if !self.mouse_pressed {
                 self.last_mouse_pos = None;
@@ -535,13 +1084,24 @@ impl State {
         };
 
         let candles = &self.timeframes[self.current_timeframe].candles;
-        let aspect = self.config.width as f32 / self.config.height as f32;
 
+        // Use chart area dimensions (excluding stats panel and volume section)
+        let chart_width = self.config.width as f32 - STATS_PANEL_WIDTH;
+        let chart_height = self.config.height as f32 * (1.0 - VOLUME_HEIGHT_RATIO);
+        let aspect = chart_width / chart_height;
+
+        // Calculate cursor position in NDC relative to the chart area
         let cursor_ndc = if let Some(pos) = self.last_mouse_pos {
-            [
-                (pos[0] / self.config.width as f32) * 2.0 - 1.0,
-                1.0 - (pos[1] / self.config.height as f32) * 2.0,
-            ]
+            // Only apply zoom-to-cursor if cursor is within the chart area
+            if pos[0] < chart_width && pos[1] < chart_height {
+                [
+                    (pos[0] / chart_width) * 2.0 - 1.0,
+                    1.0 - (pos[1] / chart_height) * 2.0,
+                ]
+            } else {
+                // Cursor outside chart area, zoom from center
+                [0.0, 0.0]
+            }
         } else {
             [0.0, 0.0]
         };
@@ -592,6 +1152,9 @@ impl State {
     pub fn render(&mut self) -> Result<(), wgpu::SurfaceError> {
         self.window.request_redraw();
 
+        // Process any pending background messages
+        self.process_background_messages();
+
         if !self.is_surface_configured {
             return Ok(());
         }
@@ -616,6 +1179,7 @@ impl State {
         let candle_count = self.timeframes[self.current_timeframe].candles.len();
         let ta_range_count = self.ta_data[self.current_timeframe].ranges.len();
         let ta_level_count = self.ta_data[self.current_timeframe].levels.len();
+        let ta_trend_count = self.ta_data[self.current_timeframe].trends.len();
 
         // Get hovered element info
         let hovered_range_info = self.hovered_range.and_then(|idx| {
@@ -646,9 +1210,47 @@ impl State {
         // Copy TA settings for egui (will be copied back after)
         let mut ta_settings = self.ta_settings.clone();
 
+        // Get guideline values and visible range for price labels
+        let guideline_values = self.renderer.guideline_values.clone();
+        let aspect = chart_width / chart_height;
+        let (y_min, y_max) = self.renderer.camera.visible_y_range(aspect);
+
         // Build egui UI
         let raw_input = self.egui_state.take_egui_input(&self.window);
         let full_output = self.egui_ctx.run(raw_input, |ctx| {
+            // Draw price labels on the left side (using Foreground so they appear on top)
+            egui::Area::new(egui::Id::new("price_labels"))
+                .fixed_pos(egui::Pos2::ZERO)
+                .order(egui::Order::Foreground)
+                .interactable(false)
+                .show(ctx, |ui| {
+                    let painter = ui.painter();
+                    for &price in &guideline_values {
+                        // Convert world Y to screen Y
+                        let normalized_y = (price - y_min) / (y_max - y_min);
+                        let screen_y = chart_height * (1.0 - normalized_y);
+
+                        // Only draw if within visible chart area
+                        if screen_y >= 0.0 && screen_y <= chart_height {
+                            let text = if price >= 1000.0 {
+                                format!("{:.0}", price)
+                            } else if price >= 1.0 {
+                                format!("{:.2}", price)
+                            } else {
+                                format!("{:.4}", price)
+                            };
+
+                            painter.text(
+                                egui::Pos2::new(5.0, screen_y - 6.0),
+                                egui::Align2::LEFT_CENTER,
+                                text,
+                                egui::FontId::proportional(11.0),
+                                egui::Color32::from_rgba_unmultiplied(180, 180, 190, 200),
+                            );
+                        }
+                    }
+                });
+
             self.stats_panel.show(
                 ctx,
                 self.current_timeframe,
@@ -683,8 +1285,19 @@ impl State {
                         ui.checkbox(&mut ta_settings.show_broken_levels, "Broken");
 
                         ui.separator();
+                        ui.checkbox(&mut ta_settings.show_trends, "Show Trends");
+                        if ta_settings.show_trends {
+                            ui.indent("trend_states", |ui| {
+                                ui.checkbox(&mut ta_settings.show_active_trends, "Active");
+                                ui.checkbox(&mut ta_settings.show_hit_trends, "Hit");
+                                ui.checkbox(&mut ta_settings.show_broken_trends, "Broken");
+                            });
+                        }
+
+                        ui.separator();
                         ui.label(format!("Ranges: {}", ta_range_count));
                         ui.label(format!("Levels: {}", ta_level_count));
+                        ui.label(format!("Trends: {}", ta_trend_count));
 
                         // Show hovered element info
                         if let Some((dir, count, high, low, start, end)) = hovered_range_info {
@@ -708,6 +1321,140 @@ impl State {
                         }
                     }
                 });
+
+            // Loading indicator overlay
+            if self.loading_state.is_loading() {
+                let screen_rect = ctx.screen_rect();
+                let center = screen_rect.center();
+
+                // Semi-transparent dark overlay
+                egui::Area::new(egui::Id::new("loading_overlay"))
+                    .fixed_pos(egui::Pos2::ZERO)
+                    .order(egui::Order::Foreground)
+                    .show(ctx, |ui| {
+                        let painter = ui.painter();
+                        painter.rect_filled(
+                            screen_rect,
+                            0.0,
+                            egui::Color32::from_rgba_unmultiplied(0, 0, 0, 180),
+                        );
+                    });
+
+                // Loading window
+                egui::Window::new("Loading")
+                    .collapsible(false)
+                    .resizable(false)
+                    .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+                    .fixed_pos(center)
+                    .show(ctx, |ui| {
+                        ui.vertical_centered(|ui| {
+                            ui.add_space(10.0);
+                            ui.spinner();
+                            ui.add_space(10.0);
+                            ui.label(self.loading_state.message());
+                            ui.add_space(10.0);
+                        });
+                    });
+            }
+
+            // Replay mode overlay and cursor line
+            if self.replay_mode {
+                let aspect = chart_width / chart_height;
+                let (x_min, _x_max) = self.renderer.camera.visible_x_range(aspect);
+
+                // Determine cursor X position
+                let cursor_x = if let Some(replay_ts) = self.replay_timestamp {
+                    // Use timestamp for sub-candle precision
+                    let tf_candles = &self.timeframes[self.current_timeframe].candles;
+                    if !tf_candles.is_empty() {
+                        // Find the candle this timestamp falls into
+                        let idx = tf_candles
+                            .binary_search_by(|c| c.timestamp.partial_cmp(&replay_ts).unwrap())
+                            .unwrap_or_else(|i| i.saturating_sub(1))
+                            .min(tf_candles.len() - 1);
+
+                        // Calculate fractional position within the candle
+                        let candle_start_ts = tf_candles[idx].timestamp;
+                        let candle_duration = Timeframe::all()[self.current_timeframe].seconds() as f32;
+                        let fraction = ((replay_ts - candle_start_ts) as f32 / candle_duration).clamp(0.0, 1.0);
+
+                        (idx as f32 + fraction) * CANDLE_SPACING
+                    } else {
+                        x_min
+                    }
+                } else if let Some(pos) = self.last_mouse_pos {
+                    // Following cursor
+                    let normalized_x = pos[0] / chart_width;
+                    x_min + normalized_x * (self.renderer.camera.scale[0] * aspect * 2.0)
+                } else {
+                    x_min
+                };
+
+                // Convert world X to screen X
+                let screen_x = ((cursor_x - x_min) / (self.renderer.camera.scale[0] * aspect * 2.0)) * chart_width;
+
+                // Draw vertical cursor line (thinner and more subtle when locked)
+                if screen_x >= 0.0 && screen_x <= chart_width {
+                    egui::Area::new(egui::Id::new("replay_cursor"))
+                        .fixed_pos(egui::Pos2::ZERO)
+                        .order(egui::Order::Background) // Behind UI elements
+                        .show(ctx, |ui| {
+                            let painter = ui.painter();
+                            let (color, width) = if self.replay_index.is_some() {
+                                // Subtle dashed appearance when locked
+                                (egui::Color32::from_rgba_unmultiplied(255, 200, 0, 100), 1.0)
+                            } else {
+                                // More visible when following cursor
+                                (egui::Color32::from_rgba_unmultiplied(255, 255, 255, 150), 1.5)
+                            };
+                            painter.line_segment(
+                                [
+                                    egui::Pos2::new(screen_x, 0.0),
+                                    egui::Pos2::new(screen_x, total_height),
+                                ],
+                                egui::Stroke::new(width, color),
+                            );
+                        });
+                }
+
+                // Calculate base candle progress for display
+                let base_candle_info = if let Some(ts) = self.replay_timestamp {
+                    let base_candles = &self.timeframes[0].candles;
+                    if !base_candles.is_empty() {
+                        let base_idx = base_candles
+                            .binary_search_by(|c| c.timestamp.partial_cmp(&ts).unwrap())
+                            .unwrap_or_else(|i| i.saturating_sub(1));
+                        Some((base_idx + 1, base_candles.len()))
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                };
+
+                // Replay mode indicator
+                egui::Window::new("Replay Mode")
+                    .title_bar(false)
+                    .resizable(false)
+                    .anchor(egui::Align2::CENTER_TOP, [0.0, 10.0])
+                    .show(ctx, |ui| {
+                        ui.horizontal(|ui| {
+                            ui.label(egui::RichText::new("REPLAY").color(egui::Color32::YELLOW).strong());
+                            if let Some(idx) = self.replay_index {
+                                ui.label(format!("Candle {}/{}", idx + 1, candle_count));
+                                if let Some((base_idx, base_total)) = base_candle_info {
+                                    ui.label(format!("(1m: {}/{})", base_idx, base_total));
+                                }
+                            } else {
+                                ui.label("Click to set position");
+                            }
+                        });
+                        ui.horizontal(|ui| {
+                            ui.label(format!("Step: {}", self.replay_step_timeframe.label()));
+                            ui.label("| [ ] step | ,. size | R exit");
+                        });
+                    });
+            }
         });
 
         // Update TA settings if changed
@@ -717,7 +1464,11 @@ impl State {
             || ta_settings.show_greedy_levels != self.ta_settings.show_greedy_levels
             || ta_settings.show_active_levels != self.ta_settings.show_active_levels
             || ta_settings.show_hit_levels != self.ta_settings.show_hit_levels
-            || ta_settings.show_broken_levels != self.ta_settings.show_broken_levels;
+            || ta_settings.show_broken_levels != self.ta_settings.show_broken_levels
+            || ta_settings.show_trends != self.ta_settings.show_trends
+            || ta_settings.show_active_trends != self.ta_settings.show_active_trends
+            || ta_settings.show_hit_trends != self.ta_settings.show_hit_trends
+            || ta_settings.show_broken_trends != self.ta_settings.show_broken_trends;
 
         if ta_changed {
             let was_ta_enabled = self.ta_settings.show_ta;
@@ -765,6 +1516,83 @@ impl State {
         {
             let tf = &self.timeframes[self.current_timeframe];
 
+            // Use replay timeframe data if available, otherwise use normal timeframe data
+            let use_replay_data = self.replay_mode && self.replay_timeframe_data.is_some();
+            let replay_tf = self.replay_timeframe_data.as_ref();
+
+            // Update render params for replay data (different price normalization and first_visible)
+            if use_replay_data {
+                if let Some(ref rtf) = self.replay_timeframe_data {
+                    let aspect = chart_width / chart_height;
+                    let (x_min, x_max) = self.renderer.camera.visible_x_range(aspect);
+                    let (y_min, y_max) = self.renderer.camera.visible_y_range(aspect);
+
+                    // Use fixed base values for replay - no LOD adjustment needed
+                    // BASE_CANDLE_WIDTH = 0.8, which is less than CANDLE_SPACING = 1.2
+                    let candle_width = 0.8;
+                    let wick_width = candle_width * 0.15;
+
+                    let render_params = RenderParams {
+                        first_visible: 0, // Replay candles start at index 0
+                        candle_width,
+                        candle_spacing: CANDLE_SPACING,
+                        wick_width,
+                        x_min,
+                        x_max,
+                        y_min,
+                        y_max,
+                        price_min: rtf.price_normalization.price_min,
+                        price_range: rtf.price_normalization.price_range,
+                        _padding1: 0.0,
+                        _padding2: 0.0,
+                    };
+                    self.queue.write_buffer(
+                        &self.renderer.render_params_buffer,
+                        0,
+                        bytemuck::cast_slice(&[render_params]),
+                    );
+
+                    let volume_params = VolumeRenderParams {
+                        first_visible: 0,
+                        bar_width: candle_width,
+                        bar_spacing: CANDLE_SPACING,
+                        max_volume: rtf.max_volume.max(1.0),
+                    };
+                    self.queue.write_buffer(
+                        &self.renderer.volume_params_buffer,
+                        0,
+                        bytemuck::cast_slice(&[volume_params]),
+                    );
+                }
+            }
+
+            // Calculate effective visible count for replay mode
+            let effective_visible_count = if use_replay_data {
+                // When using replay data, show all the re-aggregated candles
+                replay_tf.map(|r| r.candles.len() as u32).unwrap_or(0)
+            } else if self.replay_mode {
+                if let Some(replay_idx) = self.replay_index {
+                    // In replay mode with locked position (no re-aggregation needed - same timeframe)
+                    let visible_start = self.renderer.visible_start as usize;
+                    let visible_count = self.renderer.visible_count as usize;
+                    if replay_idx < visible_start {
+                        // Replay point is before visible range
+                        0
+                    } else if replay_idx >= visible_start + visible_count {
+                        // Replay point is beyond visible range - show all visible
+                        visible_count as u32
+                    } else {
+                        // Replay point is within visible range
+                        (replay_idx - visible_start + 1) as u32
+                    }
+                } else {
+                    // Cursor following mode - show all
+                    self.renderer.visible_count
+                }
+            } else {
+                self.renderer.visible_count
+            };
+
             let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("Chart Render Pass"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
@@ -772,9 +1600,9 @@ impl State {
                     resolve_target: None,
                     ops: wgpu::Operations {
                         load: wgpu::LoadOp::Clear(wgpu::Color {
-                            r: 0.08,
-                            g: 0.08,
-                            b: 0.12,
+                            r: 0.04,
+                            g: 0.04,
+                            b: 0.06,
                             a: 1.0,
                         }),
                         store: wgpu::StoreOp::Store,
@@ -800,8 +1628,11 @@ impl State {
             render_pass.set_pipeline(&self.renderer.candle_pipeline.pipeline);
             render_pass.set_bind_group(0, &self.renderer.camera_bind_group, &[]);
 
-            // Select the appropriate bind group based on LOD
-            let candle_bind_group = if self.renderer.current_lod_factor == 1 {
+            // Select the appropriate bind group based on replay mode and LOD
+            let candle_bind_group = if use_replay_data {
+                // Use replay timeframe data bind group
+                &replay_tf.unwrap().candle_bind_group
+            } else if self.renderer.current_lod_factor == 1 {
                 &tf.candle_bind_group
             } else if let Some(lod) = tf.lod_levels.iter().find(|l| l.factor == self.renderer.current_lod_factor) {
                 &lod.candle_bind_group
@@ -809,11 +1640,16 @@ impl State {
                 &tf.candle_bind_group
             };
             render_pass.set_bind_group(1, candle_bind_group, &[]);
-            render_pass.draw(0..VERTICES_PER_CANDLE, 0..self.renderer.visible_count);
+            render_pass.draw(0..VERTICES_PER_CANDLE, 0..effective_visible_count);
 
             // Render TA (ranges and levels) if enabled
             if self.ta_settings.show_ta {
-                let ta = &self.ta_data[self.current_timeframe];
+                // Use replay TA data if in replay mode with locked position
+                let ta: &TimeframeTaData = if self.replay_mode && self.replay_index.is_some() {
+                    self.replay_ta_data.as_ref().unwrap_or(&self.ta_data[self.current_timeframe])
+                } else {
+                    &self.ta_data[self.current_timeframe]
+                };
 
                 // Render ranges (6 vertices per quad, one per range)
                 if self.ta_settings.show_ranges && !ta.ranges.is_empty() {
@@ -847,6 +1683,27 @@ impl State {
                     render_pass.set_bind_group(1, &tf.ta_bind_group, &[]);
                     render_pass.draw(0..6, 0..filtered_level_count);
                 }
+
+                // Render trends (6 vertices per quad, one per trend)
+                if self.ta_settings.show_trends && !ta.trends.is_empty() {
+                    let filtered_trend_count = ta.trends.iter()
+                        .filter(|t| {
+                            match t.state {
+                                TrendState::Active => self.ta_settings.show_active_trends,
+                                TrendState::Hit => self.ta_settings.show_hit_trends,
+                                TrendState::Broken => self.ta_settings.show_broken_trends,
+                            }
+                        })
+                        .take(MAX_TA_TRENDS)
+                        .count() as u32;
+
+                    if filtered_trend_count > 0 {
+                        render_pass.set_pipeline(&self.renderer.ta_pipeline.trend_pipeline);
+                        render_pass.set_bind_group(0, &self.renderer.camera_bind_group, &[]);
+                        render_pass.set_bind_group(1, &tf.ta_bind_group, &[]);
+                        render_pass.draw(0..6, 0..filtered_trend_count);
+                    }
+                }
             }
 
             // Render volume bars using appropriate LOD level
@@ -854,7 +1711,10 @@ impl State {
             render_pass.set_pipeline(&self.renderer.volume_pipeline.pipeline);
             render_pass.set_bind_group(0, &self.renderer.volume_camera_bind_group, &[]);
 
-            let volume_bind_group = if self.renderer.current_lod_factor == 1 {
+            let volume_bind_group = if use_replay_data {
+                // Use replay timeframe data volume bind group
+                &replay_tf.unwrap().volume_bind_group
+            } else if self.renderer.current_lod_factor == 1 {
                 &tf.volume_bind_group
             } else if let Some(lod) = tf.lod_levels.iter().find(|l| l.factor == self.renderer.current_lod_factor) {
                 &lod.volume_bind_group
@@ -862,7 +1722,7 @@ impl State {
                 &tf.volume_bind_group
             };
             render_pass.set_bind_group(1, volume_bind_group, &[]);
-            render_pass.draw(0..6, 0..self.renderer.visible_count);
+            render_pass.draw(0..6, 0..effective_visible_count);
         }
 
         self.queue.submit(std::iter::once(encoder.finish()));

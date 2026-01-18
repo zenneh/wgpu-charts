@@ -5,16 +5,17 @@ struct CameraUniform {
 @group(0) @binding(0)
 var<uniform> camera: CameraUniform;
 
-// Candle data in storage buffer
-struct Candle {
-    open: f32,
-    high: f32,
-    low: f32,
-    close: f32,
+// Packed candle data in storage buffer (8 bytes per candle instead of 16)
+// Values are normalized u16 packed into u32:
+//   open_high: open (lower 16 bits) | high (upper 16 bits)
+//   low_close: low (lower 16 bits) | close (upper 16 bits)
+struct PackedCandle {
+    open_high: u32,
+    low_close: u32,
 };
 
 struct CandleArray {
-    candles: array<Candle>,
+    candles: array<PackedCandle>,
 };
 
 @group(1) @binding(0)
@@ -31,10 +32,32 @@ struct RenderParams {
     x_max: f32,
     y_min: f32,
     y_max: f32,
+    // Price denormalization: price = price_min + normalized * price_range
+    price_min: f32,
+    price_range: f32,
+    _padding1: f32,
+    _padding2: f32,
 };
 
 @group(1) @binding(1)
 var<uniform> params: RenderParams;
+
+// Unpack and denormalize a packed candle
+fn unpack_candle(packed: PackedCandle) -> vec4<f32> {
+    // Extract u16 values from packed u32s
+    let open_norm = f32(packed.open_high & 0xFFFFu) / 65535.0;
+    let high_norm = f32((packed.open_high >> 16u) & 0xFFFFu) / 65535.0;
+    let low_norm = f32(packed.low_close & 0xFFFFu) / 65535.0;
+    let close_norm = f32((packed.low_close >> 16u) & 0xFFFFu) / 65535.0;
+
+    // Denormalize to actual prices
+    let open = params.price_min + open_norm * params.price_range;
+    let high = params.price_min + high_norm * params.price_range;
+    let low = params.price_min + low_norm * params.price_range;
+    let close = params.price_min + close_norm * params.price_range;
+
+    return vec4<f32>(open, high, low, close);
+}
 
 struct VertexOutput {
     @builtin(position) clip_position: vec4<f32>,
@@ -54,7 +77,14 @@ fn vs_main(
 
     // Get the actual candle index (accounting for viewport culling offset)
     let candle_index = params.first_visible + instance_index;
-    let candle = candle_data.candles[candle_index];
+    let packed = candle_data.candles[candle_index];
+
+    // Unpack and denormalize candle data (50% memory savings)
+    let candle = unpack_candle(packed);
+    let open = candle.x;
+    let high = candle.y;
+    let low = candle.z;
+    let close = candle.w;
 
     // Calculate candle properties
     let x_center = f32(candle_index) * params.candle_spacing;
@@ -67,18 +97,18 @@ fn vs_main(
 
     // Cull if completely outside X range or Y range
     let outside_x = x_right < params.x_min || x_left > params.x_max;
-    let outside_y = candle.high < params.y_min || candle.low > params.y_max;
+    let outside_y = high < params.y_min || low > params.y_max;
 
     if outside_x || outside_y {
         out.clip_position = vec4<f32>(0.0, 0.0, 0.0, 1.0);
         out.color = vec3<f32>(0.0, 0.0, 0.0);
         return out;
     }
-    let is_bullish = candle.close >= candle.open;
+    let is_bullish = close >= open;
 
     // Ensure minimum body height for doji candles (open == close)
-    let raw_body_top = max(candle.open, candle.close);
-    let raw_body_bottom = min(candle.open, candle.close);
+    let raw_body_top = max(open, close);
+    let raw_body_bottom = min(open, close);
     let min_body_height = params.wick_width; // Use wick_width as minimum (it's already adaptive)
     let body_center = (raw_body_top + raw_body_bottom) / 2.0;
     let body_height = max(raw_body_top - raw_body_bottom, min_body_height);
@@ -113,7 +143,7 @@ fn vs_main(
         }
     } else if part == 1u {
         // Upper wick (from raw body top to high) - use raw values to avoid overlap with expanded body
-        let wick_top = candle.high;
+        let wick_top = high;
         let wick_bottom = raw_body_top;
         // Only draw if there's actual wick height
         let upper_wick_top = select(wick_bottom, wick_top, wick_top > wick_bottom);
@@ -129,7 +159,7 @@ fn vs_main(
     } else {
         // Lower wick (from low to raw body bottom) - use raw values
         let wick_top = raw_body_bottom;
-        let wick_bottom = candle.low;
+        let wick_bottom = low;
         // Only draw if there's actual wick height
         let lower_wick_bottom = select(wick_top, wick_bottom, wick_bottom < wick_top);
         switch local_vertex {
