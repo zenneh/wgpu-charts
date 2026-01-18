@@ -42,11 +42,15 @@ pub enum LevelType {
 /// The current state of a level.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LevelState {
-    /// Level is active and has not been interacted with.
+    /// Level exists but price hasn't crossed to the other side yet.
+    /// For bearish levels: waiting for price to go ABOVE the level.
+    /// For bullish levels: waiting for price to go BELOW the level.
+    Pending,
+    /// Level is active (price crossed to other side) but hasn't been hit yet.
     Active,
-    /// Level is active and has been hit (wick touched, body held).
+    /// Level is active and has been hit (wick touched).
     Hit,
-    /// Level has been broken (body closed through).
+    /// Level has been broken (same-direction candle closed fully through).
     Broken,
 }
 
@@ -59,6 +63,9 @@ pub struct LevelHit {
     pub touch_price: f32,
     /// Distance from the level (how deep the wick went).
     pub penetration: f32,
+    /// Whether the level was respected (only wick touched, body stayed on correct side).
+    /// If false, the body also touched or crossed the level.
+    pub respected: bool,
 }
 
 /// A record of a level being broken.
@@ -89,6 +96,9 @@ pub struct Level {
     pub created_at_index: usize,
     /// Index of the candle whose wick defines this level's price.
     pub source_candle_index: usize,
+    /// The timeframe index this level was created from.
+    /// A level can only be broken by candles from the same timeframe.
+    pub source_timeframe: usize,
     /// Current state of the level.
     pub state: LevelState,
     /// History of hits on this level.
@@ -101,11 +111,15 @@ pub struct Level {
 
 impl Level {
     /// Create a new level from a range.
+    ///
+    /// `source_timeframe` is the timeframe index this level belongs to.
+    /// A level can only be broken by candles from the same timeframe.
     pub fn from_range(
         id: LevelId,
         range: &Range,
         level_type: LevelType,
         created_at_index: usize,
+        source_timeframe: usize,
         tolerance: f32,
     ) -> Self {
         let (price, source_candle_index) = match level_type {
@@ -121,7 +135,8 @@ impl Level {
             source_range_id: range.id,
             created_at_index,
             source_candle_index,
-            state: LevelState::Active,
+            source_timeframe,
+            state: LevelState::Pending, // Start as Pending until price crosses to other side
             hits: Vec::new(),
             break_event: None,
             tolerance,
@@ -158,25 +173,46 @@ impl Level {
 
     /// Check if a candle interacts with this level and update state.
     ///
-    /// Returns the type of interaction that occurred.
-    pub fn check_interaction(&mut self, candle_index: usize, candle: &Candle) -> LevelInteraction {
+    /// `candle_timeframe` is the timeframe index of the candle being checked.
+    /// A level can only be BROKEN by candles from the same timeframe it was created in.
+    /// Activations and hits can occur from any timeframe.
+    ///
+    /// Level interaction rules:
+    /// 1. A level starts as Pending until price crosses to the "other side"
+    ///    - Bearish level: activated when price goes ABOVE the level
+    ///    - Bullish level: activated when price goes BELOW the level
+    /// 2. Once active, a level can be "hit" when:
+    ///    - Bearish level: the LOW wick touches or goes below the level
+    ///    - Bullish level: the HIGH wick touches or goes above the level
+    /// 3. A hit is "respected" if only the wick touched (body stayed on correct side)
+    ///    Not respected if the body also touched or crossed the level
+    /// 4. A level is "broken" only when a candle of the SAME direction AND SAME TIMEFRAME:
+    ///    - Bearish level: a BEARISH candle opens AND closes fully BELOW the level
+    ///    - Bullish level: a BULLISH candle opens AND closes fully ABOVE the level
+    pub fn check_interaction(&mut self, candle_index: usize, candle: &Candle, candle_timeframe: usize) -> LevelInteraction {
         if self.state == LevelState::Broken {
             return LevelInteraction::None;
         }
 
         let body_top = candle.open.max(candle.close);
         let body_bottom = candle.open.min(candle.close);
+        let candle_direction = if candle.close > candle.open {
+            CandleDirection::Bullish
+        } else if candle.close < candle.open {
+            CandleDirection::Bearish
+        } else {
+            CandleDirection::Doji
+        };
+
+        // A level can only be broken by candles from the same timeframe
+        let can_break = candle_timeframe == self.source_timeframe;
 
         match self.direction {
             CandleDirection::Bearish => {
-                // Bearish level (at highs) - hit when wick goes BELOW the level
-                // Broken when body closes BELOW the level
-                self.check_bearish_level_interaction(candle_index, candle, body_top, body_bottom)
+                self.check_bearish_level_interaction(candle_index, candle, body_top, body_bottom, candle_direction, can_break)
             }
             CandleDirection::Bullish => {
-                // Bullish level (at lows) - hit when wick goes ABOVE the level
-                // Broken when body closes ABOVE the level
-                self.check_bullish_level_interaction(candle_index, candle, body_top, body_bottom)
+                self.check_bullish_level_interaction(candle_index, candle, body_top, body_bottom, candle_direction, can_break)
             }
             CandleDirection::Doji => LevelInteraction::None,
         }
@@ -184,37 +220,59 @@ impl Level {
 
     /// Check bearish level interaction.
     ///
-    /// Bearish levels are at the highs of bearish ranges.
-    /// Hit when the wick touches or goes BELOW the level.
-    /// Broken when the full body closes below the level.
+    /// Bearish levels are at the highs of bearish ranges (resistance).
+    /// - Activated when price goes ABOVE the level
+    /// - Hit when LOW wick touches or goes BELOW the level
+    /// - Broken when a BEARISH candle opens AND closes fully BELOW the level (same timeframe only)
     fn check_bearish_level_interaction(
         &mut self,
         candle_index: usize,
         candle: &Candle,
         body_top: f32,
         body_bottom: f32,
+        candle_direction: CandleDirection,
+        can_break: bool,
     ) -> LevelInteraction {
-        let level_upper = self.price + self.tolerance;
-
-        // Check if the body closed below the level (broken)
-        if body_top < self.price - self.tolerance {
-            // Full body is below the level - BROKEN
-            self.state = LevelState::Broken;
-            self.break_event = Some(LevelBreak {
-                candle_index,
-                close_price: candle.close,
-            });
-            return LevelInteraction::Broken;
+        // Step 1: Check for activation (price must go ABOVE the level first)
+        if self.state == LevelState::Pending {
+            // For bearish level, activate when any part of candle is above the level
+            if candle.high > self.price + self.tolerance {
+                self.state = LevelState::Active;
+                return LevelInteraction::Activated;
+            }
+            // Not yet activated
+            return LevelInteraction::None;
         }
 
-        // Check if the wick touched or went below the level but body stayed above
-        if candle.low <= level_upper && body_bottom >= self.price - self.tolerance {
-            // Wick touched or went below, but body closed above - HIT
+        // Step 2: Check for break (ONLY bearish candles from SAME TIMEFRAME can break bearish levels)
+        // Bearish candle must open AND close fully BELOW the level (not below level - tolerance)
+        // Can only break from Active state (not from Hit state)
+        if self.state == LevelState::Active && can_break && candle_direction == CandleDirection::Bearish {
+            if body_top < self.price && body_bottom < self.price {
+                // Bearish candle with both open and close below level - BROKEN
+                self.state = LevelState::Broken;
+                self.break_event = Some(LevelBreak {
+                    candle_index,
+                    close_price: candle.close,
+                });
+                return LevelInteraction::Broken;
+            }
+        }
+
+        // Step 3: Check for hit (LOW wick touches or goes below level)
+        if candle.low <= self.price + self.tolerance {
+            // Wick touched or went below the level
             let penetration = (self.price - candle.low).max(0.0);
+
+            // Check if respected: body must stay ABOVE the level
+            // Respected = only wick touched, body didn't cross
+            let respected = body_bottom > self.price - self.tolerance;
+
             let hit = LevelHit {
                 candle_index,
                 touch_price: candle.low,
                 penetration,
+                respected,
             };
             self.hits.push(hit);
             self.state = LevelState::Hit;
@@ -226,37 +284,59 @@ impl Level {
 
     /// Check bullish level interaction.
     ///
-    /// Bullish levels are at the lows of bullish ranges.
-    /// Hit when the wick touches or goes ABOVE the level.
-    /// Broken when the full body closes above the level.
+    /// Bullish levels are at the lows of bullish ranges (support).
+    /// - Activated when price goes BELOW the level
+    /// - Hit when HIGH wick touches or goes ABOVE the level
+    /// - Broken when a BULLISH candle opens AND closes fully ABOVE the level (same timeframe only)
     fn check_bullish_level_interaction(
         &mut self,
         candle_index: usize,
         candle: &Candle,
         body_top: f32,
         body_bottom: f32,
+        candle_direction: CandleDirection,
+        can_break: bool,
     ) -> LevelInteraction {
-        let level_lower = self.price - self.tolerance;
-
-        // Check if the body closed above the level (broken)
-        if body_bottom > self.price + self.tolerance {
-            // Full body is above the level - BROKEN
-            self.state = LevelState::Broken;
-            self.break_event = Some(LevelBreak {
-                candle_index,
-                close_price: candle.close,
-            });
-            return LevelInteraction::Broken;
+        // Step 1: Check for activation (price must go BELOW the level first)
+        if self.state == LevelState::Pending {
+            // For bullish level, activate when any part of candle is below the level
+            if candle.low < self.price - self.tolerance {
+                self.state = LevelState::Active;
+                return LevelInteraction::Activated;
+            }
+            // Not yet activated
+            return LevelInteraction::None;
         }
 
-        // Check if the wick touched or went above the level but body stayed below
-        if candle.high >= level_lower && body_top <= self.price + self.tolerance {
-            // Wick touched or went above, but body closed below - HIT
+        // Step 2: Check for break (ONLY bullish candles from SAME TIMEFRAME can break bullish levels)
+        // Bullish candle must open AND close fully ABOVE the level (not above level + tolerance)
+        // Can only break from Active state (not from Hit state)
+        if self.state == LevelState::Active && can_break && candle_direction == CandleDirection::Bullish {
+            if body_bottom > self.price && body_top > self.price {
+                // Bullish candle with both open and close above level - BROKEN
+                self.state = LevelState::Broken;
+                self.break_event = Some(LevelBreak {
+                    candle_index,
+                    close_price: candle.close,
+                });
+                return LevelInteraction::Broken;
+            }
+        }
+
+        // Step 3: Check for hit (HIGH wick touches or goes above level)
+        if candle.high >= self.price - self.tolerance {
+            // Wick touched or went above the level
             let penetration = (candle.high - self.price).max(0.0);
+
+            // Check if respected: body must stay BELOW the level
+            // Respected = only wick touched, body didn't cross
+            let respected = body_top < self.price + self.tolerance;
+
             let hit = LevelHit {
                 candle_index,
                 touch_price: candle.high,
                 penetration,
+                respected,
             };
             self.hits.push(hit);
             self.state = LevelState::Hit;
@@ -272,9 +352,12 @@ impl Level {
 pub enum LevelInteraction {
     /// No interaction occurred.
     None,
-    /// The level was hit (wick touched, body held).
+    /// The level was activated (price crossed to the other side).
+    Activated,
+    /// The level was hit (wick touched level).
+    /// Check `hit.respected` to see if body stayed on correct side.
     Hit(LevelHit),
-    /// The level was broken (body closed through).
+    /// The level was broken (same-direction candle closed fully through).
     Broken,
 }
 
@@ -290,16 +373,19 @@ pub struct LevelTracker {
     pub default_tolerance: f32,
     /// Whether to create both Hold and GreedyHold levels.
     pub create_greedy_levels: bool,
+    /// The timeframe index this tracker is for.
+    pub timeframe: usize,
 }
 
 impl LevelTracker {
-    /// Create a new level tracker.
-    pub fn new(default_tolerance: f32, create_greedy_levels: bool) -> Self {
+    /// Create a new level tracker for a specific timeframe.
+    pub fn new(default_tolerance: f32, create_greedy_levels: bool, timeframe: usize) -> Self {
         Self {
             next_id: 0,
             levels: Vec::new(),
             default_tolerance,
             create_greedy_levels,
+            timeframe,
         }
     }
 
@@ -316,6 +402,7 @@ impl LevelTracker {
             range,
             LevelType::Hold,
             created_at_index,
+            self.timeframe,
             self.default_tolerance,
         );
         self.next_id += 1;
@@ -328,6 +415,7 @@ impl LevelTracker {
                 range,
                 LevelType::GreedyHold,
                 created_at_index,
+                self.timeframe,
                 self.default_tolerance,
             );
             self.next_id += 1;
@@ -346,7 +434,12 @@ impl LevelTracker {
         let mut events = Vec::new();
 
         for level in &mut self.levels {
-            match level.check_interaction(candle_index, candle) {
+            match level.check_interaction(candle_index, candle, self.timeframe) {
+                LevelInteraction::Activated => {
+                    events.push(LevelEvent::Activated {
+                        level_id: level.id,
+                    });
+                }
                 LevelInteraction::Hit(hit) => {
                     events.push(LevelEvent::Hit {
                         level_id: level.id,
@@ -409,11 +502,13 @@ pub struct OptimizedLevelTracker {
     pub create_greedy_levels: bool,
     /// Whether bucket_size has been initialized.
     initialized: bool,
+    /// The timeframe index this tracker is for.
+    pub timeframe: usize,
 }
 
 impl OptimizedLevelTracker {
-    /// Create a new optimized level tracker.
-    pub fn new(default_tolerance: f32, create_greedy_levels: bool) -> Self {
+    /// Create a new optimized level tracker for a specific timeframe.
+    pub fn new(default_tolerance: f32, create_greedy_levels: bool, timeframe: usize) -> Self {
         Self {
             next_id: 0,
             levels: Vec::new(),
@@ -422,6 +517,7 @@ impl OptimizedLevelTracker {
             default_tolerance,
             create_greedy_levels,
             initialized: false,
+            timeframe,
         }
     }
 
@@ -476,6 +572,7 @@ impl OptimizedLevelTracker {
             range,
             LevelType::Hold,
             created_at_index,
+            self.timeframe,
             self.default_tolerance,
         );
         let hold_price = hold_level.price;
@@ -491,6 +588,7 @@ impl OptimizedLevelTracker {
                 range,
                 LevelType::GreedyHold,
                 created_at_index,
+                self.timeframe,
                 self.default_tolerance,
             );
             let greedy_price = greedy_level.price;
@@ -546,7 +644,12 @@ impl OptimizedLevelTracker {
                 continue;
             }
 
-            match level.check_interaction(candle_index, candle) {
+            match level.check_interaction(candle_index, candle, self.timeframe) {
+                LevelInteraction::Activated => {
+                    events.push(LevelEvent::Activated {
+                        level_id: level.id,
+                    });
+                }
                 LevelInteraction::Hit(hit) => {
                     events.push(LevelEvent::Hit {
                         level_id: level.id,
@@ -620,6 +723,8 @@ impl OptimizedLevelTracker {
 pub enum LevelEvent {
     /// A new level was created.
     Created { level_id: LevelId },
+    /// A level was activated (price crossed to the other side).
+    Activated { level_id: LevelId },
     /// A level was hit.
     Hit { level_id: LevelId, hit: LevelHit },
     /// A level was broken.
@@ -657,25 +762,68 @@ mod tests {
         }
     }
 
+    fn make_bullish_range() -> Range {
+        // Bullish range creates SUPPORT at lows
+        Range {
+            id: RangeId::new(2),
+            direction: CandleDirection::Bullish,
+            start_index: 0,
+            end_index: 1,
+            candle_count: 2,
+            high: 120.0,
+            low: 100.0,
+            open: 105.0,
+            close: 115.0,
+            total_volume: 200.0,
+            first_high: 110.0,
+            first_low: 100.0,  // First candle low
+            last_high: 120.0,
+            last_low: 105.0,   // Last candle low
+        }
+    }
+
     #[test]
-    fn test_bearish_level_hit() {
+    fn test_bearish_level_activation() {
         let range = make_bearish_range();
-        // Bearish creates level at highs
-        // Hold level = max(first_high, last_high) = max(115, 112) = 115
-        let mut level = Level::from_range(LevelId::new(1), &range, LevelType::Hold, 2, 0.5);
+        // Level at 115.0 (max of first_high and last_high)
+        let mut level = Level::from_range(LevelId::new(1), &range, LevelType::Hold, 2, 0, 0.5);
 
         assert_eq!(level.price, 115.0);
-        assert!(level.is_bearish());
+        assert_eq!(level.state, LevelState::Pending);
 
-        // Candle with wick touching/going below bearish level but body staying above
-        // Low = 114.5 (touches level at 115), but body closes above (close = 118)
+        // Candle below level - should NOT activate (need to go ABOVE first)
+        let candle_below = make_candle(110.0, 112.0, 108.0, 111.0);
+        let interaction = level.check_interaction(3, &candle_below, 0);
+        assert!(matches!(interaction, LevelInteraction::None));
+        assert_eq!(level.state, LevelState::Pending);
+
+        // Candle going above level - should activate
+        let candle_above = make_candle(114.0, 118.0, 113.0, 117.0);
+        let interaction = level.check_interaction(4, &candle_above, 0);
+        assert!(matches!(interaction, LevelInteraction::Activated));
+        assert_eq!(level.state, LevelState::Active);
+    }
+
+    #[test]
+    fn test_bearish_level_hit_respected() {
+        let range = make_bearish_range();
+        let mut level = Level::from_range(LevelId::new(1), &range, LevelType::Hold, 2, 0, 0.5);
+
+        // First activate the level (price goes above)
+        let candle_above = make_candle(114.0, 118.0, 113.0, 117.0);
+        level.check_interaction(3, &candle_above, 0);
+        assert_eq!(level.state, LevelState::Active);
+
+        // Now test hit: wick touches level but body stays above (respected)
+        // Level at 115, low=114.5 touches, but body (open=117, close=118) stays above
         let candle = make_candle(117.0, 120.0, 114.5, 118.0);
-        let interaction = level.check_interaction(3, &candle);
+        let interaction = level.check_interaction(4, &candle, 0);
 
         match interaction {
             LevelInteraction::Hit(hit) => {
-                assert_eq!(hit.candle_index, 3);
+                assert_eq!(hit.candle_index, 4);
                 assert_eq!(hit.touch_price, 114.5);
+                assert!(hit.respected, "Body stayed above, should be respected");
             }
             _ => panic!("Expected Hit"),
         }
@@ -685,14 +833,99 @@ mod tests {
     }
 
     #[test]
-    fn test_bearish_level_broken() {
+    fn test_bearish_level_hit_not_respected() {
         let range = make_bearish_range();
-        let mut level = Level::from_range(LevelId::new(1), &range, LevelType::Hold, 2, 0.5);
+        let mut level = Level::from_range(LevelId::new(1), &range, LevelType::Hold, 2, 0, 0.5);
 
-        // Bearish level is broken when body closes BELOW the level
-        // Level is at 115, body is fully below (open=114, close=112)
+        // Activate
+        let candle_above = make_candle(114.0, 118.0, 113.0, 117.0);
+        level.check_interaction(3, &candle_above, 0);
+
+        // Hit where body also crosses the level (not respected)
+        // Level at 115, body bottom = min(114.5, 116) = 114.5 which is below level
+        let candle = make_candle(114.5, 120.0, 112.0, 116.0);
+        let interaction = level.check_interaction(4, &candle, 0);
+
+        match interaction {
+            LevelInteraction::Hit(hit) => {
+                assert!(!hit.respected, "Body crossed level, should NOT be respected");
+            }
+            _ => panic!("Expected Hit"),
+        }
+    }
+
+    #[test]
+    fn test_bearish_level_broken_by_bearish_candle() {
+        let range = make_bearish_range();
+        let mut level = Level::from_range(LevelId::new(1), &range, LevelType::Hold, 2, 0, 0.5);
+
+        // Activate
+        let candle_above = make_candle(114.0, 118.0, 113.0, 117.0);
+        level.check_interaction(3, &candle_above, 0);
+
+        // Bearish candle (close < open) with body fully below level = BROKEN
+        // Level at 115, open=114 close=112 both below 115
         let candle = make_candle(114.0, 114.5, 110.0, 112.0);
-        let interaction = level.check_interaction(3, &candle);
+        let interaction = level.check_interaction(4, &candle, 0);
+
+        assert!(matches!(interaction, LevelInteraction::Broken));
+        assert_eq!(level.state, LevelState::Broken);
+    }
+
+    #[test]
+    fn test_bearish_level_not_broken_by_bullish_candle() {
+        let range = make_bearish_range();
+        let mut level = Level::from_range(LevelId::new(1), &range, LevelType::Hold, 2, 0, 0.5);
+
+        // Activate
+        let candle_above = make_candle(114.0, 118.0, 113.0, 117.0);
+        level.check_interaction(3, &candle_above, 0);
+
+        // Bullish candle (close > open) with body fully below level = NOT broken (just a hit)
+        // Only BEARISH candles can break bearish levels
+        let candle = make_candle(112.0, 114.5, 110.0, 114.0);
+        let interaction = level.check_interaction(4, &candle, 0);
+
+        // Should be a hit (wick touched) but NOT broken
+        assert!(matches!(interaction, LevelInteraction::Hit(_)));
+        assert_eq!(level.state, LevelState::Hit);
+    }
+
+    #[test]
+    fn test_bullish_level_activation() {
+        let range = make_bullish_range();
+        // Level at 100.0 (min of first_low and last_low)
+        let mut level = Level::from_range(LevelId::new(1), &range, LevelType::Hold, 2, 0, 0.5);
+
+        assert_eq!(level.price, 100.0);
+        assert_eq!(level.state, LevelState::Pending);
+
+        // Candle above level - should NOT activate (need to go BELOW first)
+        let candle_above = make_candle(105.0, 110.0, 102.0, 108.0);
+        let interaction = level.check_interaction(3, &candle_above, 0);
+        assert!(matches!(interaction, LevelInteraction::None));
+        assert_eq!(level.state, LevelState::Pending);
+
+        // Candle going below level - should activate
+        let candle_below = make_candle(101.0, 102.0, 98.0, 99.0);
+        let interaction = level.check_interaction(4, &candle_below, 0);
+        assert!(matches!(interaction, LevelInteraction::Activated));
+        assert_eq!(level.state, LevelState::Active);
+    }
+
+    #[test]
+    fn test_bullish_level_broken_by_bullish_candle() {
+        let range = make_bullish_range();
+        let mut level = Level::from_range(LevelId::new(1), &range, LevelType::Hold, 2, 0, 0.5);
+
+        // Activate (price goes below)
+        let candle_below = make_candle(101.0, 102.0, 98.0, 99.0);
+        level.check_interaction(3, &candle_below, 0);
+
+        // Bullish candle (close > open) with body fully above level = BROKEN
+        // Level at 100, open=101 close=105 both above 100
+        let candle = make_candle(101.0, 106.0, 100.5, 105.0);
+        let interaction = level.check_interaction(4, &candle, 0);
 
         assert!(matches!(interaction, LevelInteraction::Broken));
         assert_eq!(level.state, LevelState::Broken);
@@ -700,7 +933,7 @@ mod tests {
 
     #[test]
     fn test_level_tracker() {
-        let mut tracker = LevelTracker::new(0.5, true);
+        let mut tracker = LevelTracker::new(0.5, true, 0);
         let range = make_bearish_range();
 
         tracker.create_levels_from_range(&range, 2);
@@ -708,5 +941,45 @@ mod tests {
         assert_eq!(tracker.levels.len(), 2);
         assert_eq!(tracker.levels[0].level_type, LevelType::Hold);
         assert_eq!(tracker.levels[1].level_type, LevelType::GreedyHold);
+    }
+
+    #[test]
+    fn test_level_not_broken_by_different_timeframe() {
+        let range = make_bearish_range();
+        // Create level in timeframe 0
+        let mut level = Level::from_range(LevelId::new(1), &range, LevelType::Hold, 2, 0, 0.5);
+
+        // Activate from any timeframe (activation doesn't require same timeframe)
+        let candle_above = make_candle(114.0, 118.0, 113.0, 117.0);
+        level.check_interaction(3, &candle_above, 1); // Different timeframe
+        assert_eq!(level.state, LevelState::Active);
+
+        // Bearish candle that would break the level IF same timeframe
+        // But we pass timeframe 1 (different from level's timeframe 0)
+        let candle = make_candle(114.0, 114.5, 110.0, 112.0);
+        let interaction = level.check_interaction(4, &candle, 1); // Different timeframe
+
+        // Should NOT be broken (different timeframe), but could still be a hit
+        assert!(!matches!(interaction, LevelInteraction::Broken));
+        assert_ne!(level.state, LevelState::Broken);
+    }
+
+    #[test]
+    fn test_level_broken_by_same_timeframe() {
+        let range = make_bearish_range();
+        // Create level in timeframe 0
+        let mut level = Level::from_range(LevelId::new(1), &range, LevelType::Hold, 2, 0, 0.5);
+
+        // Activate
+        let candle_above = make_candle(114.0, 118.0, 113.0, 117.0);
+        level.check_interaction(3, &candle_above, 0);
+        assert_eq!(level.state, LevelState::Active);
+
+        // Bearish candle with same timeframe should break it
+        let candle = make_candle(114.0, 114.5, 110.0, 112.0);
+        let interaction = level.check_interaction(4, &candle, 0); // Same timeframe
+
+        assert!(matches!(interaction, LevelInteraction::Broken));
+        assert_eq!(level.state, LevelState::Broken);
     }
 }

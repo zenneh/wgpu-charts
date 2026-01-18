@@ -64,6 +64,13 @@ fn vs_main(
     let dy = p1.y - p0.y;
     let len = sqrt(dx * dx + dy * dy);
 
+    // Handle zero-length segments to avoid division by zero
+    if len < 0.0001 {
+        out.clip_position = vec4<f32>(0.0, 0.0, 0.0, 1.0);
+        out.color = vec3<f32>(0.0, 0.0, 0.0);
+        return out;
+    }
+
     // Perpendicular (normal) vector for thickness
     let nx = -dy / len * params.line_thickness / 2.0;
     let ny = dx / len * params.line_thickness / 2.0;
