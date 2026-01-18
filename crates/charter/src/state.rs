@@ -15,10 +15,11 @@ use winit::{
 use charter_core::{aggregate_candles, Candle, Timeframe};
 use charter_data::CsvLoader;
 use charter_data::DataSource;
+use charter_indicators::{Indicator, Macd, MacdConfig, MacdOutput};
 use charter_render::{
-    ChartRenderer, LevelGpu, RangeGpu, RenderParams, TaRenderParams, TimeframeData, TrendGpu,
-    VolumeRenderParams, CANDLE_SPACING, MAX_TA_LEVELS, MAX_TA_RANGES, MAX_TA_TRENDS,
-    STATS_PANEL_WIDTH, VERTICES_PER_CANDLE, VOLUME_HEIGHT_RATIO,
+    ChartRenderer, IndicatorParams, IndicatorPointGpu, LevelGpu, RangeGpu, RenderParams,
+    TaRenderParams, TimeframeData, TrendGpu, VolumeRenderParams, CANDLE_SPACING, MAX_TA_LEVELS,
+    MAX_TA_RANGES, MAX_TA_TRENDS, STATS_PANEL_WIDTH, VERTICES_PER_CANDLE, VOLUME_HEIGHT_RATIO,
 };
 use charter_ta::{
     Analyzer, AnalyzerConfig, CandleDirection, Level, LevelState, LevelType, Range, Trend,
@@ -116,6 +117,62 @@ impl Default for TaDisplaySettings {
     }
 }
 
+/// A single MACD indicator instance with configuration and computed data.
+#[derive(Clone)]
+pub struct MacdInstance {
+    /// Unique identifier for this instance.
+    pub id: usize,
+    /// Configuration for this MACD.
+    pub config: MacdConfig,
+    /// Computed output per timeframe.
+    pub outputs: Vec<Option<MacdOutput>>,
+}
+
+impl MacdInstance {
+    pub fn new(id: usize, config: MacdConfig, num_timeframes: usize) -> Self {
+        Self {
+            id,
+            config,
+            outputs: vec![None; num_timeframes],
+        }
+    }
+
+    pub fn label(&self) -> String {
+        format!(
+            "MACD({},{},{})",
+            self.config.fast_period, self.config.slow_period, self.config.signal_period
+        )
+    }
+}
+
+/// GPU buffers for rendering MACD indicators.
+pub struct MacdGpuBuffers {
+    pub macd_line_buffer: wgpu::Buffer,
+    pub signal_line_buffer: wgpu::Buffer,
+    pub histogram_buffer: wgpu::Buffer,
+    pub params_buffer: wgpu::Buffer,
+    pub signal_params_buffer: wgpu::Buffer,
+    pub macd_bind_group: wgpu::BindGroup,
+    pub signal_bind_group: wgpu::BindGroup,
+    pub histogram_bind_group: wgpu::BindGroup,
+    pub macd_point_count: u32,
+    pub signal_point_count: u32,
+    pub histogram_point_count: u32,
+    /// Candle index where MACD line data starts.
+    pub macd_start_index: usize,
+    /// Candle index where signal line data starts.
+    pub signal_start_index: usize,
+}
+
+/// MACD conversion result with points and start indices.
+struct MacdConversionResult {
+    macd_points: Vec<IndicatorPointGpu>,
+    signal_points: Vec<IndicatorPointGpu>,
+    histogram_points: Vec<IndicatorPointGpu>,
+    macd_start_index: usize,
+    signal_start_index: usize,
+}
+
 /// TA data computed for a single timeframe.
 pub struct TimeframeTaData {
     pub ranges: Vec<Range>,
@@ -142,6 +199,13 @@ pub struct State {
     pub ta_settings: TaDisplaySettings,
     pub hovered_range: Option<usize>,
     pub hovered_level: Option<usize>,
+    pub hovered_trend: Option<usize>,
+
+    // MACD Indicators
+    pub macd_instances: Vec<MacdInstance>,
+    pub macd_next_id: usize,
+    pub macd_gpu_buffers: Vec<MacdGpuBuffers>,
+    pub show_macd_panel: bool,
 
     // Background loading
     pub loading_state: LoadingState,
@@ -309,6 +373,11 @@ impl State {
             ta_settings: TaDisplaySettings::default(),
             hovered_range: None,
             hovered_level: None,
+            hovered_trend: None,
+            macd_instances: Vec::new(),
+            macd_next_id: 0,
+            macd_gpu_buffers: Vec::new(),
+            show_macd_panel: false,
             loading_state: LoadingState::LoadingData,
             bg_receiver,
             bg_sender,
@@ -340,6 +409,58 @@ impl State {
         self.renderer.update_visible_range(&self.queue, tf);
         if self.ta_settings.show_ta {
             self.update_ta_buffers();
+        }
+        // Update MACD params when view changes (first_visible depends on visible_start)
+        if !self.macd_instances.is_empty() {
+            self.update_macd_params();
+        }
+    }
+
+    /// Update only the MACD params buffers (when view changes).
+    /// This is more efficient than update_macd_gpu_buffers which also updates point data.
+    fn update_macd_params(&mut self) {
+        let visible_start = self.renderer.visible_start as usize;
+
+        for i in 0..self.macd_gpu_buffers.len() {
+            let buffers = &self.macd_gpu_buffers[i];
+
+            // Calculate first_visible as offset into the indicator's points array
+            let macd_first_visible = if visible_start > buffers.macd_start_index {
+                (visible_start - buffers.macd_start_index) as u32
+            } else {
+                0
+            };
+            let signal_first_visible = if visible_start > buffers.signal_start_index {
+                (visible_start - buffers.signal_start_index) as u32
+            } else {
+                0
+            };
+
+            // Update MACD params
+            let macd_params = IndicatorParams {
+                first_visible: macd_first_visible,
+                point_spacing: CANDLE_SPACING,
+                line_thickness: 2.0,
+                count: buffers.macd_point_count,
+            };
+            self.queue.write_buffer(
+                &buffers.params_buffer,
+                0,
+                bytemuck::cast_slice(&[macd_params]),
+            );
+
+            // Update signal params
+            let signal_params = IndicatorParams {
+                first_visible: signal_first_visible,
+                point_spacing: CANDLE_SPACING,
+                line_thickness: 2.0,
+                count: buffers.signal_point_count,
+            };
+            self.queue.write_buffer(
+                &buffers.signal_params_buffer,
+                0,
+                bytemuck::cast_slice(&[signal_params]),
+            );
         }
     }
 
@@ -506,6 +627,7 @@ impl State {
             (KeyCode::Escape, true) => event_loop.exit(),
             (KeyCode::KeyF, true) | (KeyCode::Home, true) => self.fit_view(),
             (KeyCode::KeyP, true) => self.toggle_ta(),
+            (KeyCode::KeyM, true) => self.toggle_macd_panel(),
             (KeyCode::KeyR, true) => self.toggle_replay_mode(),
             (KeyCode::BracketRight, true) => self.replay_step_forward(),
             (KeyCode::BracketLeft, true) => self.replay_step_backward(),
@@ -518,6 +640,11 @@ impl State {
             (KeyCode::Digit5, true) => self.switch_timeframe(4),
             _ => {}
         }
+    }
+
+    fn toggle_macd_panel(&mut self) {
+        self.show_macd_panel = !self.show_macd_panel;
+        self.window.request_redraw();
     }
 
     fn toggle_ta(&mut self) {
@@ -822,6 +949,7 @@ impl State {
                     LevelType::GreedyHold => self.ta_settings.show_greedy_levels,
                 };
                 let state_ok = match l.state {
+                    LevelState::Pending => self.ta_settings.show_active_levels, // Pending shown with active
                     LevelState::Active => self.ta_settings.show_active_levels,
                     LevelState::Hit => self.ta_settings.show_hit_levels,
                     LevelState::Broken => self.ta_settings.show_broken_levels,
@@ -838,9 +966,12 @@ impl State {
             .iter()
             .map(|l| {
                 let (r, g, b, a) = match (l.direction, l.state) {
+                    // Pending levels: dimmer than active (waiting for price to cross)
+                    (CandleDirection::Bullish, LevelState::Pending) => (0.0, 0.5, 0.3, 0.4),
                     (CandleDirection::Bullish, LevelState::Active) => (0.0, 0.8, 0.4, 0.7),
                     (CandleDirection::Bullish, LevelState::Hit) => (0.0, 0.6, 0.3, 0.5),
                     (CandleDirection::Bullish, LevelState::Broken) => (0.0, 0.3, 0.2, 0.3),
+                    (CandleDirection::Bearish, LevelState::Pending) => (0.5, 0.15, 0.15, 0.4),
                     (CandleDirection::Bearish, LevelState::Active) => (0.8, 0.2, 0.2, 0.7),
                     (CandleDirection::Bearish, LevelState::Hit) => (0.6, 0.2, 0.2, 0.5),
                     (CandleDirection::Bearish, LevelState::Broken) => (0.3, 0.1, 0.1, 0.3),
@@ -978,6 +1109,361 @@ impl State {
         );
     }
 
+    // =========================================================================
+    // MACD Indicator Methods
+    // =========================================================================
+
+    /// Add a new MACD indicator instance with the given configuration.
+    pub fn add_macd(&mut self, config: MacdConfig) {
+        let num_timeframes = self.timeframes.len();
+        let id = self.macd_next_id;
+        self.macd_next_id += 1;
+
+        let mut instance = MacdInstance::new(id, config, num_timeframes);
+
+        // Compute MACD for current timeframe immediately
+        self.compute_macd_for_instance(&mut instance, self.current_timeframe);
+
+        self.macd_instances.push(instance);
+
+        // Create GPU buffers for this instance
+        self.create_macd_gpu_buffers_for_instance(self.macd_instances.len() - 1);
+    }
+
+    /// Remove a MACD indicator instance by index.
+    pub fn remove_macd(&mut self, index: usize) {
+        if index < self.macd_instances.len() {
+            self.macd_instances.remove(index);
+            self.macd_gpu_buffers.remove(index);
+        }
+    }
+
+    /// Compute MACD for a specific instance and timeframe.
+    fn compute_macd_for_instance(&self, instance: &mut MacdInstance, timeframe: usize) {
+        let candles = &self.timeframes[timeframe].candles;
+        if candles.is_empty() {
+            instance.outputs[timeframe] = None;
+            return;
+        }
+
+        let macd = Macd::new(instance.config.clone());
+        let output = macd.calculate_macd(candles);
+        instance.outputs[timeframe] = Some(output);
+    }
+
+    /// Recompute MACD for all instances on the current timeframe.
+    fn recompute_all_macd(&mut self) {
+        let tf = self.current_timeframe;
+        for i in 0..self.macd_instances.len() {
+            let candles = &self.timeframes[tf].candles;
+            if candles.is_empty() {
+                self.macd_instances[i].outputs[tf] = None;
+                continue;
+            }
+
+            let macd = Macd::new(self.macd_instances[i].config.clone());
+            let output = macd.calculate_macd(candles);
+            self.macd_instances[i].outputs[tf] = Some(output);
+        }
+
+        // Update GPU buffers
+        self.update_macd_gpu_buffers();
+    }
+
+    /// Create GPU buffers for a single MACD instance.
+    fn create_macd_gpu_buffers_for_instance(&mut self, instance_idx: usize) {
+        let instance = &self.macd_instances[instance_idx];
+        let tf = self.current_timeframe;
+
+        // Get the output for current timeframe
+        let conversion = self.convert_macd_to_gpu_points(instance, tf);
+
+        // Create buffers
+        let macd_line_buffer = self
+            .renderer
+            .indicator_pipeline
+            .create_indicator_buffer(&self.device, &conversion.macd_points);
+        let signal_line_buffer = self
+            .renderer
+            .indicator_pipeline
+            .create_indicator_buffer(&self.device, &conversion.signal_points);
+        let histogram_buffer = self
+            .renderer
+            .indicator_pipeline
+            .create_indicator_buffer(&self.device, &conversion.histogram_points);
+
+        // Create separate params buffers for MACD and signal lines (they have different start indices)
+        let params_buffer = self
+            .renderer
+            .indicator_pipeline
+            .create_indicator_params_buffer(&self.device);
+        let signal_params_buffer = self
+            .renderer
+            .indicator_pipeline
+            .create_indicator_params_buffer(&self.device);
+
+        let macd_bind_group = self.renderer.indicator_pipeline.create_bind_group(
+            &self.device,
+            &macd_line_buffer,
+            &params_buffer,
+        );
+        let signal_bind_group = self.renderer.indicator_pipeline.create_bind_group(
+            &self.device,
+            &signal_line_buffer,
+            &signal_params_buffer,
+        );
+        let histogram_bind_group = self.renderer.indicator_pipeline.create_bind_group(
+            &self.device,
+            &histogram_buffer,
+            &params_buffer,
+        );
+
+        let buffers = MacdGpuBuffers {
+            macd_line_buffer,
+            signal_line_buffer,
+            histogram_buffer,
+            params_buffer,
+            signal_params_buffer,
+            macd_bind_group,
+            signal_bind_group,
+            histogram_bind_group,
+            macd_point_count: conversion.macd_points.len() as u32,
+            signal_point_count: conversion.signal_points.len() as u32,
+            histogram_point_count: conversion.histogram_points.len() as u32,
+            macd_start_index: conversion.macd_start_index,
+            signal_start_index: conversion.signal_start_index,
+        };
+
+        if instance_idx < self.macd_gpu_buffers.len() {
+            self.macd_gpu_buffers[instance_idx] = buffers;
+        } else {
+            self.macd_gpu_buffers.push(buffers);
+        }
+    }
+
+    /// Convert MACD output to GPU points for rendering.
+    fn convert_macd_to_gpu_points(
+        &self,
+        instance: &MacdInstance,
+        timeframe: usize,
+    ) -> MacdConversionResult {
+        let output = match &instance.outputs[timeframe] {
+            Some(o) => o,
+            None => {
+                return MacdConversionResult {
+                    macd_points: vec![IndicatorPointGpu {
+                        x: 0.0,
+                        y: 0.0,
+                        r: 0.0,
+                        g: 0.0,
+                        b: 0.0,
+                        _padding: 0.0,
+                    }],
+                    signal_points: vec![IndicatorPointGpu {
+                        x: 0.0,
+                        y: 0.0,
+                        r: 0.0,
+                        g: 0.0,
+                        b: 0.0,
+                        _padding: 0.0,
+                    }],
+                    histogram_points: vec![IndicatorPointGpu {
+                        x: 0.0,
+                        y: 0.0,
+                        r: 0.0,
+                        g: 0.0,
+                        b: 0.0,
+                        _padding: 0.0,
+                    }],
+                    macd_start_index: 0,
+                    signal_start_index: 0,
+                };
+            }
+        };
+
+        let config = &instance.config;
+        let macd_start_index = output.macd_line.start_index();
+        let signal_start_index = output.signal_line.start_index();
+
+        // Convert MACD line
+        let mut macd_points: Vec<IndicatorPointGpu> = output
+            .macd_line
+            .iter()
+            .map(|(idx, &val)| IndicatorPointGpu {
+                x: idx as f32 * CANDLE_SPACING,
+                y: val,
+                r: config.macd_color[0],
+                g: config.macd_color[1],
+                b: config.macd_color[2],
+                _padding: 0.0,
+            })
+            .collect();
+
+        // Convert signal line
+        let mut signal_points: Vec<IndicatorPointGpu> = output
+            .signal_line
+            .iter()
+            .map(|(idx, &val)| IndicatorPointGpu {
+                x: idx as f32 * CANDLE_SPACING,
+                y: val,
+                r: config.signal_color[0],
+                g: config.signal_color[1],
+                b: config.signal_color[2],
+                _padding: 0.0,
+            })
+            .collect();
+
+        // Convert histogram (as points for now - could be rendered as bars)
+        let mut histogram_points: Vec<IndicatorPointGpu> = output
+            .histogram
+            .iter()
+            .map(|(idx, &val)| {
+                let color = if val >= 0.0 {
+                    config.histogram_pos_color
+                } else {
+                    config.histogram_neg_color
+                };
+                IndicatorPointGpu {
+                    x: idx as f32 * CANDLE_SPACING,
+                    y: val,
+                    r: color[0],
+                    g: color[1],
+                    b: color[2],
+                    _padding: 0.0,
+                }
+            })
+            .collect();
+
+        // Ensure at least one point for GPU buffers
+        if macd_points.is_empty() {
+            macd_points.push(IndicatorPointGpu {
+                x: 0.0,
+                y: 0.0,
+                r: 0.0,
+                g: 0.0,
+                b: 0.0,
+                _padding: 0.0,
+            });
+        }
+        if signal_points.is_empty() {
+            signal_points.push(IndicatorPointGpu {
+                x: 0.0,
+                y: 0.0,
+                r: 0.0,
+                g: 0.0,
+                b: 0.0,
+                _padding: 0.0,
+            });
+        }
+        if histogram_points.is_empty() {
+            histogram_points.push(IndicatorPointGpu {
+                x: 0.0,
+                y: 0.0,
+                r: 0.0,
+                g: 0.0,
+                b: 0.0,
+                _padding: 0.0,
+            });
+        }
+
+        MacdConversionResult {
+            macd_points,
+            signal_points,
+            histogram_points,
+            macd_start_index,
+            signal_start_index,
+        }
+    }
+
+    /// Update GPU buffers for all MACD instances.
+    fn update_macd_gpu_buffers(&mut self) {
+        let tf = self.current_timeframe;
+        let visible_start = self.renderer.visible_start as usize;
+
+        for i in 0..self.macd_instances.len() {
+            if i >= self.macd_gpu_buffers.len() {
+                self.create_macd_gpu_buffers_for_instance(i);
+                continue;
+            }
+
+            let instance = &self.macd_instances[i];
+            let conversion = self.convert_macd_to_gpu_points(instance, tf);
+
+            // Update buffers
+            self.queue.write_buffer(
+                &self.macd_gpu_buffers[i].macd_line_buffer,
+                0,
+                bytemuck::cast_slice(&conversion.macd_points),
+            );
+            self.queue.write_buffer(
+                &self.macd_gpu_buffers[i].signal_line_buffer,
+                0,
+                bytemuck::cast_slice(&conversion.signal_points),
+            );
+            self.queue.write_buffer(
+                &self.macd_gpu_buffers[i].histogram_buffer,
+                0,
+                bytemuck::cast_slice(&conversion.histogram_points),
+            );
+
+            // Calculate first_visible as offset into the indicator's points array.
+            // If visible_start is 100 and MACD starts at candle 25, we want to render
+            // starting from points array index 75 (= 100 - 25).
+            // If visible_start is before MACD starts, we render from the beginning (index 0).
+            let macd_first_visible = if visible_start > conversion.macd_start_index {
+                (visible_start - conversion.macd_start_index) as u32
+            } else {
+                0
+            };
+            let signal_first_visible = if visible_start > conversion.signal_start_index {
+                (visible_start - conversion.signal_start_index) as u32
+            } else {
+                0
+            };
+
+            // Update MACD params
+            let macd_params = IndicatorParams {
+                first_visible: macd_first_visible,
+                point_spacing: CANDLE_SPACING,
+                line_thickness: 2.0,
+                count: conversion.macd_points.len() as u32,
+            };
+            self.queue.write_buffer(
+                &self.macd_gpu_buffers[i].params_buffer,
+                0,
+                bytemuck::cast_slice(&[macd_params]),
+            );
+
+            // Update signal params (different start index)
+            let signal_params = IndicatorParams {
+                first_visible: signal_first_visible,
+                point_spacing: CANDLE_SPACING,
+                line_thickness: 2.0,
+                count: conversion.signal_points.len() as u32,
+            };
+            self.queue.write_buffer(
+                &self.macd_gpu_buffers[i].signal_params_buffer,
+                0,
+                bytemuck::cast_slice(&[signal_params]),
+            );
+
+            // Store start indices for later use
+            self.macd_gpu_buffers[i].macd_start_index = conversion.macd_start_index;
+            self.macd_gpu_buffers[i].signal_start_index = conversion.signal_start_index;
+        }
+
+        // Update point counts
+        for i in 0..self.macd_instances.len() {
+            if i < self.macd_gpu_buffers.len() {
+                let instance = &self.macd_instances[i];
+                let conversion = self.convert_macd_to_gpu_points(instance, tf);
+                self.macd_gpu_buffers[i].macd_point_count = conversion.macd_points.len() as u32;
+                self.macd_gpu_buffers[i].signal_point_count = conversion.signal_points.len() as u32;
+                self.macd_gpu_buffers[i].histogram_point_count = conversion.histogram_points.len() as u32;
+            }
+        }
+    }
+
     fn switch_timeframe(&mut self, index: usize) {
         if index >= self.timeframes.len() || index == self.current_timeframe {
             return;
@@ -1017,6 +1503,10 @@ impl State {
         // Compute TA first (if enabled) before update_visible_range calls update_ta_buffers
         if self.ta_settings.show_ta {
             self.ensure_ta_computed();
+        }
+        // Recompute MACD for new timeframe
+        if !self.macd_instances.is_empty() {
+            self.recompute_all_macd();
         }
         self.update_visible_range();
         self.window.request_redraw();
@@ -1207,8 +1697,28 @@ impl State {
             })
         });
 
+        let hovered_trend_info = self.hovered_trend.and_then(|idx| {
+            self.ta_data[self.current_timeframe].trends.get(idx).map(|t| {
+                (
+                    t.direction,
+                    t.state,
+                    t.start.price,
+                    t.end.price,
+                    t.start.candle_index,
+                    t.end.candle_index,
+                    t.hits.len(),
+                )
+            })
+        });
+
         // Copy TA settings for egui (will be copied back after)
         let mut ta_settings = self.ta_settings.clone();
+
+        // Copy MACD instances for egui (will apply changes after)
+        let mut macd_configs: Vec<MacdConfig> = self.macd_instances.iter().map(|i| i.config.clone()).collect();
+        let mut macd_add_requested = false;
+        let mut macd_remove_index: Option<usize> = None;
+        let show_macd_panel = self.show_macd_panel;
 
         // Get guideline values and visible range for price labels
         let guideline_values = self.renderer.guideline_values.clone();
@@ -1319,8 +1829,91 @@ impl State {
                             ui.label(format!("  State: {:?}", state));
                             ui.label(format!("  Hits: {}", hits));
                         }
+
+                        if let Some((dir, state, start_price, end_price, start_idx, end_idx, hits)) = hovered_trend_info {
+                            ui.separator();
+                            ui.label("Hovered Trend:");
+                            ui.label(format!("  Direction: {:?}", dir));
+                            ui.label(format!("  State: {:?}", state));
+                            ui.label(format!("  Start: {:.2} @ idx {}", start_price, start_idx));
+                            ui.label(format!("  End: {:.2} @ idx {}", end_price, end_idx));
+                            ui.label(format!("  Hits: {}", hits));
+                        }
                     }
                 });
+
+            // MACD Indicators panel
+            if show_macd_panel {
+                egui::Window::new("MACD Indicators")
+                    .default_pos([self.config.width as f32 - STATS_PANEL_WIDTH - 440.0, 10.0])
+                    .default_width(200.0)
+                    .resizable(false)
+                    .show(ctx, |ui| {
+                        ui.label("Press M to toggle this panel");
+                        ui.separator();
+
+                        // Add new MACD button
+                        if ui.button("+ Add MACD").clicked() {
+                            macd_add_requested = true;
+                        }
+
+                        ui.separator();
+
+                        // List existing MACD instances
+                        for (i, config) in macd_configs.iter_mut().enumerate() {
+                            ui.push_id(i, |ui| {
+                                ui.group(|ui| {
+                                    ui.horizontal(|ui| {
+                                        ui.label(format!("MACD #{}", i + 1));
+                                        if ui.small_button("X").clicked() {
+                                            macd_remove_index = Some(i);
+                                        }
+                                    });
+
+                                    // Enable toggle
+                                    ui.checkbox(&mut config.enabled, "Enabled");
+
+                                    // Period settings
+                                    ui.horizontal(|ui| {
+                                        ui.label("Fast:");
+                                        let mut fast = config.fast_period as i32;
+                                        if ui.add(egui::DragValue::new(&mut fast).range(1..=100)).changed() {
+                                            config.fast_period = fast.max(1) as usize;
+                                        }
+                                    });
+
+                                    ui.horizontal(|ui| {
+                                        ui.label("Slow:");
+                                        let mut slow = config.slow_period as i32;
+                                        if ui.add(egui::DragValue::new(&mut slow).range(1..=200)).changed() {
+                                            config.slow_period = slow.max(1) as usize;
+                                        }
+                                    });
+
+                                    ui.horizontal(|ui| {
+                                        ui.label("Signal:");
+                                        let mut signal = config.signal_period as i32;
+                                        if ui.add(egui::DragValue::new(&mut signal).range(1..=100)).changed() {
+                                            config.signal_period = signal.max(1) as usize;
+                                        }
+                                    });
+
+                                    // Color pickers (compact)
+                                    ui.horizontal(|ui| {
+                                        ui.label("MACD:");
+                                        ui.color_edit_button_rgb(&mut config.macd_color);
+                                        ui.label("Sig:");
+                                        ui.color_edit_button_rgb(&mut config.signal_color);
+                                    });
+                                });
+                            });
+                        }
+
+                        if macd_configs.is_empty() {
+                            ui.label("No MACD indicators. Click '+ Add MACD' to create one.");
+                        }
+                    });
+            }
 
             // Loading indicator overlay
             if self.loading_state.is_loading() {
@@ -1480,6 +2073,53 @@ impl State {
                 }
                 self.update_ta_buffers();
             }
+        }
+
+        // Apply MACD changes after egui run
+        let macd_changed = {
+            let mut changed = false;
+
+            // Handle add request
+            if macd_add_requested {
+                self.add_macd(MacdConfig::default());
+                changed = true;
+            }
+
+            // Handle remove request
+            if let Some(idx) = macd_remove_index {
+                self.remove_macd(idx);
+                changed = true;
+            }
+
+            // Update configs that changed
+            for (i, new_config) in macd_configs.into_iter().enumerate() {
+                if i < self.macd_instances.len() {
+                    let old_config = &self.macd_instances[i].config;
+                    if old_config.fast_period != new_config.fast_period
+                        || old_config.slow_period != new_config.slow_period
+                        || old_config.signal_period != new_config.signal_period
+                        || old_config.enabled != new_config.enabled
+                        || old_config.macd_color != new_config.macd_color
+                        || old_config.signal_color != new_config.signal_color
+                    {
+                        self.macd_instances[i].config = new_config;
+                        // Recompute MACD for this instance
+                        let candles = &self.timeframes[self.current_timeframe].candles;
+                        if !candles.is_empty() {
+                            let macd = Macd::new(self.macd_instances[i].config.clone());
+                            let output = macd.calculate_macd(candles);
+                            self.macd_instances[i].outputs[self.current_timeframe] = Some(output);
+                        }
+                        changed = true;
+                    }
+                }
+            }
+
+            changed
+        };
+
+        if macd_changed && !self.macd_instances.is_empty() {
+            self.update_macd_gpu_buffers();
         }
 
         self.egui_state
@@ -1668,6 +2308,7 @@ impl State {
                             LevelType::GreedyHold => self.ta_settings.show_greedy_levels,
                         };
                         let state_ok = match l.state {
+                            LevelState::Pending => self.ta_settings.show_active_levels,
                             LevelState::Active => self.ta_settings.show_active_levels,
                             LevelState::Hit => self.ta_settings.show_hit_levels,
                             LevelState::Broken => self.ta_settings.show_broken_levels,
@@ -1703,6 +2344,37 @@ impl State {
                         render_pass.set_bind_group(1, &tf.ta_bind_group, &[]);
                         render_pass.draw(0..6, 0..filtered_trend_count);
                     }
+                }
+            }
+
+            // Render MACD indicators if any are enabled
+            // Note: MACD values are on a different scale than prices, so this renders
+            // them overlaid on the price chart. For proper visualization, a separate
+            // oscillator pane should be implemented.
+            for (i, instance) in self.macd_instances.iter().enumerate() {
+                if !instance.config.enabled {
+                    continue;
+                }
+                if i >= self.macd_gpu_buffers.len() {
+                    continue;
+                }
+
+                let buffers = &self.macd_gpu_buffers[i];
+
+                // Render MACD line (each segment needs 6 vertices)
+                if buffers.macd_point_count > 1 {
+                    render_pass.set_pipeline(&self.renderer.indicator_pipeline.pipeline);
+                    render_pass.set_bind_group(0, &self.renderer.camera_bind_group, &[]);
+                    render_pass.set_bind_group(1, &buffers.macd_bind_group, &[]);
+                    render_pass.draw(0..6, 0..(buffers.macd_point_count - 1));
+                }
+
+                // Render signal line
+                if buffers.signal_point_count > 1 {
+                    render_pass.set_pipeline(&self.renderer.indicator_pipeline.pipeline);
+                    render_pass.set_bind_group(0, &self.renderer.camera_bind_group, &[]);
+                    render_pass.set_bind_group(1, &buffers.signal_bind_group, &[]);
+                    render_pass.draw(0..6, 0..(buffers.signal_point_count - 1));
                 }
             }
 
@@ -1880,6 +2552,7 @@ impl State {
                 LevelType::GreedyHold => self.ta_settings.show_greedy_levels,
             };
             let state_visible = match level.state {
+                LevelState::Pending => self.ta_settings.show_active_levels,
                 LevelState::Active => self.ta_settings.show_active_levels,
                 LevelState::Hit => self.ta_settings.show_hit_levels,
                 LevelState::Broken => self.ta_settings.show_broken_levels,
@@ -1900,11 +2573,69 @@ impl State {
         None
     }
 
-    /// Update hovered range/level state.
+    /// Find hovered trend at cursor position.
+    fn find_hovered_trend(&self) -> Option<usize> {
+        if !self.ta_settings.show_ta || !self.ta_settings.show_trends {
+            return None;
+        }
+
+        let (world_x, world_y) = self.get_cursor_world_pos()?;
+        let ta = &self.ta_data[self.current_timeframe];
+
+        // Calculate tolerance based on view scale
+        let chart_height = self.config.height as f32 * (1.0 - VOLUME_HEIGHT_RATIO);
+        let y_scale = self.renderer.camera.scale[1] * 2.0 / chart_height;
+        let tolerance = y_scale * 10.0; // 10 pixels tolerance
+
+        for (i, trend) in ta.trends.iter().enumerate() {
+            // Check visibility based on state
+            let state_visible = match trend.state {
+                charter_ta::types::trend::TrendState::Active => self.ta_settings.show_active_trends,
+                charter_ta::types::trend::TrendState::Hit => self.ta_settings.show_hit_trends,
+                charter_ta::types::trend::TrendState::Broken => self.ta_settings.show_broken_trends,
+            };
+
+            if !state_visible {
+                continue;
+            }
+
+            let start_x = trend.start.candle_index as f32 * CANDLE_SPACING;
+
+            // Check if cursor x is within trend's x range (extended to the right)
+            if world_x < start_x {
+                continue;
+            }
+
+            // Calculate trend price at cursor x (using linear interpolation)
+            let candle_pos = world_x / CANDLE_SPACING;
+            let dx = trend.end.candle_index as f32 - trend.start.candle_index as f32;
+            let trend_price = if dx.abs() < f32::EPSILON {
+                trend.start.price
+            } else {
+                let slope = (trend.end.price - trend.start.price) / dx;
+                let x = candle_pos - trend.start.candle_index as f32;
+                trend.start.price + slope * x
+            };
+
+            // Check if cursor is near the trend line
+            if (world_y - trend_price).abs() < tolerance {
+                return Some(i);
+            }
+        }
+
+        None
+    }
+
+    /// Update hovered range/level/trend state.
     fn update_hover_state(&mut self) {
         self.hovered_range = self.find_hovered_range();
         self.hovered_level = if self.hovered_range.is_none() {
             self.find_hovered_level()
+        } else {
+            None
+        };
+        self.hovered_trend = if self.hovered_range.is_none() && self.hovered_level.is_none() {
+            self.find_hovered_trend()
         } else {
             None
         };

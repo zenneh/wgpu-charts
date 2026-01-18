@@ -126,7 +126,7 @@ impl Analyzer {
 
     /// Create a new analyzer with custom configuration.
     pub fn with_config(config: AnalyzerConfig) -> Self {
-        let level_tracker = OptimizedLevelTracker::new(config.level_tolerance, config.create_greedy_levels);
+        let level_tracker = OptimizedLevelTracker::new(config.level_tolerance, config.create_greedy_levels, 0);
         let trend_tracker = TrendTracker::new(config.level_tolerance);
         let range_builder = RangeBuilder::new(config.doji_threshold);
 

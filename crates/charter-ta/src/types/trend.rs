@@ -350,8 +350,10 @@ pub struct TrendTracker {
     pub trends: Vec<Trend>,
     /// Default tolerance for trend interactions.
     pub default_tolerance: f32,
-    /// Last range seen (to detect consecutive same-direction ranges).
-    last_range: Option<Range>,
+    /// Last bearish range seen (to connect bearish trends even if not consecutive).
+    last_bearish_range: Option<Range>,
+    /// Last bullish range seen (to connect bullish trends even if not consecutive).
+    last_bullish_range: Option<Range>,
 }
 
 impl TrendTracker {
@@ -361,46 +363,72 @@ impl TrendTracker {
             next_id: 0,
             trends: Vec::new(),
             default_tolerance,
-            last_range: None,
+            last_bearish_range: None,
+            last_bullish_range: None,
         }
     }
 
     /// Process a completed range, potentially creating a new trend.
     ///
-    /// A trend is created when two consecutive ranges of the same direction complete.
+    /// A trend is created when we see a new range of the same direction as a previous one,
+    /// even if they're not immediately consecutive (e.g., bearish → bullish → bearish creates a bearish trend).
     pub fn process_range(&mut self, range: &Range, created_at_index: usize) -> Option<TrendEvent> {
         // Skip doji ranges
         if range.direction == CandleDirection::Doji {
             return None;
         }
 
-        let result = if let Some(ref last) = self.last_range {
-            // Check if this range has the same direction as the last one
-            if last.direction == range.direction {
-                // Create a trend from the two ranges
-                if let Some(trend) = Trend::from_ranges(
-                    TrendId::new(self.next_id),
-                    last,
-                    range,
-                    created_at_index,
-                    self.default_tolerance,
-                ) {
-                    let trend_id = trend.id;
-                    self.next_id += 1;
-                    self.trends.push(trend);
-                    Some(TrendEvent::Created { trend_id })
+        let result = match range.direction {
+            CandleDirection::Bearish => {
+                let event = if let Some(ref last) = self.last_bearish_range {
+                    // Create a trend from the last bearish range to this one
+                    if let Some(trend) = Trend::from_ranges(
+                        TrendId::new(self.next_id),
+                        last,
+                        range,
+                        created_at_index,
+                        self.default_tolerance,
+                    ) {
+                        let trend_id = trend.id;
+                        self.next_id += 1;
+                        self.trends.push(trend);
+                        Some(TrendEvent::Created { trend_id })
+                    } else {
+                        None
+                    }
                 } else {
                     None
-                }
-            } else {
-                None
+                };
+                // Remember this bearish range for next time
+                self.last_bearish_range = Some(range.clone());
+                event
             }
-        } else {
-            None
+            CandleDirection::Bullish => {
+                let event = if let Some(ref last) = self.last_bullish_range {
+                    // Create a trend from the last bullish range to this one
+                    if let Some(trend) = Trend::from_ranges(
+                        TrendId::new(self.next_id),
+                        last,
+                        range,
+                        created_at_index,
+                        self.default_tolerance,
+                    ) {
+                        let trend_id = trend.id;
+                        self.next_id += 1;
+                        self.trends.push(trend);
+                        Some(TrendEvent::Created { trend_id })
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                };
+                // Remember this bullish range for next time
+                self.last_bullish_range = Some(range.clone());
+                event
+            }
+            CandleDirection::Doji => None,
         };
-
-        // Remember this range for next time
-        self.last_range = Some(range.clone());
 
         result
     }
@@ -460,7 +488,8 @@ impl TrendTracker {
     /// Clear all trends.
     pub fn clear(&mut self) {
         self.trends.clear();
-        self.last_range = None;
+        self.last_bearish_range = None;
+        self.last_bullish_range = None;
     }
 }
 
