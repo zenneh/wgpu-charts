@@ -371,7 +371,7 @@ impl State {
                 };
                 LevelGpu {
                     y_value: l.price,
-                    x_start: l.created_at_index as f32 * CANDLE_SPACING,
+                    x_start: l.source_candle_index as f32 * CANDLE_SPACING,
                     r,
                     g,
                     b,
@@ -473,11 +473,11 @@ impl State {
 
         self.current_timeframe = index;
         self.renderer.update_camera(&self.queue);
-        self.update_visible_range();
+        // Compute TA first (if enabled) before update_visible_range calls update_ta_buffers
         if self.ta_settings.show_ta {
             self.ensure_ta_computed();
-            self.update_ta_buffers();
         }
+        self.update_visible_range();
         self.window.request_redraw();
     }
 
@@ -655,6 +655,7 @@ impl State {
                 self.fps,
                 candle_count,
                 self.renderer.visible_count,
+                self.renderer.current_lod_factor,
                 candle.as_ref(),
             );
 
@@ -719,8 +720,13 @@ impl State {
             || ta_settings.show_broken_levels != self.ta_settings.show_broken_levels;
 
         if ta_changed {
+            let was_ta_enabled = self.ta_settings.show_ta;
             self.ta_settings = ta_settings;
             if self.ta_settings.show_ta {
+                // If TA was just enabled via UI, ensure it's computed
+                if !was_ta_enabled {
+                    self.ensure_ta_computed();
+                }
                 self.update_ta_buffers();
             }
         }
@@ -790,10 +796,19 @@ impl State {
                 render_pass.draw(0..6, 0..self.renderer.guideline_count);
             }
 
-            // Render candle chart
+            // Render candle chart using appropriate LOD level
             render_pass.set_pipeline(&self.renderer.candle_pipeline.pipeline);
             render_pass.set_bind_group(0, &self.renderer.camera_bind_group, &[]);
-            render_pass.set_bind_group(1, &tf.candle_bind_group, &[]);
+
+            // Select the appropriate bind group based on LOD
+            let candle_bind_group = if self.renderer.current_lod_factor == 1 {
+                &tf.candle_bind_group
+            } else if let Some(lod) = tf.lod_levels.iter().find(|l| l.factor == self.renderer.current_lod_factor) {
+                &lod.candle_bind_group
+            } else {
+                &tf.candle_bind_group
+            };
+            render_pass.set_bind_group(1, candle_bind_group, &[]);
             render_pass.draw(0..VERTICES_PER_CANDLE, 0..self.renderer.visible_count);
 
             // Render TA (ranges and levels) if enabled
@@ -834,11 +849,19 @@ impl State {
                 }
             }
 
-            // Render volume bars
+            // Render volume bars using appropriate LOD level
             render_pass.set_viewport(0.0, chart_height, chart_width, volume_height, 0.0, 1.0);
             render_pass.set_pipeline(&self.renderer.volume_pipeline.pipeline);
             render_pass.set_bind_group(0, &self.renderer.volume_camera_bind_group, &[]);
-            render_pass.set_bind_group(1, &tf.volume_bind_group, &[]);
+
+            let volume_bind_group = if self.renderer.current_lod_factor == 1 {
+                &tf.volume_bind_group
+            } else if let Some(lod) = tf.lod_levels.iter().find(|l| l.factor == self.renderer.current_lod_factor) {
+                &lod.volume_bind_group
+            } else {
+                &tf.volume_bind_group
+            };
+            render_pass.set_bind_group(1, volume_bind_group, &[]);
             render_pass.draw(0..6, 0..self.renderer.visible_count);
         }
 

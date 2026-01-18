@@ -39,13 +39,14 @@ impl StatsPanel {
         fps: f32,
         candle_count: usize,
         visible_count: u32,
+        lod_factor: usize,
         candle: Option<&Candle>,
     ) {
         egui::SidePanel::right("stats_panel")
             .exact_width(self.config.width)
             .resizable(false)
             .show(ctx, |ui| {
-                self.build_content(ui, current_timeframe, fps, candle_count, visible_count, candle);
+                self.build_content(ui, current_timeframe, fps, candle_count, visible_count, lod_factor, candle);
             });
     }
 
@@ -56,6 +57,7 @@ impl StatsPanel {
         fps: f32,
         candle_count: usize,
         visible_count: u32,
+        lod_factor: usize,
         candle: Option<&Candle>,
     ) {
         ui.heading("Stats");
@@ -73,6 +75,11 @@ impl StatsPanel {
         ui.label(format!("FPS: {:.1}", fps));
         ui.label(format!("Candles: {}", candle_count));
         ui.label(format!("Visible: {}", visible_count));
+        let lod_label = match lod_factor {
+            1 => "Full".to_string(),
+            n => format!("{}:1", n),
+        };
+        ui.label(format!("LOD: {}", lod_label));
         ui.separator();
 
         if let Some(c) = candle {

@@ -126,6 +126,11 @@ impl CandlePipeline {
             candle_width: BASE_CANDLE_WIDTH,
             candle_spacing: CANDLE_SPACING,
             wick_width: CANDLE_SPACING * 0.08,
+            // Default view bounds (will be updated each frame)
+            x_min: 0.0,
+            x_max: f32::MAX,
+            y_min: 0.0,
+            y_max: f32::MAX,
         };
         device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("Render Params Buffer"),

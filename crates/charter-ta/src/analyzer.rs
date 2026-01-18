@@ -24,7 +24,7 @@ impl Default for AnalyzerConfig {
     fn default() -> Self {
         Self {
             doji_threshold: 0.001,
-            min_range_candles: 2,
+            min_range_candles: 3,
             level_tolerance: 0.0,
             create_greedy_levels: true,
         }
@@ -360,16 +360,17 @@ mod tests {
             .build();
 
         // Create a bearish range
-        analyzer.process_candle(make_candle(110.0, 115.0, 100.0, 105.0)); // Bearish
-        analyzer.process_candle(make_candle(105.0, 110.0, 95.0, 100.0));  // Bearish
+        analyzer.process_candle(make_candle(110.0, 115.0, 100.0, 105.0)); // Bearish, high=115
+        analyzer.process_candle(make_candle(105.0, 112.0, 95.0, 100.0));  // Bearish, high=112
 
         // Now a bullish candle to complete the bearish range
         let result = analyzer.process_candle(make_candle(100.0, 105.0, 98.0, 103.0));
         assert_eq!(result.completed_ranges.len(), 1);
 
-        // The bearish range should create a level at min(first_low, last_low) = min(100, 95) = 95
+        // The bearish range creates RESISTANCE at highs
+        // Level = max(first_high, last_high) = max(115, 112) = 115
         let levels: Vec<_> = analyzer.active_levels().collect();
         assert_eq!(levels.len(), 1);
-        assert_eq!(levels[0].price, 95.0);
+        assert_eq!(levels[0].price, 115.0);
     }
 }

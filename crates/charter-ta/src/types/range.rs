@@ -73,27 +73,79 @@ impl Range {
 
     /// Calculate the hold level price for this range.
     ///
-    /// For bearish ranges: min(first_low, last_low)
-    /// For bullish ranges: max(first_high, last_high)
+    /// For bullish ranges: min(first_low, last_low) - support at the lowest wick
+    /// For bearish ranges: max(first_high, last_high) - resistance at the highest wick
     #[inline]
     pub fn hold_level_price(&self) -> f32 {
         match self.direction {
-            CandleDirection::Bearish => self.first_low.min(self.last_low),
-            CandleDirection::Bullish => self.first_high.max(self.last_high),
+            CandleDirection::Bullish => self.first_low.min(self.last_low),
+            CandleDirection::Bearish => self.first_high.max(self.last_high),
             CandleDirection::Doji => (self.first_low + self.first_high) / 2.0,
         }
     }
 
     /// Calculate the greedy hold level price for this range.
     ///
-    /// For bearish ranges: max(first_low, last_low) - the "greedier" level
-    /// For bullish ranges: min(first_high, last_high) - the "greedier" level
+    /// For bullish ranges: max(first_low, last_low) - the "greedier" support level
+    /// For bearish ranges: min(first_high, last_high) - the "greedier" resistance level
     #[inline]
     pub fn greedy_hold_level_price(&self) -> f32 {
         match self.direction {
-            CandleDirection::Bearish => self.first_low.max(self.last_low),
-            CandleDirection::Bullish => self.first_high.min(self.last_high),
+            CandleDirection::Bullish => self.first_low.max(self.last_low),
+            CandleDirection::Bearish => self.first_high.min(self.last_high),
             CandleDirection::Doji => (self.first_low + self.first_high) / 2.0,
+        }
+    }
+
+    /// Get the candle index where the hold level originates from.
+    ///
+    /// Returns the index of the candle whose wick defines the hold level price.
+    #[inline]
+    pub fn hold_level_candle_index(&self) -> usize {
+        match self.direction {
+            CandleDirection::Bullish => {
+                // Support at lows - use candle with lower low
+                if self.first_low <= self.last_low {
+                    self.start_index
+                } else {
+                    self.end_index
+                }
+            }
+            CandleDirection::Bearish => {
+                // Resistance at highs - use candle with higher high
+                if self.first_high >= self.last_high {
+                    self.start_index
+                } else {
+                    self.end_index
+                }
+            }
+            CandleDirection::Doji => self.start_index,
+        }
+    }
+
+    /// Get the candle index where the greedy hold level originates from.
+    ///
+    /// Returns the index of the candle whose wick defines the greedy hold level price.
+    #[inline]
+    pub fn greedy_hold_level_candle_index(&self) -> usize {
+        match self.direction {
+            CandleDirection::Bullish => {
+                // Greedy support - use candle with higher low
+                if self.first_low >= self.last_low {
+                    self.start_index
+                } else {
+                    self.end_index
+                }
+            }
+            CandleDirection::Bearish => {
+                // Greedy resistance - use candle with lower high
+                if self.first_high <= self.last_high {
+                    self.start_index
+                } else {
+                    self.end_index
+                }
+            }
+            CandleDirection::Doji => self.start_index,
         }
     }
 
@@ -350,32 +402,34 @@ mod tests {
     #[test]
     fn test_hold_level_bearish() {
         let candles = vec![
-            make_candle(110.0, 115.0, 100.0, 105.0),  // Bearish, low=100
-            make_candle(105.0, 110.0, 95.0, 100.0),   // Bearish, low=95
+            make_candle(110.0, 115.0, 100.0, 105.0),  // Bearish, high=115
+            make_candle(105.0, 112.0, 95.0, 100.0),   // Bearish, high=112
         ];
 
         let ranges = detect_ranges(&candles, 0.0);
         assert_eq!(ranges.len(), 1);
 
-        // Hold level = min(first_low, last_low) = min(100, 95) = 95
-        assert_eq!(ranges[0].hold_level_price(), 95.0);
-        // Greedy hold = max(first_low, last_low) = max(100, 95) = 100
-        assert_eq!(ranges[0].greedy_hold_level_price(), 100.0);
+        // Bearish range creates RESISTANCE at highs
+        // Hold level = max(first_high, last_high) = max(115, 112) = 115
+        assert_eq!(ranges[0].hold_level_price(), 115.0);
+        // Greedy hold = min(first_high, last_high) = min(115, 112) = 112
+        assert_eq!(ranges[0].greedy_hold_level_price(), 112.0);
     }
 
     #[test]
     fn test_hold_level_bullish() {
         let candles = vec![
-            make_candle(100.0, 110.0, 95.0, 105.0),   // Bullish, high=110
-            make_candle(105.0, 120.0, 100.0, 115.0),  // Bullish, high=120
+            make_candle(100.0, 110.0, 95.0, 105.0),   // Bullish, low=95
+            make_candle(105.0, 120.0, 100.0, 115.0),  // Bullish, low=100
         ];
 
         let ranges = detect_ranges(&candles, 0.0);
         assert_eq!(ranges.len(), 1);
 
-        // Hold level = max(first_high, last_high) = max(110, 120) = 120
-        assert_eq!(ranges[0].hold_level_price(), 120.0);
-        // Greedy hold = min(first_high, last_high) = min(110, 120) = 110
-        assert_eq!(ranges[0].greedy_hold_level_price(), 110.0);
+        // Bullish range creates SUPPORT at lows
+        // Hold level = min(first_low, last_low) = min(95, 100) = 95
+        assert_eq!(ranges[0].hold_level_price(), 95.0);
+        // Greedy hold = max(first_low, last_low) = max(95, 100) = 100
+        assert_eq!(ranges[0].greedy_hold_level_price(), 100.0);
     }
 }

@@ -26,6 +26,11 @@ struct RenderParams {
     candle_width: f32,
     candle_spacing: f32,
     wick_width: f32,
+    // View bounds for GPU-side culling
+    x_min: f32,
+    x_max: f32,
+    y_min: f32,
+    y_max: f32,
 };
 
 @group(1) @binding(1)
@@ -53,6 +58,22 @@ fn vs_main(
 
     // Calculate candle properties
     let x_center = f32(candle_index) * params.candle_spacing;
+
+    // GPU-side culling: check if candle is outside visible range
+    // If so, output degenerate triangle (all vertices at same point)
+    let half_width = params.candle_width / 2.0;
+    let x_left = x_center - half_width;
+    let x_right = x_center + half_width;
+
+    // Cull if completely outside X range or Y range
+    let outside_x = x_right < params.x_min || x_left > params.x_max;
+    let outside_y = candle.high < params.y_min || candle.low > params.y_max;
+
+    if outside_x || outside_y {
+        out.clip_position = vec4<f32>(0.0, 0.0, 0.0, 1.0);
+        out.color = vec3<f32>(0.0, 0.0, 0.0);
+        return out;
+    }
     let is_bullish = candle.close >= candle.open;
 
     // Ensure minimum body height for doji candles (open == close)
@@ -64,8 +85,6 @@ fn vs_main(
     let body_top = body_center + body_height / 2.0;
     let body_bottom = body_center - body_height / 2.0;
 
-    // Candle body width (adaptive based on zoom)
-    let half_width = params.candle_width / 2.0;
     // Wick width: adaptive, passed from CPU to ensure minimum pixel visibility
     let wick_half = params.wick_width / 2.0;
 

@@ -7,13 +7,14 @@ pub mod renderer;
 
 pub use camera::{Camera, CameraUniform};
 pub use gpu_types::{
-    CandleGpu, GuidelineGpu, GuidelineParams, LevelGpu, RangeGpu, RenderParams, TaRenderParams,
-    VolumeGpu, VolumeRenderParams, MAX_GUIDELINES, MAX_TA_LEVELS, MAX_TA_RANGES,
+    aggregate_candles_lod, aggregate_volume_lod, CandleGpu, GuidelineGpu, GuidelineParams,
+    LevelGpu, LodLevel, RangeGpu, RenderParams, TaRenderParams, VolumeGpu, VolumeRenderParams,
+    MAX_GUIDELINES, MAX_TA_LEVELS, MAX_TA_RANGES,
 };
 pub use pipeline::{
     CandlePipeline, GuidelinePipeline, IndicatorPipeline, TaPipeline, VolumePipeline,
 };
-pub use renderer::{ChartRenderer, TimeframeData};
+pub use renderer::{ChartRenderer, LodData, TimeframeData};
 
 /// Constants for candle rendering.
 pub const BASE_CANDLE_WIDTH: f32 = 0.8;

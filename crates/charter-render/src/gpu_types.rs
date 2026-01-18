@@ -62,6 +62,12 @@ pub struct RenderParams {
     pub candle_width: f32,
     pub candle_spacing: f32,
     pub wick_width: f32,
+    /// Visible X range for GPU-side culling.
+    pub x_min: f32,
+    pub x_max: f32,
+    /// Visible Y range for GPU-side culling.
+    pub y_min: f32,
+    pub y_max: f32,
 }
 
 /// Guideline GPU struct (16 bytes aligned).
@@ -177,3 +183,87 @@ pub const MAX_TA_RANGES: usize = 256;
 
 /// Maximum number of levels that can be rendered at once.
 pub const MAX_TA_LEVELS: usize = 128;
+
+// ============================================================================
+// Level of Detail (LOD) System
+// ============================================================================
+
+/// LOD levels for candle aggregation.
+/// Each level aggregates N candles into 1.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum LodLevel {
+    /// Full resolution - every candle.
+    Full,
+    /// 10:1 aggregation (10 candles → 1).
+    Low,
+    /// 100:1 aggregation (100 candles → 1).
+    VeryLow,
+}
+
+impl LodLevel {
+    /// Returns the aggregation factor for this LOD level.
+    pub fn factor(&self) -> usize {
+        match self {
+            LodLevel::Full => 1,
+            LodLevel::Low => 10,
+            LodLevel::VeryLow => 100,
+        }
+    }
+
+    /// Returns all LOD levels in order.
+    pub fn all() -> [LodLevel; 3] {
+        [LodLevel::Full, LodLevel::Low, LodLevel::VeryLow]
+    }
+
+    /// Choose appropriate LOD based on candles per pixel.
+    /// When many candles map to one pixel, use lower LOD.
+    pub fn for_density(candles_per_pixel: f32) -> LodLevel {
+        if candles_per_pixel > 50.0 {
+            LodLevel::VeryLow
+        } else if candles_per_pixel > 5.0 {
+            LodLevel::Low
+        } else {
+            LodLevel::Full
+        }
+    }
+}
+
+/// Aggregates candles for LOD rendering.
+pub fn aggregate_candles_lod(candles: &[CandleGpu], factor: usize) -> Vec<CandleGpu> {
+    if factor <= 1 {
+        return candles.to_vec();
+    }
+
+    candles
+        .chunks(factor)
+        .map(|chunk| {
+            let open = chunk.first().map(|c| c.open).unwrap_or(0.0);
+            let close = chunk.last().map(|c| c.close).unwrap_or(0.0);
+            let high = chunk.iter().map(|c| c.high).fold(f32::MIN, f32::max);
+            let low = chunk.iter().map(|c| c.low).fold(f32::MAX, f32::min);
+            CandleGpu { open, high, low, close }
+        })
+        .collect()
+}
+
+/// Aggregates volume for LOD rendering.
+pub fn aggregate_volume_lod(volumes: &[VolumeGpu], factor: usize) -> Vec<VolumeGpu> {
+    if factor <= 1 {
+        return volumes.to_vec();
+    }
+
+    volumes
+        .chunks(factor)
+        .map(|chunk| {
+            let total_volume: f32 = chunk.iter().map(|v| v.volume).sum();
+            // Use the last candle's direction for the aggregated bar
+            let is_bullish = chunk.last().map(|v| v.is_bullish).unwrap_or(1);
+            VolumeGpu {
+                volume: total_volume,
+                is_bullish,
+                _padding1: 0.0,
+                _padding2: 0.0,
+            }
+        })
+        .collect()
+}

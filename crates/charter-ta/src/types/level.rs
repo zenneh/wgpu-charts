@@ -69,8 +69,10 @@ pub struct Level {
     pub direction: CandleDirection,
     /// ID of the range that created this level.
     pub source_range_id: RangeId,
-    /// Index of the candle where this level was created.
+    /// Index of the candle where this level was created (when range completed).
     pub created_at_index: usize,
+    /// Index of the candle whose wick defines this level's price.
+    pub source_candle_index: usize,
     /// Current state of the level.
     pub state: LevelState,
     /// History of hits on this level.
@@ -90,9 +92,9 @@ impl Level {
         created_at_index: usize,
         tolerance: f32,
     ) -> Self {
-        let price = match level_type {
-            LevelType::Hold => range.hold_level_price(),
-            LevelType::GreedyHold => range.greedy_hold_level_price(),
+        let (price, source_candle_index) = match level_type {
+            LevelType::Hold => (range.hold_level_price(), range.hold_level_candle_index()),
+            LevelType::GreedyHold => (range.greedy_hold_level_price(), range.greedy_hold_level_candle_index()),
         };
 
         Self {
@@ -102,6 +104,7 @@ impl Level {
             direction: range.direction,
             source_range_id: range.id,
             created_at_index,
+            source_candle_index,
             state: LevelState::Active,
             hits: Vec::new(),
             break_event: None,
@@ -146,11 +149,13 @@ impl Level {
 
         match self.direction {
             CandleDirection::Bearish => {
-                // This is a resistance level (price should stay above or touch from below)
+                // This is a RESISTANCE level (at highs) - price should stay BELOW
+                // Broken when body closes ABOVE the level
                 self.check_resistance_interaction(candle_index, candle, body_top, body_bottom)
             }
             CandleDirection::Bullish => {
-                // This is a support level (price should stay below or touch from above)
+                // This is a SUPPORT level (at lows) - price should stay ABOVE
+                // Broken when body closes BELOW the level
                 self.check_support_interaction(candle_index, candle, body_top, body_bottom)
             }
             CandleDirection::Doji => LevelInteraction::None,
@@ -164,11 +169,11 @@ impl Level {
         body_top: f32,
         body_bottom: f32,
     ) -> LevelInteraction {
-        let level_with_tolerance = self.price - self.tolerance;
+        let level_lower = self.price - self.tolerance;
 
-        // Check if the body closed below the level (broken)
-        if body_top < level_with_tolerance {
-            // Full body is below the level - BROKEN
+        // Check if the body closed above the level (broken resistance)
+        if body_bottom > self.price + self.tolerance {
+            // Full body is above the level - BROKEN
             self.state = LevelState::Broken;
             self.break_event = Some(LevelBreak {
                 candle_index,
@@ -177,13 +182,13 @@ impl Level {
             return LevelInteraction::Broken;
         }
 
-        // Check if the wick touched the level but body stayed above
-        if candle.low <= self.price + self.tolerance && body_bottom >= level_with_tolerance {
-            // Wick touched or went below, but body closed above - HIT
-            let penetration = (self.price - candle.low).max(0.0);
+        // Check if the wick touched the level but body stayed below
+        if candle.high >= level_lower && body_top <= self.price + self.tolerance {
+            // Wick touched or went above, but body closed below - HIT
+            let penetration = (candle.high - self.price).max(0.0);
             let hit = LevelHit {
                 candle_index,
-                touch_price: candle.low,
+                touch_price: candle.high,
                 penetration,
             };
             self.hits.push(hit);
@@ -201,11 +206,11 @@ impl Level {
         body_top: f32,
         body_bottom: f32,
     ) -> LevelInteraction {
-        let level_with_tolerance = self.price + self.tolerance;
+        let level_upper = self.price + self.tolerance;
 
-        // Check if the body closed above the level (broken)
-        if body_bottom > level_with_tolerance {
-            // Full body is above the level - BROKEN
+        // Check if the body closed below the level (broken support)
+        if body_top < self.price - self.tolerance {
+            // Full body is below the level - BROKEN
             self.state = LevelState::Broken;
             self.break_event = Some(LevelBreak {
                 candle_index,
@@ -214,13 +219,13 @@ impl Level {
             return LevelInteraction::Broken;
         }
 
-        // Check if the wick touched the level but body stayed below
-        if candle.high >= self.price - self.tolerance && body_top <= level_with_tolerance {
-            // Wick touched or went above, but body closed below - HIT
-            let penetration = (candle.high - self.price).max(0.0);
+        // Check if the wick touched the level but body stayed above
+        if candle.low <= level_upper && body_bottom >= self.price - self.tolerance {
+            // Wick touched or went below, but body closed above - HIT
+            let penetration = (self.price - candle.low).max(0.0);
             let hit = LevelHit {
                 candle_index,
-                touch_price: candle.high,
+                touch_price: candle.low,
                 penetration,
             };
             self.hits.push(hit);
@@ -375,6 +380,7 @@ mod tests {
     }
 
     fn make_bearish_range() -> Range {
+        // Bearish range creates RESISTANCE at highs
         Range {
             id: RangeId::new(1),
             direction: CandleDirection::Bearish,
@@ -386,31 +392,32 @@ mod tests {
             open: 110.0,
             close: 100.0,
             total_volume: 200.0,
-            first_high: 115.0,
-            first_low: 100.0,  // First candle low
-            last_high: 110.0,
-            last_low: 95.0,    // Last candle low
+            first_high: 115.0,  // First candle high
+            first_low: 100.0,
+            last_high: 112.0,   // Last candle high
+            last_low: 95.0,
         }
     }
 
     #[test]
     fn test_bearish_level_hit() {
         let range = make_bearish_range();
-        // Hold level = min(100, 95) = 95
+        // Bearish creates resistance at highs
+        // Hold level = max(first_high, last_high) = max(115, 112) = 115
         let mut level = Level::from_range(LevelId::new(1), &range, LevelType::Hold, 2, 0.5);
 
-        assert_eq!(level.price, 95.0);
+        assert_eq!(level.price, 115.0);
         assert!(level.is_resistance());
 
-        // Candle with wick touching level but body above
-        // Low = 94, but close = 97 (above level)
-        let candle = make_candle(100.0, 102.0, 94.0, 97.0);
+        // Candle with wick touching resistance level but body below
+        // High = 116, but close = 112 (below level)
+        let candle = make_candle(110.0, 116.0, 108.0, 112.0);
         let interaction = level.check_interaction(3, &candle);
 
         match interaction {
             LevelInteraction::Hit(hit) => {
                 assert_eq!(hit.candle_index, 3);
-                assert_eq!(hit.touch_price, 94.0);
+                assert_eq!(hit.touch_price, 116.0);
             }
             _ => panic!("Expected Hit"),
         }
@@ -424,9 +431,9 @@ mod tests {
         let range = make_bearish_range();
         let mut level = Level::from_range(LevelId::new(1), &range, LevelType::Hold, 2, 0.5);
 
-        // Candle with body fully below level (broken)
-        // Open = 94, Close = 92, both below level of 95
-        let candle = make_candle(94.0, 95.0, 91.0, 92.0);
+        // Resistance is broken when body closes ABOVE the level
+        // Level is at 115, body is fully above (open=116, close=118)
+        let candle = make_candle(116.0, 120.0, 115.5, 118.0);
         let interaction = level.check_interaction(3, &candle);
 
         assert!(matches!(interaction, LevelInteraction::Broken));

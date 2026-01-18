@@ -6,21 +6,37 @@ use charter_core::Candle;
 
 use crate::camera::{Camera, CameraUniform};
 use crate::gpu_types::{
-    CandleGpu, GuidelineGpu, GuidelineParams, RenderParams, VolumeGpu, VolumeRenderParams,
-    MAX_GUIDELINES,
+    aggregate_candles_lod, aggregate_volume_lod, CandleGpu, GuidelineGpu, GuidelineParams,
+    LodLevel, RenderParams, VolumeGpu, VolumeRenderParams, MAX_GUIDELINES,
 };
 use crate::pipeline::{CandlePipeline, GuidelinePipeline, IndicatorPipeline, TaPipeline, VolumePipeline};
 use crate::{BASE_CANDLE_WIDTH, CANDLE_SPACING, MIN_CANDLE_PIXELS, STATS_PANEL_WIDTH, VOLUME_HEIGHT_RATIO};
 
-/// Pre-computed timeframe data with GPU buffers for candles, volume, and TA.
-pub struct TimeframeData {
-    pub candles: Vec<Candle>,
+/// LOD data for a single level.
+pub struct LodData {
     pub candle_buffer: wgpu::Buffer,
     pub candle_bind_group: wgpu::BindGroup,
     pub volume_buffer: wgpu::Buffer,
     pub volume_bind_group: wgpu::BindGroup,
     pub count: u32,
     pub max_volume: f32,
+    pub factor: usize,
+}
+
+/// Pre-computed timeframe data with GPU buffers for candles, volume, and TA.
+pub struct TimeframeData {
+    pub candles: Vec<Candle>,
+    /// Full resolution candle buffer (LOD 0).
+    pub candle_buffer: wgpu::Buffer,
+    pub candle_bind_group: wgpu::BindGroup,
+    pub volume_buffer: wgpu::Buffer,
+    pub volume_bind_group: wgpu::BindGroup,
+    pub count: u32,
+    pub max_volume: f32,
+    /// LOD levels for zoomed-out rendering.
+    pub lod_levels: Vec<LodData>,
+    /// Current LOD level being used.
+    pub current_lod: LodLevel,
     // TA data
     pub ta_range_buffer: wgpu::Buffer,
     pub ta_level_buffer: wgpu::Buffer,
@@ -28,6 +44,39 @@ pub struct TimeframeData {
     pub ta_bind_group: wgpu::BindGroup,
     pub ta_range_count: u32,
     pub ta_level_count: u32,
+}
+
+impl TimeframeData {
+    /// Get the LOD data for a given candles-per-pixel density.
+    /// Returns (candle_bind_group, volume_bind_group, count, factor, max_volume).
+    pub fn lod_for_density(&self, candles_per_pixel: f32) -> (&wgpu::BindGroup, &wgpu::BindGroup, u32, usize, f32) {
+        let desired_lod = LodLevel::for_density(candles_per_pixel);
+
+        // Find the appropriate LOD level
+        match desired_lod {
+            LodLevel::Full => {
+                (&self.candle_bind_group, &self.volume_bind_group, self.count, 1, self.max_volume)
+            }
+            LodLevel::Low => {
+                // Try to use LOD 10
+                if let Some(lod) = self.lod_levels.iter().find(|l| l.factor == 10) {
+                    (&lod.candle_bind_group, &lod.volume_bind_group, lod.count, lod.factor, lod.max_volume)
+                } else {
+                    (&self.candle_bind_group, &self.volume_bind_group, self.count, 1, self.max_volume)
+                }
+            }
+            LodLevel::VeryLow => {
+                // Try LOD 100 first, then fall back to 10
+                if let Some(lod) = self.lod_levels.iter().find(|l| l.factor == 100) {
+                    (&lod.candle_bind_group, &lod.volume_bind_group, lod.count, lod.factor, lod.max_volume)
+                } else if let Some(lod) = self.lod_levels.iter().find(|l| l.factor == 10) {
+                    (&lod.candle_bind_group, &lod.volume_bind_group, lod.count, lod.factor, lod.max_volume)
+                } else {
+                    (&self.candle_bind_group, &self.volume_bind_group, self.count, 1, self.max_volume)
+                }
+            }
+        }
+    }
 }
 
 /// Coordinates all GPU rendering pipelines.
@@ -58,6 +107,11 @@ pub struct ChartRenderer {
 
     pub visible_start: u32,
     pub visible_count: u32,
+
+    /// Current LOD factor (1 = full, 10 = low, 100 = very low).
+    pub current_lod_factor: usize,
+    /// Candles per pixel for LOD selection.
+    pub candles_per_pixel: f32,
 
     config_width: u32,
     config_height: u32,
@@ -168,6 +222,8 @@ impl ChartRenderer {
             guideline_count: 0,
             visible_start: 0,
             visible_count: 0,
+            current_lod_factor: 1,
+            candles_per_pixel: 1.0,
             config_width: width,
             config_height: height,
         }
@@ -206,6 +262,52 @@ impl ChartRenderer {
             &self.volume_params_buffer,
         );
 
+        // Create LOD levels for zoomed-out rendering
+        let mut lod_levels = Vec::new();
+        for lod in [LodLevel::Low, LodLevel::VeryLow] {
+            let factor = lod.factor();
+            if candles_gpu.len() > factor * 10 {
+                // Only create LOD if we have enough candles to benefit
+                let lod_candles = aggregate_candles_lod(&candles_gpu, factor);
+                let lod_volume = aggregate_volume_lod(&volume_gpu, factor);
+                let lod_max_volume = lod_volume.iter().map(|v| v.volume).fold(0.0f32, f32::max);
+
+                let lod_candle_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: Some(&format!("Candle Buffer {} LOD {}", label, factor)),
+                    contents: bytemuck::cast_slice(&lod_candles),
+                    usage: wgpu::BufferUsages::STORAGE,
+                });
+
+                let lod_candle_bind_group = self.candle_pipeline.create_bind_group(
+                    device,
+                    &lod_candle_buffer,
+                    &self.render_params_buffer,
+                );
+
+                let lod_volume_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: Some(&format!("Volume Buffer {} LOD {}", label, factor)),
+                    contents: bytemuck::cast_slice(&lod_volume),
+                    usage: wgpu::BufferUsages::STORAGE,
+                });
+
+                let lod_volume_bind_group = self.volume_pipeline.create_bind_group(
+                    device,
+                    &lod_volume_buffer,
+                    &self.volume_params_buffer,
+                );
+
+                lod_levels.push(LodData {
+                    candle_buffer: lod_candle_buffer,
+                    candle_bind_group: lod_candle_bind_group,
+                    volume_buffer: lod_volume_buffer,
+                    volume_bind_group: lod_volume_bind_group,
+                    count: lod_candles.len() as u32,
+                    max_volume: lod_max_volume,
+                    factor,
+                });
+            }
+        }
+
         // Create TA buffers (initially empty, will be populated later)
         let ta_range_buffer = self.ta_pipeline.create_range_buffer(device);
         let ta_level_buffer = self.ta_pipeline.create_level_buffer(device);
@@ -225,6 +327,8 @@ impl ChartRenderer {
             volume_bind_group,
             count: candles_gpu.len() as u32,
             max_volume,
+            lod_levels,
+            current_lod: LodLevel::Full,
             ta_range_buffer,
             ta_level_buffer,
             ta_params_buffer,
@@ -267,11 +371,38 @@ impl ChartRenderer {
         let chart_height = self.config_height as f32 * (1.0 - VOLUME_HEIGHT_RATIO);
         let aspect = chart_width / chart_height;
         let (x_min, x_max) = self.camera.visible_x_range(aspect);
+        let (y_min, y_max) = self.camera.visible_y_range(aspect);
 
-        let candle_count = timeframe.candles.len();
+        let visible_width = x_max - x_min;
 
-        let first_idx = ((x_min / CANDLE_SPACING).floor() as i32 - 1).max(0) as u32;
-        let last_idx = ((x_max / CANDLE_SPACING).ceil() as i32 + 1).min(candle_count as i32) as u32;
+        // Compute candles per pixel for LOD selection
+        let visible_candles_approx = visible_width / CANDLE_SPACING;
+        self.candles_per_pixel = visible_candles_approx / chart_width;
+
+        // Select appropriate LOD based on density
+        let desired_lod = LodLevel::for_density(self.candles_per_pixel);
+        self.current_lod_factor = match desired_lod {
+            LodLevel::Full => 1,
+            LodLevel::Low => {
+                if timeframe.lod_levels.iter().any(|l| l.factor == 10) { 10 } else { 1 }
+            }
+            LodLevel::VeryLow => {
+                if timeframe.lod_levels.iter().any(|l| l.factor == 100) {
+                    100
+                } else if timeframe.lod_levels.iter().any(|l| l.factor == 10) {
+                    10
+                } else {
+                    1
+                }
+            }
+        };
+
+        // Compute effective values based on LOD
+        let effective_spacing = CANDLE_SPACING * self.current_lod_factor as f32;
+        let effective_candle_count = (timeframe.candles.len() + self.current_lod_factor - 1) / self.current_lod_factor;
+
+        let first_idx = ((x_min / effective_spacing).floor() as i32 - 1).max(0) as u32;
+        let last_idx = ((x_max / effective_spacing).ceil() as i32 + 1).min(effective_candle_count as i32) as u32;
 
         self.visible_start = first_idx;
         self.visible_count = if last_idx > first_idx {
@@ -280,20 +411,24 @@ impl ChartRenderer {
             0
         };
 
-        let visible_width = x_max - x_min;
         let world_units_per_pixel = visible_width / self.config_width as f32;
         let min_world_width = MIN_CANDLE_PIXELS * world_units_per_pixel;
-        let candle_width = BASE_CANDLE_WIDTH.max(min_world_width);
+        let candle_width = (BASE_CANDLE_WIDTH * self.current_lod_factor as f32).max(min_world_width);
 
-        let base_wick_width = CANDLE_SPACING * 0.08;
+        let base_wick_width = effective_spacing * 0.08;
         let min_wick_width = 1.0 * world_units_per_pixel;
         let wick_width = base_wick_width.max(min_wick_width);
 
+        // Pass view bounds to shader for GPU-side culling
         let render_params = RenderParams {
             first_visible: self.visible_start,
             candle_width,
-            candle_spacing: CANDLE_SPACING,
+            candle_spacing: effective_spacing,
             wick_width,
+            x_min,
+            x_max,
+            y_min,
+            y_max,
         };
 
         queue.write_buffer(
@@ -302,19 +437,26 @@ impl ChartRenderer {
             bytemuck::cast_slice(&[render_params]),
         );
 
-        let visible_max_volume = timeframe
-            .candles
-            .iter()
-            .skip(self.visible_start as usize)
-            .take(self.visible_count as usize)
-            .map(|c| c.volume)
-            .fold(0.0f32, f32::max)
-            .max(1.0);
+        // Get the appropriate max_volume for the LOD level
+        let visible_max_volume = if self.current_lod_factor == 1 {
+            timeframe
+                .candles
+                .iter()
+                .skip(self.visible_start as usize)
+                .take(self.visible_count as usize)
+                .map(|c| c.volume)
+                .fold(0.0f32, f32::max)
+                .max(1.0)
+        } else if let Some(lod) = timeframe.lod_levels.iter().find(|l| l.factor == self.current_lod_factor) {
+            lod.max_volume
+        } else {
+            timeframe.max_volume
+        };
 
         let volume_params = VolumeRenderParams {
             first_visible: self.visible_start,
             bar_width: candle_width,
-            bar_spacing: CANDLE_SPACING,
+            bar_spacing: effective_spacing,
             max_volume: visible_max_volume,
         };
         queue.write_buffer(
