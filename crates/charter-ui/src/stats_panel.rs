@@ -13,7 +13,7 @@ impl Default for StatsPanelConfig {
     fn default() -> Self {
         Self {
             width: 200.0,
-            timeframe_labels: &["1m", "15m", "1h", "1w", "1M"],
+            timeframe_labels: &["1m", "3m", "5m", "30m", "1h", "3h", "5h", "10h", "1d", "1w", "3w", "1M"],
         }
     }
 }

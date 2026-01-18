@@ -1,7 +1,11 @@
 //! Charter - GPU-accelerated candlestick chart viewer.
 
 mod app;
+mod indicators;
+mod input;
+mod replay;
 mod state;
+mod ui;
 
 use anyhow::Result;
 use winit::event_loop::EventLoop;

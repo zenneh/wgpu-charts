@@ -1,11 +1,13 @@
 //! GPU rendering for charter.
 
 pub mod camera;
+pub mod gpu_context;
 pub mod gpu_types;
 pub mod pipeline;
 pub mod renderer;
 
 pub use camera::{Camera, CameraUniform};
+pub use gpu_context::GpuContext;
 pub use gpu_types::{
     aggregate_candles_lod, aggregate_volume_lod, CandleGpu, GuidelineGpu, GuidelineParams,
     IndicatorParams, IndicatorPointGpu, LevelGpu, LodConfig, PackedCandleGpu, PriceNormalization,
@@ -13,7 +15,8 @@ pub use gpu_types::{
     MAX_GUIDELINES, MAX_TA_LEVELS, MAX_TA_RANGES, MAX_TA_TRENDS,
 };
 pub use pipeline::{
-    CandlePipeline, GuidelinePipeline, IndicatorPipeline, TaPipeline, VolumePipeline,
+    CandlePipeline, GuidelinePipeline, IndicatorPipeline, InstancedPipeline, Pipeline, TaPipeline,
+    TaLevelPipeline, TaRangePipeline, TaTrendPipeline, VolumePipeline,
 };
 pub use renderer::{ChartRenderer, LodData, TimeframeData};
 

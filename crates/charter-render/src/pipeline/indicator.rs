@@ -1,8 +1,11 @@
 //! Indicator line rendering pipeline.
 
+use std::ops::Range;
+
 use wgpu::util::DeviceExt;
 
 use crate::gpu_types::{IndicatorParams, IndicatorPointGpu};
+use crate::pipeline::traits::{InstancedPipeline, Pipeline};
 
 /// Pipeline for rendering indicator lines.
 pub struct IndicatorPipeline {
@@ -145,4 +148,33 @@ impl IndicatorPipeline {
             label: Some("Indicator Bind Group"),
         })
     }
+}
+
+/// Number of vertices per indicator line segment (2 triangles = 6 vertices).
+const VERTICES_PER_INDICATOR_SEGMENT: u32 = 6;
+
+impl Pipeline for IndicatorPipeline {
+    type BindGroupData = wgpu::BindGroup;
+
+    fn render<'a>(
+        &'a self,
+        render_pass: &mut wgpu::RenderPass<'a>,
+        camera_bind_group: &'a wgpu::BindGroup,
+        data_bind_group: &'a wgpu::BindGroup,
+        vertex_range: Range<u32>,
+        instance_range: Range<u32>,
+    ) {
+        render_pass.set_pipeline(&self.pipeline);
+        render_pass.set_bind_group(0, camera_bind_group, &[]);
+        render_pass.set_bind_group(1, data_bind_group, &[]);
+        render_pass.draw(vertex_range, instance_range);
+    }
+
+    fn pipeline(&self) -> &wgpu::RenderPipeline {
+        &self.pipeline
+    }
+}
+
+impl InstancedPipeline for IndicatorPipeline {
+    const VERTICES_PER_INSTANCE: u32 = VERTICES_PER_INDICATOR_SEGMENT;
 }

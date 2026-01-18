@@ -1,9 +1,12 @@
 //! Candle rendering pipeline.
 
+use std::ops::Range;
+
 use wgpu::util::DeviceExt;
 
 use crate::gpu_types::{CandleGpu, RenderParams};
-use crate::{BASE_CANDLE_WIDTH, CANDLE_SPACING};
+use crate::pipeline::traits::{InstancedPipeline, Pipeline};
+use crate::{BASE_CANDLE_WIDTH, CANDLE_SPACING, VERTICES_PER_CANDLE};
 
 /// Pipeline for rendering candlestick charts.
 pub struct CandlePipeline {
@@ -165,4 +168,30 @@ impl CandlePipeline {
             label: Some("Candle Bind Group"),
         })
     }
+}
+
+impl Pipeline for CandlePipeline {
+    type BindGroupData = wgpu::BindGroup;
+
+    fn render<'a>(
+        &'a self,
+        render_pass: &mut wgpu::RenderPass<'a>,
+        camera_bind_group: &'a wgpu::BindGroup,
+        data_bind_group: &'a wgpu::BindGroup,
+        vertex_range: Range<u32>,
+        instance_range: Range<u32>,
+    ) {
+        render_pass.set_pipeline(&self.pipeline);
+        render_pass.set_bind_group(0, camera_bind_group, &[]);
+        render_pass.set_bind_group(1, data_bind_group, &[]);
+        render_pass.draw(vertex_range, instance_range);
+    }
+
+    fn pipeline(&self) -> &wgpu::RenderPipeline {
+        &self.pipeline
+    }
+}
+
+impl InstancedPipeline for CandlePipeline {
+    const VERTICES_PER_INSTANCE: u32 = VERTICES_PER_CANDLE;
 }

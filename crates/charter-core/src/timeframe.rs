@@ -5,11 +5,18 @@ use crate::candle::Candle;
 /// Timeframe enumeration for different chart periods.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Timeframe {
-    Min1,   // 1 minute (base data)
-    Min15,  // 15 minutes
-    Hour1,  // 1 hour
-    Week1,  // 1 week
-    Month1, // 1 month
+    Min1,    // 1 minute (base data)
+    Min3,    // 3 minutes
+    Min5,    // 5 minutes
+    Min30,   // 30 minutes
+    Hour1,   // 1 hour
+    Hour3,   // 3 hours
+    Hour5,   // 5 hours
+    Hour10,  // 10 hours
+    Day1,    // 1 day
+    Week1,   // 1 week
+    Week3,   // 3 weeks
+    Month1,  // 1 month
 }
 
 impl Timeframe {
@@ -17,9 +24,16 @@ impl Timeframe {
     pub fn seconds(&self) -> f64 {
         match self {
             Timeframe::Min1 => 60.0,
-            Timeframe::Min15 => 60.0 * 15.0,
+            Timeframe::Min3 => 60.0 * 3.0,
+            Timeframe::Min5 => 60.0 * 5.0,
+            Timeframe::Min30 => 60.0 * 30.0,
             Timeframe::Hour1 => 60.0 * 60.0,
+            Timeframe::Hour3 => 60.0 * 60.0 * 3.0,
+            Timeframe::Hour5 => 60.0 * 60.0 * 5.0,
+            Timeframe::Hour10 => 60.0 * 60.0 * 10.0,
+            Timeframe::Day1 => 60.0 * 60.0 * 24.0,
             Timeframe::Week1 => 60.0 * 60.0 * 24.0 * 7.0,
+            Timeframe::Week3 => 60.0 * 60.0 * 24.0 * 21.0,
             Timeframe::Month1 => 60.0 * 60.0 * 24.0 * 30.0,
         }
     }
@@ -28,9 +42,16 @@ impl Timeframe {
     pub fn label(&self) -> &'static str {
         match self {
             Timeframe::Min1 => "1m",
-            Timeframe::Min15 => "15m",
+            Timeframe::Min3 => "3m",
+            Timeframe::Min5 => "5m",
+            Timeframe::Min30 => "30m",
             Timeframe::Hour1 => "1h",
+            Timeframe::Hour3 => "3h",
+            Timeframe::Hour5 => "5h",
+            Timeframe::Hour10 => "10h",
+            Timeframe::Day1 => "1d",
             Timeframe::Week1 => "1w",
+            Timeframe::Week3 => "3w",
             Timeframe::Month1 => "1M",
         }
     }
@@ -39,9 +60,16 @@ impl Timeframe {
     pub fn all() -> &'static [Timeframe] {
         &[
             Timeframe::Min1,
-            Timeframe::Min15,
+            Timeframe::Min3,
+            Timeframe::Min5,
+            Timeframe::Min30,
             Timeframe::Hour1,
+            Timeframe::Hour3,
+            Timeframe::Hour5,
+            Timeframe::Hour10,
+            Timeframe::Day1,
             Timeframe::Week1,
+            Timeframe::Week3,
             Timeframe::Month1,
         ]
     }

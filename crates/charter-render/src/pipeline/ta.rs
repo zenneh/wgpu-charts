@@ -1,8 +1,11 @@
 //! Technical Analysis rendering pipeline.
 
+use std::ops::Range;
+
 use wgpu::util::DeviceExt;
 
 use crate::gpu_types::{LevelGpu, RangeGpu, TaRenderParams, TrendGpu, MAX_TA_LEVELS, MAX_TA_RANGES, MAX_TA_TRENDS};
+use crate::pipeline::traits::InstancedPipeline;
 
 /// Pipeline for rendering technical analysis elements (ranges, levels, and trends).
 pub struct TaPipeline {
@@ -313,4 +316,157 @@ impl TaPipeline {
             label: Some("TA Bind Group"),
         })
     }
+
+    /// Renders TA ranges.
+    ///
+    /// # Arguments
+    ///
+    /// * `render_pass` - The render pass to record commands into
+    /// * `camera_bind_group` - The camera/view-projection bind group (slot 0)
+    /// * `ta_bind_group` - The TA data bind group (slot 1)
+    /// * `range_count` - Number of ranges to render
+    pub fn render_ranges<'a>(
+        &'a self,
+        render_pass: &mut wgpu::RenderPass<'a>,
+        camera_bind_group: &'a wgpu::BindGroup,
+        ta_bind_group: &'a wgpu::BindGroup,
+        range_count: u32,
+    ) {
+        render_pass.set_pipeline(&self.range_pipeline);
+        render_pass.set_bind_group(0, camera_bind_group, &[]);
+        render_pass.set_bind_group(1, ta_bind_group, &[]);
+        render_pass.draw(0..VERTICES_PER_TA_ELEMENT, 0..range_count);
+    }
+
+    /// Renders TA levels (support/resistance).
+    ///
+    /// # Arguments
+    ///
+    /// * `render_pass` - The render pass to record commands into
+    /// * `camera_bind_group` - The camera/view-projection bind group (slot 0)
+    /// * `ta_bind_group` - The TA data bind group (slot 1)
+    /// * `level_count` - Number of levels to render
+    pub fn render_levels<'a>(
+        &'a self,
+        render_pass: &mut wgpu::RenderPass<'a>,
+        camera_bind_group: &'a wgpu::BindGroup,
+        ta_bind_group: &'a wgpu::BindGroup,
+        level_count: u32,
+    ) {
+        render_pass.set_pipeline(&self.level_pipeline);
+        render_pass.set_bind_group(0, camera_bind_group, &[]);
+        render_pass.set_bind_group(1, ta_bind_group, &[]);
+        render_pass.draw(0..VERTICES_PER_TA_ELEMENT, 0..level_count);
+    }
+
+    /// Renders TA trends (trendlines).
+    ///
+    /// # Arguments
+    ///
+    /// * `render_pass` - The render pass to record commands into
+    /// * `camera_bind_group` - The camera/view-projection bind group (slot 0)
+    /// * `ta_bind_group` - The TA data bind group (slot 1)
+    /// * `trend_count` - Number of trends to render
+    pub fn render_trends<'a>(
+        &'a self,
+        render_pass: &mut wgpu::RenderPass<'a>,
+        camera_bind_group: &'a wgpu::BindGroup,
+        ta_bind_group: &'a wgpu::BindGroup,
+        trend_count: u32,
+    ) {
+        render_pass.set_pipeline(&self.trend_pipeline);
+        render_pass.set_bind_group(0, camera_bind_group, &[]);
+        render_pass.set_bind_group(1, ta_bind_group, &[]);
+        render_pass.draw(0..VERTICES_PER_TA_ELEMENT, 0..trend_count);
+    }
+}
+
+/// Number of vertices per TA element (2 triangles = 6 vertices).
+const VERTICES_PER_TA_ELEMENT: u32 = 6;
+
+/// Wrapper for rendering TA ranges through the Pipeline trait.
+pub struct TaRangePipeline<'a>(pub &'a TaPipeline);
+
+impl<'a> crate::pipeline::traits::Pipeline for TaRangePipeline<'a> {
+    type BindGroupData = wgpu::BindGroup;
+
+    fn render<'b>(
+        &'b self,
+        render_pass: &mut wgpu::RenderPass<'b>,
+        camera_bind_group: &'b wgpu::BindGroup,
+        data_bind_group: &'b wgpu::BindGroup,
+        vertex_range: Range<u32>,
+        instance_range: Range<u32>,
+    ) {
+        render_pass.set_pipeline(&self.0.range_pipeline);
+        render_pass.set_bind_group(0, camera_bind_group, &[]);
+        render_pass.set_bind_group(1, data_bind_group, &[]);
+        render_pass.draw(vertex_range, instance_range);
+    }
+
+    fn pipeline(&self) -> &wgpu::RenderPipeline {
+        &self.0.range_pipeline
+    }
+}
+
+impl<'a> InstancedPipeline for TaRangePipeline<'a> {
+    const VERTICES_PER_INSTANCE: u32 = VERTICES_PER_TA_ELEMENT;
+}
+
+/// Wrapper for rendering TA levels through the Pipeline trait.
+pub struct TaLevelPipeline<'a>(pub &'a TaPipeline);
+
+impl<'a> crate::pipeline::traits::Pipeline for TaLevelPipeline<'a> {
+    type BindGroupData = wgpu::BindGroup;
+
+    fn render<'b>(
+        &'b self,
+        render_pass: &mut wgpu::RenderPass<'b>,
+        camera_bind_group: &'b wgpu::BindGroup,
+        data_bind_group: &'b wgpu::BindGroup,
+        vertex_range: Range<u32>,
+        instance_range: Range<u32>,
+    ) {
+        render_pass.set_pipeline(&self.0.level_pipeline);
+        render_pass.set_bind_group(0, camera_bind_group, &[]);
+        render_pass.set_bind_group(1, data_bind_group, &[]);
+        render_pass.draw(vertex_range, instance_range);
+    }
+
+    fn pipeline(&self) -> &wgpu::RenderPipeline {
+        &self.0.level_pipeline
+    }
+}
+
+impl<'a> InstancedPipeline for TaLevelPipeline<'a> {
+    const VERTICES_PER_INSTANCE: u32 = VERTICES_PER_TA_ELEMENT;
+}
+
+/// Wrapper for rendering TA trends through the Pipeline trait.
+pub struct TaTrendPipeline<'a>(pub &'a TaPipeline);
+
+impl<'a> crate::pipeline::traits::Pipeline for TaTrendPipeline<'a> {
+    type BindGroupData = wgpu::BindGroup;
+
+    fn render<'b>(
+        &'b self,
+        render_pass: &mut wgpu::RenderPass<'b>,
+        camera_bind_group: &'b wgpu::BindGroup,
+        data_bind_group: &'b wgpu::BindGroup,
+        vertex_range: Range<u32>,
+        instance_range: Range<u32>,
+    ) {
+        render_pass.set_pipeline(&self.0.trend_pipeline);
+        render_pass.set_bind_group(0, camera_bind_group, &[]);
+        render_pass.set_bind_group(1, data_bind_group, &[]);
+        render_pass.draw(vertex_range, instance_range);
+    }
+
+    fn pipeline(&self) -> &wgpu::RenderPipeline {
+        &self.0.trend_pipeline
+    }
+}
+
+impl<'a> InstancedPipeline for TaTrendPipeline<'a> {
+    const VERTICES_PER_INSTANCE: u32 = VERTICES_PER_TA_ELEMENT;
 }

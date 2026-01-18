@@ -1,8 +1,11 @@
 //! Guideline rendering pipeline.
 
+use std::ops::Range;
+
 use wgpu::util::DeviceExt;
 
 use crate::gpu_types::{GuidelineGpu, GuidelineParams, MAX_GUIDELINES};
+use crate::pipeline::traits::{InstancedPipeline, Pipeline};
 
 /// Pipeline for rendering price guidelines.
 pub struct GuidelinePipeline {
@@ -150,4 +153,33 @@ impl GuidelinePipeline {
             label: Some("Guideline Bind Group"),
         })
     }
+}
+
+/// Number of vertices per guideline (2 triangles = 6 vertices).
+const VERTICES_PER_GUIDELINE: u32 = 6;
+
+impl Pipeline for GuidelinePipeline {
+    type BindGroupData = wgpu::BindGroup;
+
+    fn render<'a>(
+        &'a self,
+        render_pass: &mut wgpu::RenderPass<'a>,
+        camera_bind_group: &'a wgpu::BindGroup,
+        data_bind_group: &'a wgpu::BindGroup,
+        vertex_range: Range<u32>,
+        instance_range: Range<u32>,
+    ) {
+        render_pass.set_pipeline(&self.pipeline);
+        render_pass.set_bind_group(0, camera_bind_group, &[]);
+        render_pass.set_bind_group(1, data_bind_group, &[]);
+        render_pass.draw(vertex_range, instance_range);
+    }
+
+    fn pipeline(&self) -> &wgpu::RenderPipeline {
+        &self.pipeline
+    }
+}
+
+impl InstancedPipeline for GuidelinePipeline {
+    const VERTICES_PER_INSTANCE: u32 = VERTICES_PER_GUIDELINE;
 }
