@@ -42,15 +42,15 @@ pub enum LevelType {
 /// The current state of a level.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LevelState {
-    /// Level exists but price hasn't crossed to the other side yet.
-    /// For bearish levels: waiting for price to go ABOVE the level.
-    /// For bullish levels: waiting for price to go BELOW the level.
-    Pending,
-    /// Level is active (price crossed to other side) but hasn't been hit yet.
+    /// Level exists but price hasn't closed on the other side yet.
+    /// For bearish levels: waiting for full candle body to close ABOVE the level.
+    /// For bullish levels: waiting for full candle body to close BELOW the level.
+    Inactive,
+    /// Level is active (price closed on other side). Can receive hits.
+    /// Hits are recorded but don't change the state.
     Active,
-    /// Level is active and has been hit (wick touched).
-    Hit,
     /// Level has been broken (same-direction candle closed fully through).
+    /// No more hits are recorded once broken.
     Broken,
 }
 
@@ -59,6 +59,9 @@ pub enum LevelState {
 pub struct LevelHit {
     /// Index of the candle that caused the hit.
     pub candle_index: usize,
+    /// The timeframe index that caused the hit.
+    /// This allows distinguishing between e.g. 1min hits vs 15min hits.
+    pub timeframe: usize,
     /// The wick price that touched the level.
     pub touch_price: f32,
     /// Distance from the level (how deep the wick went).
@@ -136,7 +139,7 @@ impl Level {
             created_at_index,
             source_candle_index,
             source_timeframe,
-            state: LevelState::Pending, // Start as Pending until price crosses to other side
+            state: LevelState::Inactive, // Start as Pending until price crosses to other side
             hits: Vec::new(),
             break_event: None,
             tolerance,
@@ -209,10 +212,10 @@ impl Level {
 
         match self.direction {
             CandleDirection::Bearish => {
-                self.check_bearish_level_interaction(candle_index, candle, body_top, body_bottom, candle_direction, can_break)
+                self.check_bearish_level_interaction(candle_index, candle, candle_timeframe, body_top, body_bottom, candle_direction, can_break)
             }
             CandleDirection::Bullish => {
-                self.check_bullish_level_interaction(candle_index, candle, body_top, body_bottom, candle_direction, can_break)
+                self.check_bullish_level_interaction(candle_index, candle, candle_timeframe, body_top, body_bottom, candle_direction, can_break)
             }
             CandleDirection::Doji => LevelInteraction::None,
         }
@@ -221,22 +224,24 @@ impl Level {
     /// Check bearish level interaction.
     ///
     /// Bearish levels are at the highs of bearish ranges (resistance).
-    /// - Activated when price goes ABOVE the level
+    /// - Activated when full candle body is ABOVE the level (both open and close above)
     /// - Hit when LOW wick touches or goes BELOW the level
     /// - Broken when a BEARISH candle opens AND closes fully BELOW the level (same timeframe only)
     fn check_bearish_level_interaction(
         &mut self,
         candle_index: usize,
         candle: &Candle,
+        candle_timeframe: usize,
         body_top: f32,
         body_bottom: f32,
         candle_direction: CandleDirection,
         can_break: bool,
     ) -> LevelInteraction {
-        // Step 1: Check for activation (price must go ABOVE the level first)
-        if self.state == LevelState::Pending {
-            // For bearish level, activate when any part of candle is above the level
-            if candle.high > self.price + self.tolerance {
+        // Step 1: Check for activation (full candle body must be ABOVE the level)
+        if self.state == LevelState::Inactive {
+            // For bearish level, activate when full candle body is above the level
+            // (both open and close must be above)
+            if body_bottom > self.price + self.tolerance {
                 self.state = LevelState::Active;
                 return LevelInteraction::Activated;
             }
@@ -270,12 +275,13 @@ impl Level {
 
             let hit = LevelHit {
                 candle_index,
+                timeframe: candle_timeframe,
                 touch_price: candle.low,
                 penetration,
                 respected,
             };
             self.hits.push(hit);
-            self.state = LevelState::Hit;
+            // State stays Active - hits don't change the state
             return LevelInteraction::Hit(hit);
         }
 
@@ -285,22 +291,24 @@ impl Level {
     /// Check bullish level interaction.
     ///
     /// Bullish levels are at the lows of bullish ranges (support).
-    /// - Activated when price goes BELOW the level
+    /// - Activated when full candle body is BELOW the level (both open and close below)
     /// - Hit when HIGH wick touches or goes ABOVE the level
     /// - Broken when a BULLISH candle opens AND closes fully ABOVE the level (same timeframe only)
     fn check_bullish_level_interaction(
         &mut self,
         candle_index: usize,
         candle: &Candle,
+        candle_timeframe: usize,
         body_top: f32,
         body_bottom: f32,
         candle_direction: CandleDirection,
         can_break: bool,
     ) -> LevelInteraction {
-        // Step 1: Check for activation (price must go BELOW the level first)
-        if self.state == LevelState::Pending {
-            // For bullish level, activate when any part of candle is below the level
-            if candle.low < self.price - self.tolerance {
+        // Step 1: Check for activation (full candle body must be BELOW the level)
+        if self.state == LevelState::Inactive {
+            // For bullish level, activate when full candle body is below the level
+            // (both open and close must be below)
+            if body_top < self.price - self.tolerance {
                 self.state = LevelState::Active;
                 return LevelInteraction::Activated;
             }
@@ -334,12 +342,13 @@ impl Level {
 
             let hit = LevelHit {
                 candle_index,
+                timeframe: candle_timeframe,
                 touch_price: candle.high,
                 penetration,
                 respected,
             };
             self.hits.push(hit);
-            self.state = LevelState::Hit;
+            // State stays Active - hits don't change the state
             return LevelInteraction::Hit(hit);
         }
 
@@ -789,17 +798,23 @@ mod tests {
         let mut level = Level::from_range(LevelId::new(1), &range, LevelType::Hold, 2, 0, 0.5);
 
         assert_eq!(level.price, 115.0);
-        assert_eq!(level.state, LevelState::Pending);
+        assert_eq!(level.state, LevelState::Inactive);
 
-        // Candle below level - should NOT activate (need to go ABOVE first)
+        // Candle below level - should NOT activate (need full body ABOVE first)
         let candle_below = make_candle(110.0, 112.0, 108.0, 111.0);
         let interaction = level.check_interaction(3, &candle_below, 0);
         assert!(matches!(interaction, LevelInteraction::None));
-        assert_eq!(level.state, LevelState::Pending);
+        assert_eq!(level.state, LevelState::Inactive);
 
-        // Candle going above level - should activate
-        let candle_above = make_candle(114.0, 118.0, 113.0, 117.0);
-        let interaction = level.check_interaction(4, &candle_above, 0);
+        // Candle with only wick above - should NOT activate (need full body above)
+        let candle_wick_above = make_candle(114.0, 118.0, 113.0, 115.0);
+        let interaction = level.check_interaction(4, &candle_wick_above, 0);
+        assert!(matches!(interaction, LevelInteraction::None));
+        assert_eq!(level.state, LevelState::Inactive);
+
+        // Candle with full body above level (both open and close > 115.5) - should activate
+        let candle_body_above = make_candle(116.0, 120.0, 115.8, 118.0);
+        let interaction = level.check_interaction(5, &candle_body_above, 0);
         assert!(matches!(interaction, LevelInteraction::Activated));
         assert_eq!(level.state, LevelState::Active);
     }
@@ -809,8 +824,8 @@ mod tests {
         let range = make_bearish_range();
         let mut level = Level::from_range(LevelId::new(1), &range, LevelType::Hold, 2, 0, 0.5);
 
-        // First activate the level (price goes above)
-        let candle_above = make_candle(114.0, 118.0, 113.0, 117.0);
+        // First activate the level (full body above level)
+        let candle_above = make_candle(116.0, 120.0, 115.8, 118.0);
         level.check_interaction(3, &candle_above, 0);
         assert_eq!(level.state, LevelState::Active);
 
@@ -822,13 +837,14 @@ mod tests {
         match interaction {
             LevelInteraction::Hit(hit) => {
                 assert_eq!(hit.candle_index, 4);
+                assert_eq!(hit.timeframe, 0);
                 assert_eq!(hit.touch_price, 114.5);
                 assert!(hit.respected, "Body stayed above, should be respected");
             }
             _ => panic!("Expected Hit"),
         }
 
-        assert_eq!(level.state, LevelState::Hit);
+        assert_eq!(level.state, LevelState::Active); // State stays Active after hit
         assert_eq!(level.hit_count(), 1);
     }
 
@@ -837,8 +853,8 @@ mod tests {
         let range = make_bearish_range();
         let mut level = Level::from_range(LevelId::new(1), &range, LevelType::Hold, 2, 0, 0.5);
 
-        // Activate
-        let candle_above = make_candle(114.0, 118.0, 113.0, 117.0);
+        // Activate (full body above level)
+        let candle_above = make_candle(116.0, 120.0, 115.8, 118.0);
         level.check_interaction(3, &candle_above, 0);
 
         // Hit where body also crosses the level (not respected)
@@ -859,8 +875,8 @@ mod tests {
         let range = make_bearish_range();
         let mut level = Level::from_range(LevelId::new(1), &range, LevelType::Hold, 2, 0, 0.5);
 
-        // Activate
-        let candle_above = make_candle(114.0, 118.0, 113.0, 117.0);
+        // Activate (full body above level)
+        let candle_above = make_candle(116.0, 120.0, 115.8, 118.0);
         level.check_interaction(3, &candle_above, 0);
 
         // Bearish candle (close < open) with body fully below level = BROKEN
@@ -877,8 +893,8 @@ mod tests {
         let range = make_bearish_range();
         let mut level = Level::from_range(LevelId::new(1), &range, LevelType::Hold, 2, 0, 0.5);
 
-        // Activate
-        let candle_above = make_candle(114.0, 118.0, 113.0, 117.0);
+        // Activate (full body above level)
+        let candle_above = make_candle(116.0, 120.0, 115.8, 118.0);
         level.check_interaction(3, &candle_above, 0);
 
         // Bullish candle (close > open) with body fully below level = NOT broken (just a hit)
@@ -888,7 +904,7 @@ mod tests {
 
         // Should be a hit (wick touched) but NOT broken
         assert!(matches!(interaction, LevelInteraction::Hit(_)));
-        assert_eq!(level.state, LevelState::Hit);
+        assert_eq!(level.state, LevelState::Active); // State stays Active after hit
     }
 
     #[test]
@@ -898,17 +914,23 @@ mod tests {
         let mut level = Level::from_range(LevelId::new(1), &range, LevelType::Hold, 2, 0, 0.5);
 
         assert_eq!(level.price, 100.0);
-        assert_eq!(level.state, LevelState::Pending);
+        assert_eq!(level.state, LevelState::Inactive);
 
-        // Candle above level - should NOT activate (need to go BELOW first)
+        // Candle above level - should NOT activate (need full body BELOW first)
         let candle_above = make_candle(105.0, 110.0, 102.0, 108.0);
         let interaction = level.check_interaction(3, &candle_above, 0);
         assert!(matches!(interaction, LevelInteraction::None));
-        assert_eq!(level.state, LevelState::Pending);
+        assert_eq!(level.state, LevelState::Inactive);
 
-        // Candle going below level - should activate
-        let candle_below = make_candle(101.0, 102.0, 98.0, 99.0);
-        let interaction = level.check_interaction(4, &candle_below, 0);
+        // Candle with only wick below - should NOT activate (need full body below)
+        let candle_wick_below = make_candle(101.0, 102.0, 98.0, 100.5);
+        let interaction = level.check_interaction(4, &candle_wick_below, 0);
+        assert!(matches!(interaction, LevelInteraction::None));
+        assert_eq!(level.state, LevelState::Inactive);
+
+        // Candle with full body below level (both open and close < 99.5) - should activate
+        let candle_body_below = make_candle(99.0, 99.3, 97.0, 98.0);
+        let interaction = level.check_interaction(5, &candle_body_below, 0);
         assert!(matches!(interaction, LevelInteraction::Activated));
         assert_eq!(level.state, LevelState::Active);
     }
@@ -918,8 +940,8 @@ mod tests {
         let range = make_bullish_range();
         let mut level = Level::from_range(LevelId::new(1), &range, LevelType::Hold, 2, 0, 0.5);
 
-        // Activate (price goes below)
-        let candle_below = make_candle(101.0, 102.0, 98.0, 99.0);
+        // Activate (full body below level)
+        let candle_below = make_candle(99.0, 99.3, 97.0, 98.0);
         level.check_interaction(3, &candle_below, 0);
 
         // Bullish candle (close > open) with body fully above level = BROKEN
@@ -949,8 +971,8 @@ mod tests {
         // Create level in timeframe 0
         let mut level = Level::from_range(LevelId::new(1), &range, LevelType::Hold, 2, 0, 0.5);
 
-        // Activate from any timeframe (activation doesn't require same timeframe)
-        let candle_above = make_candle(114.0, 118.0, 113.0, 117.0);
+        // Activate (full body above level) from any timeframe
+        let candle_above = make_candle(116.0, 120.0, 115.8, 118.0);
         level.check_interaction(3, &candle_above, 1); // Different timeframe
         assert_eq!(level.state, LevelState::Active);
 
@@ -970,8 +992,8 @@ mod tests {
         // Create level in timeframe 0
         let mut level = Level::from_range(LevelId::new(1), &range, LevelType::Hold, 2, 0, 0.5);
 
-        // Activate
-        let candle_above = make_candle(114.0, 118.0, 113.0, 117.0);
+        // Activate (full body above level)
+        let candle_above = make_candle(116.0, 120.0, 115.8, 118.0);
         level.check_interaction(3, &candle_above, 0);
         assert_eq!(level.state, LevelState::Active);
 
@@ -981,5 +1003,40 @@ mod tests {
 
         assert!(matches!(interaction, LevelInteraction::Broken));
         assert_eq!(level.state, LevelState::Broken);
+    }
+
+    #[test]
+    fn test_hit_tracks_timeframe() {
+        let range = make_bearish_range();
+        let mut level = Level::from_range(LevelId::new(1), &range, LevelType::Hold, 2, 0, 0.5);
+
+        // Activate (full body above level)
+        let candle_above = make_candle(116.0, 120.0, 115.8, 118.0);
+        level.check_interaction(3, &candle_above, 0);
+
+        // Hit from timeframe 1
+        let candle1 = make_candle(117.0, 120.0, 114.5, 118.0);
+        let interaction1 = level.check_interaction(4, &candle1, 1);
+        match interaction1 {
+            LevelInteraction::Hit(hit) => {
+                assert_eq!(hit.timeframe, 1, "Hit should record timeframe 1");
+            }
+            _ => panic!("Expected Hit"),
+        }
+
+        // Hit from timeframe 2
+        let candle2 = make_candle(117.0, 120.0, 114.0, 118.0);
+        let interaction2 = level.check_interaction(5, &candle2, 2);
+        match interaction2 {
+            LevelInteraction::Hit(hit) => {
+                assert_eq!(hit.timeframe, 2, "Hit should record timeframe 2");
+            }
+            _ => panic!("Expected Hit"),
+        }
+
+        // Verify both hits are recorded with their timeframes
+        assert_eq!(level.hits.len(), 2);
+        assert_eq!(level.hits[0].timeframe, 1);
+        assert_eq!(level.hits[1].timeframe, 2);
     }
 }

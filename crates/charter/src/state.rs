@@ -949,9 +949,8 @@ impl State {
                     LevelType::GreedyHold => self.ta_settings.show_greedy_levels,
                 };
                 let state_ok = match l.state {
-                    LevelState::Pending => self.ta_settings.show_active_levels, // Pending shown with active
+                    LevelState::Inactive => self.ta_settings.show_active_levels, // Inactive shown with active
                     LevelState::Active => self.ta_settings.show_active_levels,
-                    LevelState::Hit => self.ta_settings.show_hit_levels,
                     LevelState::Broken => self.ta_settings.show_broken_levels,
                 };
                 type_ok && state_ok
@@ -966,14 +965,12 @@ impl State {
             .iter()
             .map(|l| {
                 let (r, g, b, a) = match (l.direction, l.state) {
-                    // Pending levels: dimmer than active (waiting for price to cross)
-                    (CandleDirection::Bullish, LevelState::Pending) => (0.0, 0.5, 0.3, 0.4),
+                    // Inactive levels: dimmer than active (waiting for price to close on other side)
+                    (CandleDirection::Bullish, LevelState::Inactive) => (0.0, 0.5, 0.3, 0.4),
                     (CandleDirection::Bullish, LevelState::Active) => (0.0, 0.8, 0.4, 0.7),
-                    (CandleDirection::Bullish, LevelState::Hit) => (0.0, 0.6, 0.3, 0.5),
                     (CandleDirection::Bullish, LevelState::Broken) => (0.0, 0.3, 0.2, 0.3),
-                    (CandleDirection::Bearish, LevelState::Pending) => (0.5, 0.15, 0.15, 0.4),
+                    (CandleDirection::Bearish, LevelState::Inactive) => (0.5, 0.15, 0.15, 0.4),
                     (CandleDirection::Bearish, LevelState::Active) => (0.8, 0.2, 0.2, 0.7),
-                    (CandleDirection::Bearish, LevelState::Hit) => (0.6, 0.2, 0.2, 0.5),
                     (CandleDirection::Bearish, LevelState::Broken) => (0.3, 0.1, 0.1, 0.3),
                     (CandleDirection::Doji, _) => (0.5, 0.5, 0.5, 0.5),
                 };
@@ -2308,9 +2305,8 @@ impl State {
                             LevelType::GreedyHold => self.ta_settings.show_greedy_levels,
                         };
                         let state_ok = match l.state {
-                            LevelState::Pending => self.ta_settings.show_active_levels,
+                            LevelState::Inactive => self.ta_settings.show_active_levels,
                             LevelState::Active => self.ta_settings.show_active_levels,
-                            LevelState::Hit => self.ta_settings.show_hit_levels,
                             LevelState::Broken => self.ta_settings.show_broken_levels,
                         };
                         type_ok && state_ok
@@ -2552,9 +2548,8 @@ impl State {
                 LevelType::GreedyHold => self.ta_settings.show_greedy_levels,
             };
             let state_visible = match level.state {
-                LevelState::Pending => self.ta_settings.show_active_levels,
+                LevelState::Inactive => self.ta_settings.show_active_levels,
                 LevelState::Active => self.ta_settings.show_active_levels,
-                LevelState::Hit => self.ta_settings.show_hit_levels,
                 LevelState::Broken => self.ta_settings.show_broken_levels,
             };
 
