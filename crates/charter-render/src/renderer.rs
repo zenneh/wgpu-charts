@@ -7,7 +7,7 @@ use charter_core::Candle;
 use crate::camera::{Camera, CameraUniform};
 use crate::gpu_types::{
     aggregate_candles_lod, aggregate_volume_lod, CandleGpu, GuidelineGpu, GuidelineParams,
-    LodLevel, PackedCandleGpu, PriceNormalization, RenderParams, VolumeGpu, VolumeRenderParams,
+    LodConfig, PackedCandleGpu, PriceNormalization, RenderParams, VolumeGpu, VolumeRenderParams,
     MAX_GUIDELINES,
 };
 use crate::pipeline::{CandlePipeline, GuidelinePipeline, IndicatorPipeline, TaPipeline, VolumePipeline};
@@ -38,8 +38,8 @@ pub struct TimeframeData {
     pub price_normalization: PriceNormalization,
     /// LOD levels for zoomed-out rendering.
     pub lod_levels: Vec<LodData>,
-    /// Current LOD level being used.
-    pub current_lod: LodLevel,
+    /// LOD configuration.
+    pub lod_config: LodConfig,
     // TA data
     pub ta_range_buffer: wgpu::Buffer,
     pub ta_level_buffer: wgpu::Buffer,
@@ -55,31 +55,35 @@ impl TimeframeData {
     /// Get the LOD data for a given candles-per-pixel density.
     /// Returns (candle_bind_group, volume_bind_group, count, factor, max_volume).
     pub fn lod_for_density(&self, candles_per_pixel: f32) -> (&wgpu::BindGroup, &wgpu::BindGroup, u32, usize, f32) {
-        let desired_lod = LodLevel::for_density(candles_per_pixel);
+        let desired_factor = self.lod_config.factor_for_density(candles_per_pixel);
 
-        // Find the appropriate LOD level
-        match desired_lod {
-            LodLevel::Full => {
-                (&self.candle_bind_group, &self.volume_bind_group, self.count, 1, self.max_volume)
-            }
-            LodLevel::Low => {
-                // Try to use LOD 10
-                if let Some(lod) = self.lod_levels.iter().find(|l| l.factor == 10) {
-                    (&lod.candle_bind_group, &lod.volume_bind_group, lod.count, lod.factor, lod.max_volume)
+        // If full resolution is desired, return it immediately
+        if desired_factor == 1 {
+            return (&self.candle_bind_group, &self.volume_bind_group, self.count, 1, self.max_volume);
+        }
+
+        // Try to find exact match first
+        if let Some(lod) = self.lod_levels.iter().find(|l| l.factor == desired_factor) {
+            return (&lod.candle_bind_group, &lod.volume_bind_group, lod.count, lod.factor, lod.max_volume);
+        }
+
+        // Find the closest available LOD level (prefer slightly higher detail)
+        let closest_lod = self.lod_levels.iter()
+            .min_by_key(|lod| {
+                let diff = (lod.factor as i32 - desired_factor as i32).abs();
+                // Prefer lower factors (higher detail) when equally close
+                if lod.factor < desired_factor {
+                    diff * 10 // Penalize less detailed options less
                 } else {
-                    (&self.candle_bind_group, &self.volume_bind_group, self.count, 1, self.max_volume)
+                    diff * 15 // Penalize more detailed options more
                 }
-            }
-            LodLevel::VeryLow => {
-                // Try LOD 100 first, then fall back to 10
-                if let Some(lod) = self.lod_levels.iter().find(|l| l.factor == 100) {
-                    (&lod.candle_bind_group, &lod.volume_bind_group, lod.count, lod.factor, lod.max_volume)
-                } else if let Some(lod) = self.lod_levels.iter().find(|l| l.factor == 10) {
-                    (&lod.candle_bind_group, &lod.volume_bind_group, lod.count, lod.factor, lod.max_volume)
-                } else {
-                    (&self.candle_bind_group, &self.volume_bind_group, self.count, 1, self.max_volume)
-                }
-            }
+            });
+
+        if let Some(lod) = closest_lod {
+            (&lod.candle_bind_group, &lod.volume_bind_group, lod.count, lod.factor, lod.max_volume)
+        } else {
+            // Fallback to full resolution if no LOD levels exist
+            (&self.candle_bind_group, &self.volume_bind_group, self.count, 1, self.max_volume)
         }
     }
 }
@@ -242,6 +246,16 @@ impl ChartRenderer {
         candles: Vec<Candle>,
         label: &str,
     ) -> TimeframeData {
+        self.create_timeframe_data_with_config(device, candles, label, LodConfig::default())
+    }
+
+    pub fn create_timeframe_data_with_config(
+        &self,
+        device: &wgpu::Device,
+        candles: Vec<Candle>,
+        label: &str,
+        lod_config: LodConfig,
+    ) -> TimeframeData {
         // Compute price normalization for packed candles (50% memory savings)
         let price_normalization = PriceNormalization::from_candles(&candles);
 
@@ -292,13 +306,15 @@ impl ChartRenderer {
         // Create LOD levels using packed candles
         let candles_gpu: Vec<CandleGpu> = candles.iter().map(CandleGpu::from).collect();
         let mut lod_levels = Vec::new();
-        for lod in [LodLevel::Low, LodLevel::VeryLow] {
-            let factor = lod.factor();
-            if candles_gpu.len() > factor * 10 {
+
+        // Generate LOD levels based on configuration
+        for &factor in lod_config.factors() {
+            // Only create LOD if we have enough candles (at least 5x the factor for meaningful aggregation)
+            if candles_gpu.len() > factor * 5 {
                 // Aggregate then pack for LOD
                 let lod_candles_gpu = aggregate_candles_lod(&candles_gpu, factor);
                 let lod_packed = price_normalization.pack_candles_gpu(&lod_candles_gpu);
-                let lod_volume = aggregate_volume_lod(&volume_gpu, factor);
+                let lod_volume = aggregate_volume_lod(&volume_gpu, &candles_gpu, factor);
                 let lod_max_volume = lod_volume.iter().map(|v| v.volume).fold(0.0f32, f32::max);
 
                 let lod_candle_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -362,7 +378,7 @@ impl ChartRenderer {
             max_volume,
             price_normalization,
             lod_levels,
-            current_lod: LodLevel::Full,
+            lod_config,
             ta_range_buffer,
             ta_level_buffer,
             ta_trend_buffer,
@@ -417,21 +433,26 @@ impl ChartRenderer {
         self.candles_per_pixel = visible_candles_approx / chart_width;
 
         // Select appropriate LOD based on density
-        let desired_lod = LodLevel::for_density(self.candles_per_pixel);
-        self.current_lod_factor = match desired_lod {
-            LodLevel::Full => 1,
-            LodLevel::Low => {
-                if timeframe.lod_levels.iter().any(|l| l.factor == 10) { 10 } else { 1 }
-            }
-            LodLevel::VeryLow => {
-                if timeframe.lod_levels.iter().any(|l| l.factor == 100) {
-                    100
-                } else if timeframe.lod_levels.iter().any(|l| l.factor == 10) {
-                    10
-                } else {
-                    1
-                }
-            }
+        let desired_factor = timeframe.lod_config.factor_for_density(self.candles_per_pixel);
+
+        // Find the best available LOD factor
+        self.current_lod_factor = if desired_factor == 1 {
+            1
+        } else if let Some(lod) = timeframe.lod_levels.iter().find(|l| l.factor == desired_factor) {
+            lod.factor
+        } else {
+            // Find closest available LOD level
+            timeframe.lod_levels.iter()
+                .min_by_key(|lod| {
+                    let diff = (lod.factor as i32 - desired_factor as i32).abs();
+                    if lod.factor < desired_factor {
+                        diff * 10
+                    } else {
+                        diff * 15
+                    }
+                })
+                .map(|lod| lod.factor)
+                .unwrap_or(1)
         };
 
         // Compute effective values based on LOD
@@ -450,7 +471,9 @@ impl ChartRenderer {
 
         let world_units_per_pixel = visible_width / chart_width;
         let min_world_width = MIN_CANDLE_PIXELS * world_units_per_pixel;
-        let candle_width = (BASE_CANDLE_WIDTH * self.current_lod_factor as f32).max(min_world_width);
+        let desired_width = (BASE_CANDLE_WIDTH * self.current_lod_factor as f32).max(min_world_width);
+        // Ensure candle width never exceeds spacing to prevent overlap
+        let candle_width = desired_width.min(effective_spacing * 0.95);
 
         // Wick width: use a fraction of candle width, with minimum pixel visibility
         let base_wick_width = candle_width * 0.15;
