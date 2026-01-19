@@ -33,7 +33,7 @@ use charter_ta::{
     Analyzer, AnalyzerConfig, CandleDirection, Level, LevelState, LevelType, MlFeatures, Range,
     TimeframeFeatures, Trend, TrendState, MlInferenceHandle,
 };
-use charter_ui::StatsPanel;
+use charter_ui::TopBar;
 
 /// Loading state for background operations.
 #[derive(Debug, Clone, PartialEq)]
@@ -185,7 +185,6 @@ pub struct State {
     pub egui_ctx: egui::Context,
     pub egui_state: egui_winit::State,
     pub egui_renderer: egui_wgpu::Renderer,
-    pub stats_panel: StatsPanel,
 
     // Input handling
     pub input: InputHandler,
@@ -341,8 +340,6 @@ impl State {
         );
         let egui_renderer = egui_wgpu::Renderer::new(&device, surface_format, None, 1, false);
 
-        let stats_panel = StatsPanel::default();
-
         // Try to load ML model if it exists
         let ml_inference = match MlInferenceHandle::load("data/charter_model.onnx") {
             Ok(handle) => {
@@ -379,7 +376,6 @@ impl State {
             egui_ctx,
             egui_state,
             egui_renderer,
-            stats_panel,
             input: InputHandler::new(),
             last_frame_time: Instant::now(),
             frame_count: 0,
@@ -640,8 +636,8 @@ impl State {
             self.timeframes[0] = new_tf_data;
         }
 
-        // Re-populate TA buffers after creating new TimeframeData (buffers were recreated empty)
-        self.update_ta_buffers();
+        // Update render params with new price_normalization (critical for correct rendering)
+        self.update_visible_range();
 
         self.window.request_redraw();
     }
@@ -674,10 +670,14 @@ impl State {
         // Update loading state
         self.loading_state = LoadingState::FetchingMexcData { symbol: symbol.clone() };
 
-        // Clear existing data
-        for tf in &mut self.timeframes {
-            tf.candles.clear();
+        // Recreate empty TimeframeData to clear GPU buffers (just clearing Vec leaves stale GPU data)
+        let timeframe_types = Timeframe::all();
+        for (i, tf) in timeframe_types.iter().enumerate() {
+            let empty_tf = self.renderer.create_timeframe_data(&self.device, Vec::new(), tf.label());
+            self.timeframes[i] = empty_tf;
         }
+
+        // Clear TA data
         for ta in &mut self.ta_data {
             ta.ranges.clear();
             ta.levels.clear();
@@ -1511,13 +1511,15 @@ impl State {
             });
         }
 
-        // Calculate x_max for rendering
-        let x_max = (tf.candles.len() as f32) * CANDLE_SPACING;
-
         // Compute line thickness based on current view
         let chart_height = self.config.height as f32 * (1.0 - VOLUME_HEIGHT_RATIO);
         let aspect = (self.config.width as f32 - STATS_PANEL_WIDTH) / chart_height;
         let (y_min, y_max) = self.renderer.camera.visible_y_range(aspect);
+
+        // Extend levels/trends to the right edge of visible screen (not just last candle)
+        let (_, visible_x_max) = self.renderer.camera.visible_x_range(aspect);
+        let candle_x_max = (tf.candles.len() as f32) * CANDLE_SPACING;
+        let x_max = visible_x_max.max(candle_x_max);
         let price_range = y_max - y_min;
         let world_units_per_pixel = price_range / chart_height;
         let level_thickness = (1.5 * world_units_per_pixel).max(price_range * 0.0008);
@@ -2237,6 +2239,9 @@ impl State {
         let show_macd = self.show_macd_panel;
         let should_show_symbol_picker = self.show_symbol_picker;
         let current_symbol = self.current_symbol.clone();
+        let current_timeframe = self.current_timeframe;
+        let ws_connected = self.ws_connected;
+        let new_timeframe = RefCell::new(None::<usize>);
 
         // Copy data for egui closure (will be updated after)
         let ta_settings = RefCell::new(self.ta_settings.clone());
@@ -2294,15 +2299,16 @@ impl State {
                     }
                 });
 
-            self.stats_panel.show(
+            // Top bar with symbol, OHLC data, and timeframe selector
+            if let Some(tf) = TopBar::show(
                 ctx,
-                self.current_timeframe,
-                self.fps,
-                candle_count,
-                self.renderer.visible_count,
-                self.renderer.current_lod_factor,
+                &current_symbol,
+                current_timeframe,
                 candle.as_ref(),
-            );
+                ws_connected,
+            ) {
+                *new_timeframe.borrow_mut() = Some(tf);
+            }
 
             // TA control panel (extracted to ui::ta_panel)
             {
@@ -2519,6 +2525,11 @@ impl State {
 
         // Update symbol picker state if it changed
         self.symbol_picker_state = symbol_picker_state.into_inner();
+
+        // Apply timeframe change from top bar
+        if let Some(tf) = new_timeframe.into_inner() {
+            self.switch_timeframe(tf);
+        }
 
         self.egui_state
             .handle_platform_output(&self.window, full_output.platform_output);

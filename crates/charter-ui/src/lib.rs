@@ -1,7 +1,7 @@
 //! UI components for charter.
 
 pub mod indicator_panel;
-pub mod stats_panel;
+pub mod top_bar;
 
 pub use indicator_panel::IndicatorPanel;
-pub use stats_panel::StatsPanel;
+pub use top_bar::{TopBar, TOP_BAR_HEIGHT, TIMEFRAME_LABELS};
