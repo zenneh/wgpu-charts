@@ -32,6 +32,17 @@
           (rust-bin.stable.latest.default.override {
             extensions = ["rust-src" "rust-analyzer"];
           })
+          # Python with ML packages for training
+          (python3.withPackages (ps: with ps; [
+            numpy
+            pandas
+            scikit-learn
+            xgboost
+            onnx
+            onnxmltools
+            plotly
+            matplotlib
+          ]))
         ];
 
         inherit buildInputs;

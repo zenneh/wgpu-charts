@@ -27,8 +27,8 @@ use charter_render::{
     MAX_TA_LEVELS, MAX_TA_RANGES, MAX_TA_TRENDS, STATS_PANEL_WIDTH, VOLUME_HEIGHT_RATIO,
 };
 use charter_ta::{
-    Analyzer, AnalyzerConfig, CandleDirection, Level, LevelState, LevelType, Range, Trend,
-    TrendState,
+    Analyzer, AnalyzerConfig, CandleDirection, Level, LevelState, LevelType, MlFeatures, Range,
+    TimeframeFeatures, Trend, TrendState, MlInferenceHandle,
 };
 use charter_ui::StatsPanel;
 
@@ -45,6 +45,8 @@ pub enum LoadingState {
     CreatingBuffers { current: usize, total: usize },
     /// Computing technical analysis.
     ComputingTa { timeframe: usize },
+    /// Computing TA for multiple timeframes (for ML inference).
+    ComputingMlTa { completed: usize, total: usize },
 }
 
 impl LoadingState {
@@ -65,6 +67,9 @@ impl LoadingState {
             LoadingState::ComputingTa { timeframe } => {
                 format!("Computing TA for timeframe {}", timeframe)
             }
+            LoadingState::ComputingMlTa { completed, total } => {
+                format!("Computing TA for ML ({}/{})", completed, total)
+            }
         }
     }
 }
@@ -82,6 +87,8 @@ pub enum BackgroundMessage {
         levels: Vec<Level>,
         trends: Vec<Trend>,
     },
+    /// Progress update for batch ML TA computation.
+    MlTaProgress { completed: usize, total: usize },
     /// Loading state update.
     LoadingStateChanged(LoadingState),
     /// Error occurred.
@@ -178,6 +185,9 @@ pub struct State {
 
     // Replay mode
     pub replay: ReplayManager,
+
+    // ML inference (optional - loaded if model exists)
+    pub ml_inference: Option<MlInferenceHandle>,
 }
 
 impl State {
@@ -279,6 +289,7 @@ impl State {
                 levels: Vec::new(),
                 trends: Vec::new(),
                 computed: false,
+                prediction: None,
             });
 
             // Create empty placeholder timeframe
@@ -299,6 +310,18 @@ impl State {
         let egui_renderer = egui_wgpu::Renderer::new(&device, surface_format, None, 1, false);
 
         let stats_panel = StatsPanel::default();
+
+        // Try to load ML model if it exists
+        let ml_inference = match MlInferenceHandle::load("data/charter_model.onnx") {
+            Ok(handle) => {
+                println!("ML model loaded successfully from data/charter_model.onnx");
+                Some(handle)
+            }
+            Err(e) => {
+                println!("ML model not available (this is OK): {}", e);
+                None
+            }
+        };
 
         let state = Self {
             surface,
@@ -330,6 +353,7 @@ impl State {
             frame_count: 0,
             fps: 0.0,
             replay: ReplayManager::new(),
+            ml_inference,
         };
 
         // Don't update visible range yet - data is loading
@@ -463,12 +487,26 @@ impl State {
                         levels,
                         trends,
                         computed: true,
+                        prediction: None,
                     };
                     self.loading_state = LoadingState::Idle;
 
                     // Update TA buffers if this is the current timeframe
                     if timeframe == self.current_timeframe && self.ta_settings.show_ta {
                         self.update_ta_buffers();
+                    }
+                    updated = true;
+                }
+                BackgroundMessage::MlTaProgress { completed, total } => {
+                    // Update progress for ML TA batch computation
+                    if completed >= total {
+                        self.loading_state = LoadingState::Idle;
+                        // Recompute replay TA now that all ML timeframes are ready
+                        if self.replay.is_locked() {
+                            self.recompute_replay_ta();
+                        }
+                    } else {
+                        self.loading_state = LoadingState::ComputingMlTa { completed, total };
                     }
                     updated = true;
                 }
@@ -545,6 +583,94 @@ impl State {
         });
     }
 
+    /// Precompute TA for all timeframes needed for ML inference.
+    /// The ML model uses 4 essential timeframes: 5m, 1h, 1d, 1w
+    /// These correspond to indices [2, 4, 8, 9] in Timeframe::all().
+    /// This runs in background to avoid blocking the UI.
+    fn precompute_ml_ta(&self) {
+        // Essential timeframe indices: 5m(2), 1h(4), 1d(8), 1w(9)
+        const ML_TIMEFRAME_INDICES: [usize; 4] = [2, 4, 8, 9];
+        const MIN_CANDLES: usize = 100;
+
+        // Collect timeframes that need TA computation
+        let mut timeframes_to_compute: Vec<(usize, Vec<Candle>)> = Vec::new();
+
+        for &tf_idx in &ML_TIMEFRAME_INDICES {
+            if tf_idx >= self.timeframes.len() {
+                continue;
+            }
+
+            // Skip if already computed
+            if self.ta_data[tf_idx].computed {
+                continue;
+            }
+
+            // Skip if not enough candles
+            let candles = &self.timeframes[tf_idx].candles;
+            if candles.len() < MIN_CANDLES {
+                continue;
+            }
+
+            timeframes_to_compute.push((tf_idx, candles.clone()));
+        }
+
+        if timeframes_to_compute.is_empty() {
+            return; // Nothing to compute
+        }
+
+        let total = timeframes_to_compute.len();
+        let sender = self.bg_sender.clone();
+
+        // Send initial progress
+        let _ = sender.send(BackgroundMessage::MlTaProgress { completed: 0, total });
+
+        thread::spawn(move || {
+            println!("Precomputing TA for {} ML timeframes in background...", total);
+            let start = Instant::now();
+
+            for (completed, (tf_idx, candles)) in timeframes_to_compute.into_iter().enumerate() {
+                let tf_start = Instant::now();
+                let ta_config = AnalyzerConfig::default();
+                let mut analyzer = Analyzer::with_config(ta_config);
+
+                for candle in &candles {
+                    analyzer.process_candle(*candle);
+                }
+
+                let ranges = analyzer.ranges().to_vec();
+                let levels = analyzer.all_levels().to_vec();
+                let trends = analyzer.all_trends().to_vec();
+
+                println!(
+                    "  Timeframe {}: {} levels, {} trends in {:.2}s",
+                    tf_idx,
+                    levels.len(),
+                    trends.len(),
+                    tf_start.elapsed().as_secs_f32()
+                );
+
+                // Send TA data for this timeframe
+                let _ = sender.send(BackgroundMessage::TaComputed {
+                    timeframe: tf_idx,
+                    ranges,
+                    levels,
+                    trends,
+                });
+
+                // Send progress update
+                let _ = sender.send(BackgroundMessage::MlTaProgress {
+                    completed: completed + 1,
+                    total,
+                });
+            }
+
+            println!(
+                "ML TA precomputation complete in {:.2}s",
+                start.elapsed().as_secs_f32()
+            );
+        });
+    }
+
     pub fn resize(&mut self, width: u32, height: u32) {
         if width > 0 && height > 0 {
             self.config.width = width;
@@ -591,6 +717,10 @@ impl State {
         if self.ta_settings.show_ta {
             self.ensure_ta_computed();
             self.update_ta_buffers();
+            // If in replay mode with ML, precompute TA for all ML timeframes
+            if self.replay.enabled && self.ml_inference.is_some() {
+                self.precompute_ml_ta();
+            }
         }
         self.window.request_redraw();
     }
@@ -599,9 +729,16 @@ impl State {
         let was_enabled = self.replay.enabled;
         self.replay.toggle(self.current_timeframe);
 
-        // Refresh TA buffers with full data when exiting replay mode
-        if was_enabled && !self.replay.enabled && self.ta_settings.show_ta {
-            self.update_ta_buffers();
+        if !was_enabled && self.replay.enabled {
+            // Entering replay mode - precompute TA for all ML timeframes if ML is available
+            if self.ml_inference.is_some() && self.ta_settings.show_ta {
+                self.precompute_ml_ta();
+            }
+        } else if was_enabled && !self.replay.enabled {
+            // Refresh TA buffers with full data when exiting replay mode
+            if self.ta_settings.show_ta {
+                self.update_ta_buffers();
+            }
         }
         self.window.request_redraw();
     }
@@ -666,8 +803,17 @@ impl State {
             return;
         }
 
+        // Get the replay timestamp
+        let replay_ts = match self.replay.timestamp {
+            Some(ts) => ts,
+            None => {
+                self.replay.ta_data = None;
+                return;
+            }
+        };
+
         // Use replay_candles if available (re-aggregated data), otherwise use timeframe candles
-        let candles: Vec<Candle> = if let Some(ref replay_candles) = self.replay.candles {
+        let current_tf_candles: Vec<Candle> = if let Some(ref replay_candles) = self.replay.candles {
             replay_candles.clone()
         } else if let Some(replay_idx) = self.replay.index {
             let tf_candles = &self.timeframes[self.current_timeframe].candles;
@@ -681,7 +827,7 @@ impl State {
             return;
         };
 
-        if candles.is_empty() {
+        if current_tf_candles.is_empty() {
             self.replay.ta_data = Some(TimeframeTaData::with_data(
                 Vec::new(),
                 Vec::new(),
@@ -691,20 +837,299 @@ impl State {
             return;
         }
 
-        let ta_config = AnalyzerConfig::default();
-        let mut analyzer = Analyzer::with_config(ta_config);
+        // Get replay candle index for current timeframe
+        let current_tf_idx = self.current_timeframe;
+        let replay_candle_idx = current_tf_candles.len().saturating_sub(1);
 
-        for candle in &candles {
-            analyzer.process_candle(*candle);
+        // Use precomputed TA if available, filtering to only include elements
+        // that existed at the replay point. Otherwise compute on-the-fly.
+        let mut ta_data = if self.ta_data[current_tf_idx].computed {
+            // Filter precomputed TA data to replay point
+            let ranges: Vec<_> = self.ta_data[current_tf_idx]
+                .ranges
+                .iter()
+                .filter(|r| r.end_index <= replay_candle_idx)
+                .cloned()
+                .collect();
+
+            let levels: Vec<_> = self.ta_data[current_tf_idx]
+                .levels
+                .iter()
+                .filter(|l| {
+                    if l.created_at_index > replay_candle_idx {
+                        return false;
+                    }
+                    if l.state == LevelState::Broken {
+                        if let Some(ref break_event) = l.break_event {
+                            return break_event.candle_index > replay_candle_idx;
+                        }
+                    }
+                    true
+                })
+                .cloned()
+                .collect();
+
+            let trends: Vec<_> = self.ta_data[current_tf_idx]
+                .trends
+                .iter()
+                .filter(|t| {
+                    if t.created_at_index > replay_candle_idx {
+                        return false;
+                    }
+                    if t.state == TrendState::Broken {
+                        if let Some(ref break_event) = t.break_event {
+                            return break_event.candle_index > replay_candle_idx;
+                        }
+                    }
+                    true
+                })
+                .cloned()
+                .collect();
+
+            TimeframeTaData::with_data(ranges, levels, trends)
+        } else {
+            // Fallback: compute TA on-the-fly (slow path)
+            let ta_config = AnalyzerConfig::default();
+            let mut analyzer = Analyzer::with_config(ta_config);
+            for candle in &current_tf_candles {
+                analyzer.process_candle(*candle);
+            }
+            TimeframeTaData::with_data(
+                analyzer.ranges().to_vec(),
+                analyzer.all_levels().to_vec(),
+                analyzer.all_trends().to_vec(),
+            )
+        };
+
+        // Run ML inference if model is available
+        if let Some(ref ml_inference) = self.ml_inference {
+            // Compute multi-timeframe features for ML
+            let prediction = self.compute_ml_prediction(ml_inference, replay_ts, &current_tf_candles);
+            if let Some(pred) = prediction {
+                ta_data.set_prediction(pred);
+            }
         }
 
-        self.replay.ta_data = Some(TimeframeTaData::with_data(
-            analyzer.ranges().to_vec(),
-            analyzer.all_levels().to_vec(),
-            analyzer.all_trends().to_vec(),
-        ));
-
+        self.replay.ta_data = Some(ta_data);
         self.update_ta_buffers();
+    }
+
+    /// Compute ML prediction using multi-timeframe features.
+    ///
+    /// The ML model uses 4 essential timeframes: 5m, 1h, 1d, 1w
+    /// These correspond to indices [2, 4, 8, 9] in Timeframe::all().
+    ///
+    /// OPTIMIZATION: We only need TA from the last ~3 weekly ranges (21 days) to extract
+    /// meaningful features. This avoids computing TA for years of history.
+    fn compute_ml_prediction(
+        &self,
+        ml_inference: &MlInferenceHandle,
+        replay_ts: f64,
+        current_tf_candles: &[Candle],
+    ) -> Option<charter_ta::MlPrediction> {
+        // Minimum candles required per timeframe (same as training)
+        const MIN_CANDLES: usize = 100;
+
+        // Essential timeframe indices: 5m(2), 1h(4), 1d(8), 1w(9)
+        const ML_TIMEFRAME_INDICES: [usize; 4] = [2, 4, 8, 9];
+
+        // Only compute TA for the last 3 weekly ranges (~21 days)
+        // This is sufficient for feature extraction and much faster than full history
+        const LOOKBACK_SECONDS: f64 = 21.0 * 24.0 * 3600.0; // 21 days in seconds
+        let lookback_start_ts = replay_ts - LOOKBACK_SECONDS;
+
+        // Get current candle for global features
+        let current_candle = current_tf_candles.last()?;
+        let current_candle_idx = current_tf_candles.len().saturating_sub(1);
+        let current_price = current_candle.close;
+
+        // Compute features for the 6 essential timeframes (matching training)
+        let ta_config = AnalyzerConfig::default();
+        let mut tf_features: Vec<TimeframeFeatures> = Vec::new();
+
+        for (feature_idx, &tf_idx) in ML_TIMEFRAME_INDICES.iter().enumerate() {
+            if tf_idx >= self.timeframes.len() {
+                continue;
+            }
+            let tf_data = &self.timeframes[tf_idx];
+
+            // Find candles up to replay timestamp for this timeframe
+            let candles = &tf_data.candles;
+            if candles.len() < MIN_CANDLES {
+                continue; // Skip timeframes with too few candles
+            }
+
+            // Binary search to find the last candle at or before replay_ts
+            let end_idx = candles
+                .binary_search_by(|c| c.timestamp.partial_cmp(&replay_ts).unwrap_or(std::cmp::Ordering::Equal))
+                .unwrap_or_else(|i| i.saturating_sub(1));
+
+            if end_idx == 0 {
+                continue; // Not enough history
+            }
+
+            let tf_candle_idx = end_idx.min(candles.len().saturating_sub(1));
+
+            // Use precomputed TA data if available for this timeframe
+            let (levels, trends, feature_candle_idx) = if self.ta_data[tf_idx].computed {
+                // Filter to only include TA elements that existed at this candle index
+                // AND were not broken yet at this point in time
+                let levels: Vec<_> = self.ta_data[tf_idx]
+                    .levels
+                    .iter()
+                    .filter(|l| {
+                        // Level must have been created before or at this candle
+                        if l.created_at_index > tf_candle_idx {
+                            return false;
+                        }
+                        // Check if level was broken at this point in time
+                        // If broken, check when - if break happened after tf_candle_idx, it was still active
+                        if l.state == LevelState::Broken {
+                            if let Some(ref break_event) = l.break_event {
+                                // Level was still active at replay time if break happened later
+                                return break_event.candle_index > tf_candle_idx;
+                            }
+                        }
+                        true // Active or hit level
+                    })
+                    .cloned()
+                    .collect();
+                let trends: Vec<_> = self.ta_data[tf_idx]
+                    .trends
+                    .iter()
+                    .filter(|t| {
+                        // Trend must have been created before or at this candle
+                        if t.created_at_index > tf_candle_idx {
+                            return false;
+                        }
+                        // Check if trend was broken at this point in time
+                        if t.state == TrendState::Broken {
+                            if let Some(ref break_event) = t.break_event {
+                                return break_event.candle_index > tf_candle_idx;
+                            }
+                        }
+                        true
+                    })
+                    .cloned()
+                    .collect();
+                // Use absolute index for precomputed data
+                (levels, trends, tf_candle_idx)
+            } else {
+                // Compute TA only for the last ~3 weeks (not full history)
+                // Find start index for lookback window
+                let start_idx = candles
+                    .binary_search_by(|c| c.timestamp.partial_cmp(&lookback_start_ts).unwrap_or(std::cmp::Ordering::Equal))
+                    .unwrap_or_else(|i| i);
+
+                let mut analyzer = Analyzer::with_config(ta_config.clone());
+                for candle in &candles[start_idx..=tf_candle_idx] {
+                    analyzer.process_candle(*candle);
+                }
+                // Use relative index for on-the-fly computation since analyzer
+                // indices are relative to the window start
+                let relative_idx = tf_candle_idx - start_idx;
+                (analyzer.all_levels().to_vec(), analyzer.all_trends().to_vec(), relative_idx)
+            };
+
+            let features = TimeframeFeatures::extract(
+                feature_idx, // Use sequential index 0-5 for feature extraction
+                &levels,
+                &trends,
+                current_price,
+                feature_candle_idx,
+            );
+            tf_features.push(features);
+        }
+
+        if tf_features.is_empty() {
+            return None; // No valid timeframes
+        }
+
+        // Calculate global candle features
+        let prev_close = if current_candle_idx > 0 {
+            current_tf_candles.get(current_candle_idx - 1).map(|c| c.close).unwrap_or(current_candle.open)
+        } else {
+            current_candle.open
+        };
+        let price_change = if prev_close > 0.0 {
+            (current_candle.close - prev_close) / prev_close
+        } else {
+            0.0
+        };
+
+        let body = (current_candle.close - current_candle.open).abs();
+        let range = current_candle.high - current_candle.low;
+        let body_ratio = if range > f32::EPSILON { body / range } else { 0.5 };
+
+        // Normalize volume using rolling average (approximation)
+        let volume_sum: f32 = current_tf_candles.iter().rev().take(100).map(|c| c.volume).sum();
+        let volume_count = current_tf_candles.len().min(100) as f32;
+        let avg_volume = volume_sum / volume_count.max(1.0);
+        let volume_normalized = if avg_volume > f32::EPSILON {
+            current_candle.volume / avg_volume
+        } else {
+            1.0
+        };
+
+        let ml_features = MlFeatures {
+            timeframes: tf_features,
+            current_price,
+            current_volume_normalized: volume_normalized,
+            price_change_normalized: price_change,
+            body_ratio,
+            is_bullish: if current_candle.close > current_candle.open { 1.0 } else { 0.0 },
+        };
+
+        // Check feature dimension matches model expectation
+        // Model trained with 4 timeframes (5m, 1h, 1d, 1w): 301 features (4 × 74 + 5)
+        let feature_count = ml_features.feature_count();
+        if feature_count != 301 {
+            eprintln!(
+                "ML feature count mismatch: got {} (from {} timeframes), expected 301 (4 timeframes × 74 + 5)",
+                feature_count,
+                ml_features.timeframes.len()
+            );
+            return None;
+        }
+
+        // Debug: print some feature values to verify they change
+        let feature_vec = ml_features.to_vec();
+        let first_5: Vec<f32> = feature_vec.iter().take(5).copied().collect();
+        let last_5: Vec<f32> = feature_vec.iter().rev().take(5).rev().copied().collect();
+        eprintln!(
+            "ML features: first 5 = {:?}, last 5 = {:?}, price = {:.2}",
+            first_5, last_5, current_price
+        );
+
+        // Run inference with timing
+        let inference_start = Instant::now();
+        match ml_inference.predict(&ml_features) {
+            Ok(prediction) => {
+                let inference_time = inference_start.elapsed();
+                eprintln!(
+                    "ML inference: {:.2}ms, direction_up={:.1}%, level_break={:.1}%, conf={:.1}%",
+                    inference_time.as_secs_f64() * 1000.0,
+                    prediction.direction_up_prob * 100.0,
+                    prediction.level_break_prob * 100.0,
+                    prediction.confidence * 100.0
+                );
+                Some(prediction)
+            }
+            Err(e) => {
+                // Log error but don't spam - only log occasionally
+                static LAST_ERROR: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0);
+                let last = LAST_ERROR.load(std::sync::atomic::Ordering::Relaxed);
+                if now > last + 5 {
+                    LAST_ERROR.store(now, std::sync::atomic::Ordering::Relaxed);
+                    eprintln!("ML inference error: {}", e);
+                }
+                None
+            }
+        }
     }
 
     /// Compute TA for current timeframe if not already computed.
@@ -1606,7 +2031,12 @@ impl State {
 
         // Copy data for egui closure (will be updated after)
         let ta_settings = RefCell::new(self.ta_settings.clone());
-        let ta_data = self.ta_data[self.current_timeframe].clone();
+        // Use replay TA data if in replay mode with locked position, otherwise use precomputed TA
+        let ta_data = if self.replay.is_locked() {
+            self.replay.ta_data.clone().unwrap_or_else(|| self.ta_data[self.current_timeframe].clone())
+        } else {
+            self.ta_data[self.current_timeframe].clone()
+        };
         let indicators = &self.indicators;
         let loading_state = self.loading_state.clone();
         let screen_width = self.config.width as f32;

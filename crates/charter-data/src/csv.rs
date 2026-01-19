@@ -26,8 +26,13 @@ impl DataSource for CsvLoader {
     }
 }
 
-/// Parse datetime string "YYYY-MM-DD HH:MM:SS" to unix timestamp.
+/// Parse datetime string "YYYY-MM-DD HH:MM:SS" or Unix timestamp to unix timestamp.
 pub fn parse_datetime(s: &str) -> Option<f64> {
+    // First try parsing as Unix timestamp (e.g., "1325412060.0")
+    if let Ok(ts) = s.parse::<f64>() {
+        return Some(ts);
+    }
+
     // Format: "2017-08-17 04:00:00"
     let parts: Vec<&str> = s.split(&['-', ' ', ':']).collect();
     if parts.len() < 6 {
@@ -62,22 +67,50 @@ pub fn parse_datetime(s: &str) -> Option<f64> {
 }
 
 /// Load candles from CSV file and analyze for missing data.
-/// Expected format: Open time,Open,High,Low,Close,Volume,... (comma-separated)
+/// Supports multiple formats:
+/// - Format 1: Timestamp,Open,High,Low,Close,Volume (BTC style)
+/// - Format 2: Unix Timestamp,Date,Symbol,Open,High,Low,Close,Volume (ETH style)
 pub fn load_candles_from_csv<P: AsRef<Path>>(path: P) -> anyhow::Result<Vec<Candle>> {
     let mut reader = csv::ReaderBuilder::new().delimiter(b',').from_path(path)?;
+
+    // Detect format from headers
+    let headers = reader.headers()?.clone();
+    let headers_lower: Vec<String> = headers.iter().map(|h| h.to_lowercase()).collect();
+
+    // Find column indices
+    let ts_col = headers_lower.iter().position(|h| h.contains("timestamp") || h == "time");
+    let open_col = headers_lower.iter().position(|h| h == "open");
+    let high_col = headers_lower.iter().position(|h| h == "high");
+    let low_col = headers_lower.iter().position(|h| h == "low");
+    let close_col = headers_lower.iter().position(|h| h == "close");
+    let volume_col = headers_lower.iter().position(|h| h == "volume");
+
+    // Default to standard format if not found
+    let ts_col = ts_col.unwrap_or(0);
+    let open_col = open_col.unwrap_or(1);
+    let high_col = high_col.unwrap_or(2);
+    let low_col = low_col.unwrap_or(3);
+    let close_col = close_col.unwrap_or(4);
+    let volume_col = volume_col.unwrap_or(5);
 
     let mut candles = Vec::new();
 
     for result in reader.records() {
         let record = result?;
-        // Column 0 = datetime string, 1=open, 2=high, 3=low, 4=close, 5=volume
-        let datetime_str = record.get(0).unwrap_or("");
-        let timestamp = parse_datetime(datetime_str).unwrap_or(0.0);
-        let open: f32 = record.get(1).unwrap_or("0").parse()?;
-        let high: f32 = record.get(2).unwrap_or("0").parse()?;
-        let low: f32 = record.get(3).unwrap_or("0").parse()?;
-        let close: f32 = record.get(4).unwrap_or("0").parse()?;
-        let volume: f32 = record.get(5).unwrap_or("0").parse()?;
+
+        let datetime_str = record.get(ts_col).unwrap_or("");
+        let mut timestamp = parse_datetime(datetime_str).unwrap_or(0.0);
+
+        // Detect milliseconds (13+ digits) vs seconds (10 digits)
+        if timestamp > 1e12 {
+            timestamp /= 1000.0;
+        }
+
+        let open: f32 = record.get(open_col).unwrap_or("0").parse()?;
+        let high: f32 = record.get(high_col).unwrap_or("0").parse()?;
+        let low: f32 = record.get(low_col).unwrap_or("0").parse()?;
+        let close: f32 = record.get(close_col).unwrap_or("0").parse()?;
+        let volume: f32 = record.get(volume_col).unwrap_or("0").parse()?;
 
         candles.push(Candle::new(timestamp, open, high, low, close, volume));
     }
@@ -86,7 +119,9 @@ pub fn load_candles_from_csv<P: AsRef<Path>>(path: P) -> anyhow::Result<Vec<Cand
     let timestamps: Vec<f64> = candles.iter().map(|c| c.timestamp).collect();
     analyze_data_gaps(&timestamps);
 
-    // Data is already in chronological order (oldest first)
+    // Sort by timestamp to ensure chronological order
+    candles.sort_by(|a, b| a.timestamp.partial_cmp(&b.timestamp).unwrap());
+
     Ok(candles)
 }
 

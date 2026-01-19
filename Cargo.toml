@@ -7,6 +7,7 @@ members = [
     "crates/charter-render",
     "crates/charter-ui",
     "crates/charter-ta",
+    "crates/charter-backtest",
     "crates/charter",
 ]
 

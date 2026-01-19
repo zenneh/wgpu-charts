@@ -1,0 +1,16 @@
+# Charter ML Training Requirements
+
+# Core ML
+numpy>=1.24.0
+pandas>=2.0.0
+scikit-learn>=1.3.0
+
+# PyTorch (optional, for neural network training)
+torch>=2.0.0
+
+# Model export
+onnx>=1.14.0
+onnxruntime>=1.15.0
+
+# Utilities
+joblib>=1.3.0

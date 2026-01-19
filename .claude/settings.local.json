@@ -8,7 +8,21 @@
       "Bash(cargo test:*)",
       "Bash(find:*)",
       "Bash(wc:*)",
-      "Bash(grep:*)"
+      "Bash(grep:*)",
+      "Bash(ls:*)",
+      "Bash(./target/release/charter-ml-export:*)",
+      "Bash(pip3 list:*)",
+      "Bash(nix develop:*)",
+      "Bash(nix-env -qaP:*)",
+      "Bash(nix search:*)",
+      "Bash(timeout 5 cargo run:*)",
+      "Bash(python3:*)",
+      "Bash(timeout 8 cargo run:*)",
+      "Bash(timeout 15 cargo run:*)",
+      "Bash(cargo doc:*)",
+      "Bash(python scripts/ml/train_model.py:*)",
+      "Bash(cargo run:*)",
+      "Bash(python:*)"
     ]
   }
 }

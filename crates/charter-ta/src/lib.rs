@@ -92,6 +92,8 @@
 //!
 
 pub mod analyzer;
+pub mod inference;
+pub mod ml;
 pub mod rules;
 pub mod types;
 
@@ -104,3 +106,12 @@ pub use types::{
 
 // Re-export commonly used rules
 pub use rules::{Rule, RuleContext};
+
+// Re-export ML types
+pub use ml::{
+    LevelFeatures, MlFeatures, MlPrediction, TimeframeFeatures, TrainingDataset, TrainingSample,
+    TrendFeatures, LEVELS_PER_CATEGORY, NUM_TIMEFRAMES,
+};
+
+// Re-export inference types
+pub use inference::{MlInference, MlInferenceHandle, ScalerParams};
