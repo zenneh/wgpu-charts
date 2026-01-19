@@ -553,6 +553,14 @@ impl State {
                     self.loading_state = LoadingState::Idle;
                 }
                 BackgroundMessage::LiveCandleUpdate { candle, is_closed } => {
+                    // Skip live updates while data is being loaded (prevents wrong symbol's data)
+                    if !matches!(self.loading_state, LoadingState::Idle) {
+                        continue;
+                    }
+                    // Skip if we have no candles yet (data not loaded)
+                    if self.timeframes[0].candles.is_empty() {
+                        continue;
+                    }
                     // Update the current 1-minute candle with live data
                     self.update_live_candle(candle, is_closed);
                     updated = true;
@@ -631,6 +639,9 @@ impl State {
             );
             self.timeframes[0] = new_tf_data;
         }
+
+        // Re-populate TA buffers after creating new TimeframeData (buffers were recreated empty)
+        self.update_ta_buffers();
 
         self.window.request_redraw();
     }
