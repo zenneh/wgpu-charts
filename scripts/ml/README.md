@@ -29,9 +29,11 @@ This generates a CSV with:
 - **302 features**: 4 timeframes × 74 features + 6 global features (including RSI-14)
 - **Labels**: direction_up, price_change_pct, level_broke
 
-### Step 2a: Train with Default Hyperparameters
+### Step 2: Choose Your Training Method
 
-Quick training with reasonable defaults:
+#### Option A: Quick Training (Default Hyperparameters)
+
+Fast training with reasonable defaults - good for experimentation:
 
 ```bash
 python scripts/ml/train_model.py training_data.csv charter_model.onnx
@@ -54,47 +56,62 @@ python scripts/ml/train_model.py training_data.csv charter_model.onnx
 - StandardScaler normalization
 - Exports to ONNX for Rust inference
 
-### Step 2b: Hyperparameter Tuning (Recommended)
+#### Option B: Optimized Training (Recommended for Production)
 
-For better performance, use Optuna to find optimal hyperparameters:
+**One-step training with automatic hyperparameter optimization:**
 
 ```bash
 python scripts/ml/tune_hyperparameters.py training_data.csv charter_model.onnx --trials 100
 ```
 
 **What it does:**
-- Runs 100 trials of Bayesian optimization
-- Tests combinations of:
-  - n_estimators: 100-500
-  - max_depth: 3-10
-  - learning_rate: 0.01-0.3 (log scale)
-  - subsample: 0.6-1.0
-  - colsample_bytree: 0.6-1.0
-  - min_child_weight: 1-10
-  - gamma: 0-5
-  - reg_alpha: 0-2
-  - reg_lambda: 0-2
-- Uses MedianPruner to terminate unpromising trials early
-- Saves best hyperparameters to `charter_model.params.json`
+1. **Search Phase** (90% of time): Runs 100 trials of Bayesian optimization to find best hyperparameters
+2. **Training Phase** (10% of time): Automatically trains final model with best parameters
+3. **Export**: Saves trained model + scaler + best hyperparameters
+
+**Search space:**
+- n_estimators: 100-500
+- max_depth: 3-10
+- learning_rate: 0.01-0.3 (log scale)
+- subsample: 0.6-1.0
+- colsample_bytree: 0.6-1.0
+- min_child_weight: 1-10
+- gamma: 0-5
+- reg_alpha: 0-2
+- reg_lambda: 0-2
+
+**Output:**
+- `charter_model.onnx` - Trained model ready to use
+- `charter_model.onnx.scaler.json` - Feature normalization parameters
+- `charter_model.params.json` - Best hyperparameters (for future reuse)
 
 **Typical runtime:** 30-60 minutes for 100 trials
 
-### Step 3: Retrain with Optimal Hyperparameters
+**Note:** No retraining needed! The tuning script outputs a production-ready model.
 
-After tuning, retrain using the best parameters:
+### When to Use `train_model.py --params`
+
+The `--params` flag is useful for specific scenarios:
 
 ```bash
-python scripts/ml/train_model.py training_data.csv charter_model.onnx --params charter_model.params.json
+python scripts/ml/train_model.py new_data.csv model_v2.onnx --params best_params.json
 ```
 
-This trains the final model with optimized hyperparameters for deployment.
+**Use cases:**
+- **Retraining on new data** with proven hyperparameters (e.g., weekly model updates)
+- **Experimenting** with specific hyperparameter combinations without full tuning
+- **CI/CD pipelines** where tuning happens once, then params are versioned and reused
 
 ## Output Files
 
-Training produces:
-- `charter_model.onnx` - ONNX model for cross-platform inference
+Both training scripts produce:
+- `charter_model.onnx` - Trained ONNX model ready for inference
 - `charter_model.onnx.scaler.json` - StandardScaler parameters (mean/scale)
-- `charter_model.params.json` - Best hyperparameters (from tuning only)
+
+Additionally, `tune_hyperparameters.py` creates:
+- `charter_model.params.json` - Best hyperparameters (for future reuse)
+
+**Important:** The `.onnx` file from `tune_hyperparameters.py` is already trained and ready to use - no additional training step required!
 
 ## Model Architecture
 
@@ -157,29 +174,43 @@ Models are evaluated on:
 
 ### Quick Start (Default Params)
 ```bash
-# Export data
+# 1. Export data
 cargo run --bin ml_export -- data/btcusdt_1m.csv training.csv
 
-# Train model
+# 2. Train model with defaults
 python scripts/ml/train_model.py training.csv model.onnx
 
-# Copy to data directory for use in app
+# 3. Deploy
 cp model.onnx data/charter_model.onnx
 cp model.onnx.scaler.json data/charter_model.onnx.scaler.json
 ```
 
-### Production Workflow (Optimized)
+### Production Workflow (Optimized - Recommended)
 ```bash
 # 1. Export data
 cargo run --bin ml_export -- data/btcusdt_1m.csv training.csv --max-candles 300000
 
-# 2. Tune hyperparameters (takes ~1 hour)
-python scripts/ml/tune_hyperparameters.py training.csv tuned_model.onnx --trials 100
+# 2. One-step optimization + training (takes ~1 hour)
+python scripts/ml/tune_hyperparameters.py training.csv model.onnx --trials 100
 
-# 3. Verify results and deploy
-cp tuned_model.onnx data/charter_model.onnx
-cp tuned_model.onnx.scaler.json data/charter_model.onnx.scaler.json
-cp tuned_model.params.json data/charter_model.params.json
+# 3. Deploy (model is already trained!)
+cp model.onnx data/charter_model.onnx
+cp model.onnx.scaler.json data/charter_model.onnx.scaler.json
+cp model.params.json data/charter_model.params.json
+```
+
+### Retraining with Saved Hyperparameters
+```bash
+# Week 1: Initial tuning
+python scripts/ml/tune_hyperparameters.py week1_data.csv model.onnx --trials 100
+# Saves: model.onnx + model.params.json
+
+# Week 2: New data arrives, reuse proven hyperparameters
+cargo run --bin ml_export -- data/btcusdt_1m.csv week2_data.csv
+python scripts/ml/train_model.py week2_data.csv model_v2.onnx --params model.params.json
+
+# Deploy updated model
+cp model_v2.onnx data/charter_model.onnx
 ```
 
 ## Troubleshooting
