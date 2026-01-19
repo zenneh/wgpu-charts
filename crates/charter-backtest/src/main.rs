@@ -25,7 +25,7 @@ use charter_ta::{
 
 /// Minimum confidence threshold to enter a trade (0.0 - 1.0).
 /// Note: Model typically outputs very low confidence (~0.03 avg), so this should be low.
-const MIN_CONFIDENCE: f32 = 0.02;
+const MIN_CONFIDENCE: f32 = 0.020;
 
 /// Risk per trade as fraction of bankroll.
 const RISK_PER_TRADE: f32 = 0.01; // 1% risk per trade
@@ -291,10 +291,17 @@ impl BacktestEngine {
             Direction::Short
         };
 
-        // Calculate margin (collateral) based on risk
+        // Calculate base margin (collateral) based on risk
         // With leverage, we risk more per unit of margin
         // Margin = (Balance * Risk%) / (StopLoss% * Leverage)
-        let margin = (self.balance * RISK_PER_TRADE) / (STOP_LOSS_PCT * leverage);
+        let base_margin = (self.balance * RISK_PER_TRADE) / (STOP_LOSS_PCT * leverage);
+
+        // Scale position size based on confidence
+        // Maps confidence to multiplier: MIN_CONFIDENCE -> 0.5x, 2*MIN_CONFIDENCE -> 1.5x
+        // Formula: 0.5 + (confidence / MIN_CONFIDENCE) * 0.5
+        let confidence_ratio = prediction.confidence / MIN_CONFIDENCE;
+        let confidence_multiplier = (0.5 + confidence_ratio * 0.5).clamp(0.5, 1.5);
+        let margin = base_margin * confidence_multiplier;
         let margin = margin.min(self.balance * 0.5); // Max 50% of balance as margin
 
         // Minimum margin: 0.1% of balance (allows small starting balances)
