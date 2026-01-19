@@ -475,10 +475,19 @@ impl ChartRenderer {
         // Ensure candle width never exceeds spacing to prevent overlap
         let candle_width = desired_width.min(effective_spacing * 0.95);
 
-        // Wick width: use a fraction of candle width, with minimum pixel visibility
-        let base_wick_width = candle_width * 0.15;
-        let min_wick_width = 1.0 * world_units_per_pixel;
-        let wick_width = base_wick_width.max(min_wick_width);
+        // Wick width: proportional to candle, clamped between 1-4 pixels
+        // Also cap at absolute maximum of 10% of candle width to stay visually thin
+        let x_pixel_size = world_units_per_pixel;
+        let min_wick_width = 1.0 * x_pixel_size; // Minimum 1 pixel
+        let max_wick_width = 4.0 * x_pixel_size; // Maximum 4 pixels
+        let proportional_wick = candle_width * 0.1; // 10% of candle width
+        let wick_width = proportional_wick.clamp(min_wick_width, max_wick_width);
+
+        // Minimum body height for doji candles - use Y-axis pixel size (price units per pixel)
+        // to ensure at least 2 pixels visibility on screen
+        let visible_height = y_max - y_min;
+        let y_pixel_size = visible_height / chart_height;
+        let min_body_height = 2.0 * y_pixel_size;
 
         // Pass view bounds and price normalization to shader
         let render_params = RenderParams {
@@ -492,8 +501,8 @@ impl ChartRenderer {
             y_max,
             price_min: timeframe.price_normalization.price_min,
             price_range: timeframe.price_normalization.price_range,
-            _padding1: 0.0,
-            _padding2: 0.0,
+            min_body_height,
+            _padding: 0.0,
         };
 
         queue.write_buffer(

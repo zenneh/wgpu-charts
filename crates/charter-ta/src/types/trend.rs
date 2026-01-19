@@ -1,5 +1,7 @@
 //! Trend types - trendlines derived from consecutive ranges with interaction tracking.
 
+use rayon::prelude::*;
+
 use super::direction::CandleDirection;
 use super::range::Range;
 use charter_core::Candle;
@@ -436,38 +438,35 @@ impl TrendTracker {
     /// Check all active trends for interactions with a candle.
     ///
     /// Returns a list of events that occurred.
+    /// Uses parallel processing for improved performance with many trends.
     pub fn check_interactions(&mut self, candle_index: usize, candle: &Candle) -> Vec<TrendEvent> {
-        let mut events = Vec::new();
+        // Parallel phase: check all trends concurrently
+        // Each trend check is independent, making this embarrassingly parallel
+        self.trends
+            .par_iter_mut()
+            .filter_map(|trend| {
+                // Skip if trend was created on or after this candle (not yet active)
+                if trend.created_at_index >= candle_index {
+                    return None;
+                }
+                // Skip already broken trends
+                if trend.state == TrendState::Broken {
+                    return None;
+                }
 
-        for trend in &mut self.trends {
-            // Skip if trend was created on or after this candle (not yet active)
-            if trend.created_at_index >= candle_index {
-                continue;
-            }
-
-            // Skip already broken trends
-            if trend.state == TrendState::Broken {
-                continue;
-            }
-
-            match trend.check_interaction(candle_index, candle) {
-                TrendInteraction::Hit(hit) => {
-                    events.push(TrendEvent::Hit {
+                match trend.check_interaction(candle_index, candle) {
+                    TrendInteraction::Hit(hit) => Some(TrendEvent::Hit {
                         trend_id: trend.id,
                         hit,
-                    });
-                }
-                TrendInteraction::Broken => {
-                    events.push(TrendEvent::Broken {
+                    }),
+                    TrendInteraction::Broken => Some(TrendEvent::Broken {
                         trend_id: trend.id,
                         break_event: trend.break_event.unwrap(),
-                    });
+                    }),
+                    TrendInteraction::None => None,
                 }
-                TrendInteraction::None => {}
-            }
-        }
-
-        events
+            })
+            .collect()
     }
 
     /// Get all active (non-broken) trends.

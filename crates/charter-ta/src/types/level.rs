@@ -1,6 +1,8 @@
 //! Level types - price levels derived from ranges with interaction tracking.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+
+use rayon::prelude::*;
 
 use super::direction::CandleDirection;
 use super::range::{Range, RangeId};
@@ -624,54 +626,61 @@ impl OptimizedLevelTracker {
         let high_bucket = self.bucket_key(candle.high).0;
 
         // Collect level indices to check (avoid borrowing issues)
-        let mut levels_to_check = Vec::new();
+        // Using HashSet for O(1) duplicate detection instead of O(N) Vec::contains
+        let mut levels_to_check = HashSet::new();
         for bucket_idx in low_bucket..=high_bucket {
             if let Some(level_indices) = self.price_buckets.get(&BucketKey(bucket_idx)) {
                 for &level_idx in level_indices {
-                    // Avoid duplicates (a level might span multiple buckets conceptually)
-                    if !levels_to_check.contains(&level_idx) {
-                        levels_to_check.push(level_idx);
-                    }
+                    levels_to_check.insert(level_idx);
                 }
             }
         }
 
-        // Track levels to unregister (broken levels)
+        let timeframe = self.timeframe;
+
+        // Parallel phase: check all relevant levels concurrently
+        // Each level check is independent, making this embarrassingly parallel
+        let results: Vec<(usize, LevelId, f32, LevelInteraction)> = self
+            .levels
+            .par_iter_mut()
+            .enumerate()
+            .filter(|(idx, _)| levels_to_check.contains(idx))
+            .filter_map(|(idx, level)| {
+                // Skip if level was created on or after this candle (not yet active)
+                if level.created_at_index >= candle_index {
+                    return None;
+                }
+                // Skip already broken levels
+                if level.state == LevelState::Broken {
+                    return None;
+                }
+                let interaction = level.check_interaction(candle_index, candle, timeframe);
+                if matches!(interaction, LevelInteraction::None) {
+                    None
+                } else {
+                    Some((idx, level.id, level.price, interaction))
+                }
+            })
+            .collect();
+
+        // Sequential phase: collect events and track broken levels
         let mut broken_levels = Vec::new();
-
-        // Check each level
-        for level_idx in levels_to_check {
-            let level = &mut self.levels[level_idx];
-
-            // Skip if level was created on or after this candle (not yet active)
-            if level.created_at_index >= candle_index {
-                continue;
-            }
-
-            // Skip already broken levels
-            if level.state == LevelState::Broken {
-                continue;
-            }
-
-            match level.check_interaction(candle_index, candle, self.timeframe) {
+        for (idx, level_id, price, interaction) in results {
+            match interaction {
                 LevelInteraction::Activated => {
-                    events.push(LevelEvent::Activated {
-                        level_id: level.id,
-                    });
+                    events.push(LevelEvent::Activated { level_id });
                 }
                 LevelInteraction::Hit(hit) => {
-                    events.push(LevelEvent::Hit {
-                        level_id: level.id,
-                        hit,
-                    });
+                    events.push(LevelEvent::Hit { level_id, hit });
                 }
                 LevelInteraction::Broken => {
+                    // Need to get break_event from the level
+                    let break_event = self.levels[idx].break_event.unwrap();
                     events.push(LevelEvent::Broken {
-                        level_id: level.id,
-                        break_event: level.break_event.unwrap(),
+                        level_id,
+                        break_event,
                     });
-                    // Mark for removal from bucket
-                    broken_levels.push((level_idx, level.price));
+                    broken_levels.push((idx, price));
                 }
                 LevelInteraction::None => {}
             }

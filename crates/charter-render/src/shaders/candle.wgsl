@@ -35,8 +35,9 @@ struct RenderParams {
     // Price denormalization: price = price_min + normalized * price_range
     price_min: f32,
     price_range: f32,
-    _padding1: f32,
-    _padding2: f32,
+    // Minimum body height for doji candles
+    min_body_height: f32,
+    _padding: f32,
 };
 
 @group(1) @binding(1)
@@ -89,39 +90,36 @@ fn vs_main(
     // Calculate candle properties
     let x_center = f32(candle_index) * params.candle_spacing;
 
-    // GPU-side culling: check if candle is outside visible range
-    // If so, output degenerate triangle (all vertices at same point)
-    let half_width = params.candle_width / 2.0;
-    let x_left = x_center - half_width;
-    let x_right = x_center + half_width;
-
-    // Cull if completely outside X range or Y range
-    let outside_x = x_right < params.x_min || x_left > params.x_max;
+    // GPU-side culling: Y-axis only (CPU already limits X range via instance count)
+    // If completely outside Y range, output degenerate triangle
     let outside_y = high < params.y_min || low > params.y_max;
 
-    if outside_x || outside_y {
+    if outside_y {
         out.clip_position = vec4<f32>(0.0, 0.0, 0.0, 1.0);
         out.color = vec3<f32>(0.0, 0.0, 0.0);
         return out;
     }
+
+    let half_width = params.candle_width / 2.0;
     let is_bullish = close >= open;
 
     // Ensure minimum body height for doji candles (open == close)
+    // Use a small minimum (~1 pixel) to keep body visible without covering wicks
     let raw_body_top = max(open, close);
     let raw_body_bottom = min(open, close);
-    let min_body_height = params.wick_width; // Use wick_width as minimum (it's already adaptive)
     let body_center = (raw_body_top + raw_body_bottom) / 2.0;
-    let body_height = max(raw_body_top - raw_body_bottom, min_body_height);
+    let body_height = max(raw_body_top - raw_body_bottom, params.min_body_height);
     let body_top = body_center + body_height / 2.0;
     let body_bottom = body_center - body_height / 2.0;
 
     // Wick width: adaptive, passed from CPU to ensure minimum pixel visibility
     let wick_half = params.wick_width / 2.0;
 
-    // Determine which part of the candle we're drawing
-    // 0-5: body, 6-11: upper wick, 12-17: lower wick
-    let part = vertex_index / 6u;
-    let local_vertex = vertex_index % 6u;
+    // Indexed drawing: 12 unique vertices (4 per quad), index buffer forms triangles
+    // Part: 0=body (vertices 0-3), 1=upper wick (4-7), 2=lower wick (8-11)
+    // Local vertex: 0=bottom-left, 1=bottom-right, 2=top-right, 3=top-left
+    let part = vertex_index / 4u;
+    let local_vertex = vertex_index % 4u;
 
     // Same color for body and wicks
     let color = select(BEARISH_COLOR, BULLISH_COLOR, is_bullish);
@@ -129,46 +127,36 @@ fn vs_main(
     var pos: vec2<f32>;
 
     if part == 0u {
-        // Body - two triangles forming a quad
-        // Triangle 1: 0, 1, 2 (bottom-left, bottom-right, top-right)
-        // Triangle 2: 3, 4, 5 (bottom-left, top-right, top-left)
+        // Body quad corners
         switch local_vertex {
             case 0u: { pos = vec2<f32>(x_center - half_width, body_bottom); }
             case 1u: { pos = vec2<f32>(x_center + half_width, body_bottom); }
             case 2u: { pos = vec2<f32>(x_center + half_width, body_top); }
-            case 3u: { pos = vec2<f32>(x_center - half_width, body_bottom); }
-            case 4u: { pos = vec2<f32>(x_center + half_width, body_top); }
-            case 5u: { pos = vec2<f32>(x_center - half_width, body_top); }
+            case 3u: { pos = vec2<f32>(x_center - half_width, body_top); }
             default: { pos = vec2<f32>(0.0, 0.0); }
         }
     } else if part == 1u {
-        // Upper wick (from raw body top to high) - use raw values to avoid overlap with expanded body
+        // Upper wick quad corners (from raw body top to high)
         let wick_top = high;
         let wick_bottom = raw_body_top;
-        // Only draw if there's actual wick height
         let upper_wick_top = select(wick_bottom, wick_top, wick_top > wick_bottom);
         switch local_vertex {
             case 0u: { pos = vec2<f32>(x_center - wick_half, wick_bottom); }
             case 1u: { pos = vec2<f32>(x_center + wick_half, wick_bottom); }
             case 2u: { pos = vec2<f32>(x_center + wick_half, upper_wick_top); }
-            case 3u: { pos = vec2<f32>(x_center - wick_half, wick_bottom); }
-            case 4u: { pos = vec2<f32>(x_center + wick_half, upper_wick_top); }
-            case 5u: { pos = vec2<f32>(x_center - wick_half, upper_wick_top); }
+            case 3u: { pos = vec2<f32>(x_center - wick_half, upper_wick_top); }
             default: { pos = vec2<f32>(0.0, 0.0); }
         }
     } else {
-        // Lower wick (from low to raw body bottom) - use raw values
+        // Lower wick quad corners (from low to raw body bottom)
         let wick_top = raw_body_bottom;
         let wick_bottom = low;
-        // Only draw if there's actual wick height
         let lower_wick_bottom = select(wick_top, wick_bottom, wick_bottom < wick_top);
         switch local_vertex {
             case 0u: { pos = vec2<f32>(x_center - wick_half, lower_wick_bottom); }
             case 1u: { pos = vec2<f32>(x_center + wick_half, lower_wick_bottom); }
             case 2u: { pos = vec2<f32>(x_center + wick_half, wick_top); }
-            case 3u: { pos = vec2<f32>(x_center - wick_half, lower_wick_bottom); }
-            case 4u: { pos = vec2<f32>(x_center + wick_half, wick_top); }
-            case 5u: { pos = vec2<f32>(x_center - wick_half, wick_top); }
+            case 3u: { pos = vec2<f32>(x_center - wick_half, wick_top); }
             default: { pos = vec2<f32>(0.0, 0.0); }
         }
     }

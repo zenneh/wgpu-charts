@@ -169,8 +169,9 @@ pub struct RenderParams {
     /// Price denormalization: price = price_min + normalized * price_range
     pub price_min: f32,
     pub price_range: f32,
-    pub _padding1: f32,
-    pub _padding2: f32,
+    /// Minimum body height for doji candles (should be small, ~1 pixel).
+    pub min_body_height: f32,
+    pub _padding: f32,
 }
 
 /// Guideline GPU struct (16 bytes aligned).

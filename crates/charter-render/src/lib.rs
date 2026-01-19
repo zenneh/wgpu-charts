@@ -23,7 +23,8 @@ pub use renderer::{ChartRenderer, LodData, TimeframeData};
 /// Constants for candle rendering.
 pub const BASE_CANDLE_WIDTH: f32 = 0.8;
 pub const CANDLE_SPACING: f32 = 1.2;
-pub const VERTICES_PER_CANDLE: u32 = 18; // 6 triangles * 3 vertices
+pub const VERTICES_PER_CANDLE: u32 = 12; // 4 vertices per quad * 3 quads (indexed drawing)
+pub const INDICES_PER_CANDLE: u32 = 18; // 6 indices per quad * 3 quads
 pub const MIN_CANDLE_PIXELS: f32 = 3.0; // Minimum candle width in pixels
 
 /// Layout constants.

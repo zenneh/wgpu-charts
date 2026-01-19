@@ -23,8 +23,8 @@ use charter_data::DataSource;
 use charter_indicators::{Indicator, Macd, MacdConfig};
 use charter_render::{
     ChartRenderer, IndicatorParams, IndicatorPointGpu, LevelGpu, RangeGpu, RenderParams,
-    TaRenderParams, TimeframeData, TrendGpu, VolumeRenderParams, CANDLE_SPACING, MAX_TA_LEVELS,
-    MAX_TA_RANGES, MAX_TA_TRENDS, STATS_PANEL_WIDTH, VERTICES_PER_CANDLE, VOLUME_HEIGHT_RATIO,
+    TaRenderParams, TimeframeData, TrendGpu, VolumeRenderParams, CANDLE_SPACING, INDICES_PER_CANDLE,
+    MAX_TA_LEVELS, MAX_TA_RANGES, MAX_TA_TRENDS, STATS_PANEL_WIDTH, VOLUME_HEIGHT_RATIO,
 };
 use charter_ta::{
     Analyzer, AnalyzerConfig, CandleDirection, Level, LevelState, LevelType, Range, Trend,
@@ -495,9 +495,9 @@ impl State {
                 self.timeframes[index] = tf_data;
             }
 
-            // All done - set idle and update view
+            // All done - set idle and fit view to show data
             self.loading_state = LoadingState::Idle;
-            self.update_visible_range();
+            self.fit_view(); // Properly position camera after data is loaded
             updated = true;
         }
 
@@ -1382,6 +1382,13 @@ impl State {
 
         self.current_timeframe = index;
         self.renderer.update_camera(&self.queue);
+
+        // If in replay mode with a locked position, recompute replay data for new timeframe
+        if self.replay.enabled && self.replay.is_locked() {
+            self.recompute_replay_candles();
+            self.recompute_replay_ta();
+        }
+
         // Compute TA first (if enabled) before update_visible_range calls update_ta_buffers
         if self.ta_settings.show_ta {
             self.ensure_ta_computed();
@@ -1894,9 +1901,15 @@ impl State {
                 let (y_min, y_max) = self.renderer.camera.visible_y_range(aspect);
 
                 // Use fixed base values for replay - no LOD adjustment needed
-                // BASE_CANDLE_WIDTH = 0.8, which is less than CANDLE_SPACING = 1.2
-                let candle_width = 0.8;
-                let wick_width = candle_width * 0.15;
+                let visible_width = x_max - x_min;
+                let x_pixel_size = visible_width / chart_width;
+                let min_candle_width = 3.0 * x_pixel_size; // At least 3 pixels
+                let candle_width = 0.8_f32.max(min_candle_width).min(CANDLE_SPACING * 0.95);
+                let wick_width = (candle_width * 0.1).clamp(1.0 * x_pixel_size, 4.0 * x_pixel_size);
+                // Use Y-axis pixel size for body height (price units per pixel)
+                let visible_height = y_max - y_min;
+                let y_pixel_size = visible_height / chart_height;
+                let min_body_height = 2.0 * y_pixel_size;
 
                 let render_params = RenderParams {
                     first_visible: 0, // Replay candles start at index 0
@@ -1909,8 +1922,8 @@ impl State {
                     y_max,
                     price_min: rtf.price_normalization.price_min,
                     price_range: rtf.price_normalization.price_range,
-                    _padding1: 0.0,
-                    _padding2: 0.0,
+                    min_body_height,
+                    _padding: 0.0,
                 };
                 self.queue.write_buffer(
                     &self.renderer.render_params_buffer,
@@ -2005,7 +2018,11 @@ impl State {
                 &tf.candle_bind_group
             };
             render_pass.set_bind_group(1, candle_bind_group, &[]);
-            render_pass.draw(0..VERTICES_PER_CANDLE, 0..effective_visible_count);
+            render_pass.set_index_buffer(
+                self.renderer.candle_pipeline.index_buffer.slice(..),
+                wgpu::IndexFormat::Uint16,
+            );
+            render_pass.draw_indexed(0..INDICES_PER_CANDLE, 0, 0..effective_visible_count);
 
             // Render TA (ranges and levels) if enabled
             if self.ta_settings.show_ta {

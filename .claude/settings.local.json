@@ -5,7 +5,10 @@
       "Bash(cargo build:*)",
       "Bash(cargo clippy:*)",
       "Bash(md5:*)",
-      "Bash(cargo test:*)"
+      "Bash(cargo test:*)",
+      "Bash(find:*)",
+      "Bash(wc:*)",
+      "Bash(grep:*)"
     ]
   }
 }

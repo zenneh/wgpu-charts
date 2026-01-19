@@ -6,5 +6,6 @@ description = "Rule-based technical analysis for charter"
 
 [dependencies]
 charter-core.workspace = true
+rayon = "1.10"
 
 [dev-dependencies]
