@@ -914,6 +914,60 @@ impl State {
         self.update_ta_buffers();
     }
 
+    /// Helper function to calculate RSI for a specific candle index.
+    fn calculate_rsi_for_candles(candles: &[Candle], current_idx: usize, period: usize) -> f32 {
+        if current_idx < period + 1 || candles.is_empty() {
+            return 0.5; // Neutral if not enough data
+        }
+
+        let start_idx = current_idx.saturating_sub(100.min(current_idx)); // Look back max 100 candles
+        let lookback_candles = &candles[start_idx..=current_idx];
+
+        if lookback_candles.len() < period + 1 {
+            return 0.5;
+        }
+
+        let mut gains = Vec::new();
+        let mut losses = Vec::new();
+
+        // Calculate price changes
+        for i in 1..lookback_candles.len() {
+            let change = lookback_candles[i].close - lookback_candles[i - 1].close;
+            if change > 0.0 {
+                gains.push(change);
+                losses.push(0.0);
+            } else {
+                gains.push(0.0);
+                losses.push(-change);
+            }
+        }
+
+        if gains.len() < period {
+            return 0.5;
+        }
+
+        // Calculate average gain and loss using Wilder's smoothing
+        let mut avg_gain: f32 = gains.iter().take(period).sum::<f32>() / period as f32;
+        let mut avg_loss: f32 = losses.iter().take(period).sum::<f32>() / period as f32;
+
+        // Apply smoothing for remaining values
+        for i in period..gains.len() {
+            avg_gain = (avg_gain * (period - 1) as f32 + gains[i]) / period as f32;
+            avg_loss = (avg_loss * (period - 1) as f32 + losses[i]) / period as f32;
+        }
+
+        // Calculate RSI
+        if avg_loss == 0.0 {
+            return 1.0; // Maximum RSI (100) normalized to 1.0
+        }
+
+        let rs = avg_gain / avg_loss;
+        let rsi = 100.0 - (100.0 / (1.0 + rs));
+
+        // Normalize to 0-1 range
+        rsi / 100.0
+    }
+
     /// Compute ML prediction using multi-timeframe features.
     ///
     /// The ML model uses 4 essential timeframes: 5m, 1h, 1d, 1w
@@ -1071,6 +1125,9 @@ impl State {
             1.0
         };
 
+        // Calculate RSI (14-period)
+        let rsi_14 = Self::calculate_rsi_for_candles(current_tf_candles, current_candle_idx, 14);
+
         let ml_features = MlFeatures {
             timeframes: tf_features,
             current_price,
@@ -1078,14 +1135,15 @@ impl State {
             price_change_normalized: price_change,
             body_ratio,
             is_bullish: if current_candle.close > current_candle.open { 1.0 } else { 0.0 },
+            rsi_14,
         };
 
         // Check feature dimension matches model expectation
-        // Model trained with 4 timeframes (5m, 1h, 1d, 1w): 301 features (4 × 74 + 5)
+        // Model trained with 4 timeframes (5m, 1h, 1d, 1w): 302 features (4 × 74 + 6 with RSI)
         let feature_count = ml_features.feature_count();
-        if feature_count != 301 {
+        if feature_count != 302 {
             eprintln!(
-                "ML feature count mismatch: got {} (from {} timeframes), expected 301 (4 timeframes × 74 + 5)",
+                "ML feature count mismatch: got {} (from {} timeframes), expected 302 (4 timeframes × 74 + 6 with RSI)",
                 feature_count,
                 ml_features.timeframes.len()
             );

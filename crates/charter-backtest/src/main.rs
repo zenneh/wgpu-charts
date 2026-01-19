@@ -602,6 +602,61 @@ fn main() -> Result<()> {
     Ok(())
 }
 
+/// Calculate RSI (Relative Strength Index) for a given candle index.
+/// Returns value normalized to 0-1 range (typical RSI is 0-100, so we divide by 100).
+fn calculate_rsi(candles: &[Candle], current_idx: usize, period: usize) -> f32 {
+    if current_idx < period + 1 || candles.is_empty() {
+        return 0.5; // Neutral if not enough data
+    }
+
+    let start_idx = current_idx.saturating_sub(100.min(current_idx)); // Look back max 100 candles
+    let lookback_candles = &candles[start_idx..=current_idx];
+
+    if lookback_candles.len() < period + 1 {
+        return 0.5;
+    }
+
+    let mut gains = Vec::new();
+    let mut losses = Vec::new();
+
+    // Calculate price changes
+    for i in 1..lookback_candles.len() {
+        let change = lookback_candles[i].close - lookback_candles[i - 1].close;
+        if change > 0.0 {
+            gains.push(change);
+            losses.push(0.0);
+        } else {
+            gains.push(0.0);
+            losses.push(-change);
+        }
+    }
+
+    if gains.len() < period {
+        return 0.5;
+    }
+
+    // Calculate average gain and loss using Wilder's smoothing method
+    let mut avg_gain: f32 = gains.iter().take(period).sum::<f32>() / period as f32;
+    let mut avg_loss: f32 = losses.iter().take(period).sum::<f32>() / period as f32;
+
+    // Apply smoothing for remaining values
+    for i in period..gains.len() {
+        avg_gain = (avg_gain * (period - 1) as f32 + gains[i]) / period as f32;
+        avg_loss = (avg_loss * (period - 1) as f32 + losses[i]) / period as f32;
+    }
+
+    // Calculate RSI
+    if avg_loss == 0.0 {
+        return 1.0; // Maximum RSI (100) normalized to 1.0
+    }
+
+    let rs = avg_gain / avg_loss;
+    let rsi = 100.0 - (100.0 / (1.0 + rs));
+
+    // Normalize to 0-1 range
+    rsi / 100.0
+}
+
 /// Extract ML features for a candle.
 fn extract_features(
     candle: &Candle,
@@ -652,7 +707,7 @@ fn extract_features(
         tf_features.push(features);
     }
 
-    // Need all 4 timeframes for the model (301 features = 4 × 74 + 5)
+    // Need all 4 timeframes for the model (302 features = 4 × 74 + 6 with RSI)
     if tf_features.len() != 4 {
         return None;
     }
@@ -689,6 +744,9 @@ fn extract_features(
         1.0
     };
 
+    // Calculate RSI (14-period)
+    let rsi_14 = calculate_rsi(primary_candles, candle_idx, 14);
+
     Some(MlFeatures {
         timeframes: tf_features,
         current_price,
@@ -696,6 +754,7 @@ fn extract_features(
         price_change_normalized: price_change,
         body_ratio,
         is_bullish: if candle.close > candle.open { 1.0 } else { 0.0 },
+        rsi_14,
     })
 }
 

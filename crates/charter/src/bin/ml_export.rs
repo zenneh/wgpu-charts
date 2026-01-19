@@ -34,6 +34,54 @@ const MIN_CANDLES: usize = 100;
 /// Skip early candles to let TA patterns form.
 const WARMUP_CANDLES: usize = 500;
 
+/// Calculate RSI (Relative Strength Index) for a given period.
+/// Returns value normalized to 0-1 range (typical RSI is 0-100, so we divide by 100).
+fn calculate_rsi(candles: &[Candle], period: usize) -> f32 {
+    if candles.len() < period + 1 {
+        return 0.5; // Neutral if not enough data
+    }
+
+    let mut gains = Vec::new();
+    let mut losses = Vec::new();
+
+    // Calculate price changes
+    for i in 1..candles.len() {
+        let change = candles[i].close - candles[i - 1].close;
+        if change > 0.0 {
+            gains.push(change);
+            losses.push(0.0);
+        } else {
+            gains.push(0.0);
+            losses.push(-change);
+        }
+    }
+
+    if gains.len() < period {
+        return 0.5;
+    }
+
+    // Calculate average gain and loss using Wilder's smoothing method
+    let mut avg_gain: f32 = gains.iter().take(period).sum::<f32>() / period as f32;
+    let mut avg_loss: f32 = losses.iter().take(period).sum::<f32>() / period as f32;
+
+    // Apply smoothing for remaining values
+    for i in period..gains.len() {
+        avg_gain = (avg_gain * (period - 1) as f32 + gains[i]) / period as f32;
+        avg_loss = (avg_loss * (period - 1) as f32 + losses[i]) / period as f32;
+    }
+
+    // Calculate RSI
+    if avg_loss == 0.0 {
+        return 1.0; // Maximum RSI (100) normalized to 1.0
+    }
+
+    let rs = avg_gain / avg_loss;
+    let rsi = 100.0 - (100.0 / (1.0 + rs));
+
+    // Normalize to 0-1 range
+    rsi / 100.0
+}
+
 /// Timeframes for ML training (4 total: 5m, 1h, 1d, 1w).
 fn ml_timeframes() -> Vec<Timeframe> {
     vec![
@@ -323,6 +371,14 @@ fn main() -> Result<()> {
             1.0
         };
 
+        // Calculate RSI (14-period) on the candles up to current index
+        let rsi_lookback = 100.min(sample_idx); // Use last 100 candles for RSI calculation
+        let rsi_14 = if sample_idx > 14 {
+            calculate_rsi(&primary_candles[sample_idx.saturating_sub(rsi_lookback)..=sample_idx], 14)
+        } else {
+            0.5 // Neutral if not enough history
+        };
+
         let ml_features = MlFeatures {
             timeframes: tf_features,
             current_price: current_candle.close,
@@ -334,6 +390,7 @@ fn main() -> Result<()> {
             } else {
                 0.0
             },
+            rsi_14,
         };
 
         // Create sample with labels
@@ -404,7 +461,7 @@ fn main() -> Result<()> {
     println!("╚══════════════════════════════════════════════════════════════╝");
     println!("   • Total samples: {}", samples_created);
     println!(
-        "   • Feature dimensions: {} (4 timeframes × 74 features + 5 global)",
+        "   • Feature dimensions: {} (4 timeframes × 74 features + 6 global with RSI)",
         dataset.feature_dim
     );
 

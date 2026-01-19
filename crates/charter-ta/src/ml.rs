@@ -322,14 +322,16 @@ pub struct MlFeatures {
     pub body_ratio: f32,
     /// Whether current candle is bullish (1.0) or bearish (0.0).
     pub is_bullish: f32,
+    /// RSI (14-period) normalized to 0-1 range.
+    pub rsi_14: f32,
 }
 
 impl MlFeatures {
     /// Get total feature count.
     pub fn feature_count(&self) -> usize {
         // Per timeframe: 60 (levels) + 12 (trends) + 2 (counts) = 74
-        // Global: 5
-        self.timeframes.len() * 74 + 5
+        // Global: 6 (added RSI)
+        self.timeframes.len() * 74 + 6
     }
 
     /// Convert to flat feature vector for model input.
@@ -342,6 +344,7 @@ impl MlFeatures {
         v.push(self.body_ratio);
         v.push(self.is_bullish);
         v.push(self.timeframes.len() as f32); // Number of timeframes
+        v.push(self.rsi_14); // RSI feature
 
         // Then per-timeframe features
         for tf in &self.timeframes {
@@ -461,8 +464,8 @@ pub struct TrainingDataset {
 impl TrainingDataset {
     /// Create a new dataset.
     pub fn new(num_timeframes: usize, lookahead_candles: usize) -> Self {
-        // Per timeframe: 74 features, plus 5 global
-        let feature_dim = num_timeframes * 74 + 5;
+        // Per timeframe: 74 features, plus 6 global (added RSI)
+        let feature_dim = num_timeframes * 74 + 6;
         Self {
             samples: Vec::new(),
             feature_dim,
@@ -542,10 +545,11 @@ mod tests {
             price_change_normalized: 0.01,
             body_ratio: 0.6,
             is_bullish: 1.0,
+            rsi_14: 0.5,
         };
 
         let vec = features.to_vec();
-        // 5 global + 3 × 74 = 5 + 222 = 227
-        assert_eq!(vec.len(), 227);
+        // 6 global + 3 × 74 = 6 + 222 = 228
+        assert_eq!(vec.len(), 228);
     }
 }

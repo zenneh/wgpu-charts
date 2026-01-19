@@ -1,15 +1,15 @@
 #!/usr/bin/env python3
 """
-Charter ML Model Training Script (XGBoost)
+Charter ML Hyperparameter Tuning Script (using Optuna)
 
-Trains an XGBoost classifier for price direction prediction (up/down).
-Exports the trained model to ONNX format for Rust inference.
+Automatically searches for optimal XGBoost hyperparameters using Bayesian optimization.
+Uses chronological (walk-forward) validation to prevent look-ahead bias.
 
 Usage:
-    python train_model.py <training_data.csv> <output_model.onnx>
+    python tune_hyperparameters.py <training_data.csv> <output_model.onnx> [--trials N]
 
 Example:
-    python train_model.py training_data.csv charter_model.onnx
+    python tune_hyperparameters.py training_data.csv charter_model.onnx --trials 100
 """
 
 import argparse
@@ -38,8 +38,17 @@ except ImportError:
     print("Warning: sklearn not available. Install with: pip install scikit-learn")
 
 try:
+    import optuna
+    from optuna.pruners import MedianPruner
+    from optuna.samplers import TPESampler
+    OPTUNA_AVAILABLE = True
+except ImportError:
+    OPTUNA_AVAILABLE = False
+    print("Warning: Optuna not available. Install with: pip install optuna")
+
+try:
     import onnx
-    from onnx import helper, TensorProto, numpy_helper
+    from onnx import helper, TensorProto
     ONNX_AVAILABLE = True
 except ImportError:
     ONNX_AVAILABLE = False
@@ -68,49 +77,83 @@ def load_data(path: str) -> tuple[np.ndarray, np.ndarray]:
     print(f"   Features shape: {X.shape}")
     print(f"   Labels shape: {y.shape}")
 
-    # Handle NaN/Inf
-    X = np.nan_to_num(X, nan=0.0, posinf=0.0, neginf=0.0)
+    # Handle NaN/Inf - use median imputation instead of zeros
+    from sklearn.impute import SimpleImputer
+    imputer = SimpleImputer(strategy='median')
+    X = imputer.fit_transform(X)
 
     return X, y
 
 
-def train_xgboost(X_train, y_train, X_val, y_val, custom_params=None) -> tuple:
-    """Train XGBoost classifier."""
-    print("\n🚀 Training XGBoost model...")
+def objective(trial: optuna.Trial, X_train, y_train, X_val, y_val) -> float:
+    """Optuna objective function to maximize validation AUC."""
+
+    # Suggest hyperparameters
+    params = {
+        'n_estimators': trial.suggest_int('n_estimators', 100, 500),
+        'max_depth': trial.suggest_int('max_depth', 3, 10),
+        'learning_rate': trial.suggest_float('learning_rate', 0.01, 0.3, log=True),
+        'subsample': trial.suggest_float('subsample', 0.6, 1.0),
+        'colsample_bytree': trial.suggest_float('colsample_bytree', 0.6, 1.0),
+        'min_child_weight': trial.suggest_int('min_child_weight', 1, 10),
+        'gamma': trial.suggest_float('gamma', 0, 5),
+        'reg_alpha': trial.suggest_float('reg_alpha', 0, 2),
+        'reg_lambda': trial.suggest_float('reg_lambda', 0, 2),
+        'objective': 'binary:logistic',
+        'eval_metric': 'auc',
+        'use_label_encoder': False,
+        'random_state': 42,
+        'n_jobs': -1,
+        'verbosity': 0,
+    }
 
     # Standardize features
     scaler = StandardScaler()
     X_train_scaled = scaler.fit_transform(X_train)
     X_val_scaled = scaler.transform(X_val)
 
-    # Default XGBoost parameters optimized for binary classification
-    default_params = {
-        'n_estimators': 200,
-        'max_depth': 6,
-        'learning_rate': 0.1,
-        'subsample': 0.8,
-        'colsample_bytree': 0.8,
-        'min_child_weight': 1,
-        'gamma': 0,
-        'reg_alpha': 0.1,
-        'reg_lambda': 1.0,
+    # Train model
+    model = XGBClassifier(**params)
+
+    # Add pruning callback for early termination of unpromising trials
+    pruning_callback = optuna.integration.XGBoostPruningCallback(trial, 'validation_0-auc')
+
+    model.fit(
+        X_train_scaled, y_train,
+        eval_set=[(X_val_scaled, y_val)],
+        early_stopping_rounds=20,
+        verbose=False,
+        callbacks=[pruning_callback]
+    )
+
+    # Evaluate
+    y_prob = model.predict_proba(X_val_scaled)[:, 1]
+    auc = roc_auc_score(y_val, y_prob)
+
+    return auc
+
+
+def train_best_model(best_params: dict, X_train, y_train, X_val, y_val) -> tuple:
+    """Train final model with best hyperparameters."""
+    print("\n🚀 Training final model with best hyperparameters...")
+
+    # Standardize features
+    scaler = StandardScaler()
+    X_train_scaled = scaler.fit_transform(X_train)
+    X_val_scaled = scaler.transform(X_val)
+
+    # Update params for final training
+    final_params = best_params.copy()
+    final_params.update({
         'objective': 'binary:logistic',
         'eval_metric': 'auc',
         'use_label_encoder': False,
         'random_state': 42,
         'n_jobs': -1,
         'verbosity': 1,
-    }
+    })
 
-    # Use custom params if provided, otherwise use defaults
-    if custom_params:
-        print("   Using custom hyperparameters from tuning")
-        params = {**default_params, **custom_params}
-    else:
-        print("   Using default hyperparameters")
-        params = default_params
-
-    model = XGBClassifier(**params)
+    model = XGBClassifier(**final_params)
 
     # Train with early stopping
     model.fit(
@@ -131,7 +174,7 @@ def train_xgboost(X_train, y_train, X_val, y_val, custom_params=None) -> tuple:
     accuracy = accuracy_score(y_val, y_pred)
     auc = roc_auc_score(y_val, y_prob)
 
-    print(f"\n📊 Validation Results:")
+    print(f"\n📊 Final Validation Results:")
     print(f"   Accuracy: {accuracy:.4f}")
     print(f"   AUC-ROC:  {auc:.4f}")
     print(f"\n{classification_report(y_val, y_pred, target_names=['DOWN', 'UP'])}")
@@ -151,71 +194,23 @@ def export_to_onnx(model: XGBClassifier, scaler: StandardScaler, input_dim: int,
     print(f"\n💾 Exporting model to ONNX: {output_path}")
 
     if not ONNXMLTOOLS_AVAILABLE:
-        print("   ⚠️  onnxmltools not available, using manual export...")
-        export_manual_onnx(model, scaler, input_dim, output_path)
+        print("   ⚠️  onnxmltools not available, skipping ONNX export")
+        # Save as XGBoost native format instead
+        native_path = Path(output_path).with_suffix('.xgb')
+        model.save_model(str(native_path))
+        print(f"   ✓ Native XGBoost model saved to: {native_path}")
+        save_scaler(scaler, str(native_path))
         return
 
     # Convert XGBoost to ONNX
     initial_type = [('features', FloatTensorType([None, input_dim]))]
     onnx_model = convert_xgboost(model, initial_types=initial_type, target_opset=12)
 
-    # The converted model outputs class labels and probabilities
-    # We need to modify to output just the probability of class 1
-
     # Save the model
     onnx.save(onnx_model, output_path)
     print(f"   ✓ Model saved")
 
     # Save scaler parameters
-    save_scaler(scaler, output_path)
-
-
-def export_manual_onnx(model: XGBClassifier, scaler: StandardScaler, input_dim: int, output_path: str):
-    """Manual ONNX export by building a simple approximation network."""
-    # For XGBoost, we'll extract the predictions and create a lookup-style model
-    # This is a fallback when onnxmltools isn't available
-
-    if not ONNX_AVAILABLE:
-        print("   ❌ Cannot export: ONNX not available")
-        return
-
-    # Get the booster and tree structure
-    booster = model.get_booster()
-    trees = booster.get_dump(dump_format='json')
-
-    print(f"   Model has {len(trees)} trees")
-
-    # For simplicity, we'll create a model that uses the sklearn-style coefficients
-    # This won't be as accurate as full tree traversal but works as fallback
-
-    # Actually, let's just save the model in a format we can load directly
-    # and do inference in Python, then call from Rust via a simpler interface
-
-    # Save as XGBoost native format
-    native_path = Path(output_path).with_suffix('.xgb')
-    model.save_model(str(native_path))
-    print(f"   ✓ Native XGBoost model saved to: {native_path}")
-
-    # For ONNX, create a simple passthrough that we'll replace later
-    # when onnxmltools is available
-    nodes = []
-    initializers = []
-
-    # Create a simple identity + sigmoid as placeholder
-    nodes.append(helper.make_node('ReduceMean', ['features'], ['mean_out'], axes=[1], keepdims=True))
-    nodes.append(helper.make_node('Sigmoid', ['mean_out'], ['predictions']))
-
-    input_tensor = helper.make_tensor_value_info('features', TensorProto.FLOAT, [None, input_dim])
-    output_tensor = helper.make_tensor_value_info('predictions', TensorProto.FLOAT, [None, 1])
-
-    graph = helper.make_graph(nodes, 'xgboost_placeholder', [input_tensor], [output_tensor], initializers)
-    onnx_model = helper.make_model(graph, opset_imports=[helper.make_opsetid('', 13)])
-    onnx_model.ir_version = 7
-
-    onnx.checker.check_model(onnx_model)
-    onnx.save(onnx_model, output_path)
-    print(f"   ⚠️  Placeholder ONNX saved (install onnxmltools for full export)")
-
     save_scaler(scaler, output_path)
 
 
@@ -232,10 +227,10 @@ def save_scaler(scaler: StandardScaler, model_path: str):
 
 
 def main():
-    parser = argparse.ArgumentParser(description='Train Charter ML model with XGBoost')
+    parser = argparse.ArgumentParser(description='Tune Charter ML model hyperparameters with Optuna')
     parser.add_argument('input', help='Path to training data CSV')
     parser.add_argument('output', help='Path for output model (.onnx)')
-    parser.add_argument('--params', help='Optional JSON file with hyperparameters from tuning')
+    parser.add_argument('--trials', type=int, default=50, help='Number of optimization trials (default: 50)')
     args = parser.parse_args()
 
     if not XGBOOST_AVAILABLE:
@@ -246,8 +241,12 @@ def main():
         print("❌ sklearn is required. Install with: pip install scikit-learn")
         sys.exit(1)
 
+    if not OPTUNA_AVAILABLE:
+        print("❌ Optuna is required. Install with: pip install optuna")
+        sys.exit(1)
+
     print("╔══════════════════════════════════════════════════════════════╗")
-    print("║         Charter ML Training (XGBoost)                        ║")
+    print("║      Charter ML Hyperparameter Tuning (Optuna)              ║")
     print("╚══════════════════════════════════════════════════════════════╝")
     print()
 
@@ -259,7 +258,6 @@ def main():
         sys.exit(1)
 
     # Walk-forward validation: Use chronological split (no random shuffle)
-    # This prevents look-ahead bias where model trains on future data to predict the past
     split_idx = int(len(X) * 0.8)
     X_train = X[:split_idx]
     y_train = y[:split_idx]
@@ -272,19 +270,43 @@ def main():
     print(f"   Train direction up: {y_train.mean():.1%}")
     print(f"   Val direction up:   {y_val.mean():.1%}")
 
-    # Load custom hyperparameters if provided
-    custom_params = None
-    if args.params:
-        print(f"\n📋 Loading hyperparameters from {args.params}...")
-        with open(args.params, 'r') as f:
-            custom_params = json.load(f)
+    # Run Optuna optimization
+    print(f"\n🔍 Starting hyperparameter search ({args.trials} trials)...")
+    print("   This may take a while...\n")
 
-    # Train
-    model, scaler = train_xgboost(X_train, y_train, X_val, y_val, custom_params)
+    study = optuna.create_study(
+        direction='maximize',
+        sampler=TPESampler(seed=42),
+        pruner=MedianPruner(n_startup_trials=5, n_warmup_steps=10)
+    )
+
+    study.optimize(
+        lambda trial: objective(trial, X_train, y_train, X_val, y_val),
+        n_trials=args.trials,
+        show_progress_bar=True
+    )
+
+    # Print results
+    print("\n✨ Optimization complete!")
+    print(f"\n📈 Best trial:")
+    print(f"   Value (AUC): {study.best_trial.value:.4f}")
+    print(f"   Params:")
+    for key, value in study.best_trial.params.items():
+        print(f"      {key}: {value}")
+
+    # Train final model with best parameters
+    best_params = study.best_trial.params
+    model, scaler = train_best_model(best_params, X_train, y_train, X_val, y_val)
 
     # Export
     output_path = args.output if args.output.endswith('.onnx') else args.output + '.onnx'
     export_to_onnx(model, scaler, X.shape[1], output_path)
+
+    # Save best hyperparameters to JSON
+    params_path = Path(output_path).with_suffix('.params.json')
+    with open(params_path, 'w') as f:
+        json.dump(best_params, f, indent=2)
+    print(f"   ✓ Best hyperparameters saved to: {params_path}")
 
     print("\n✨ Training complete!")
 
