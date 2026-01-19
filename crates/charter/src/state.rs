@@ -33,6 +33,7 @@ use charter_ta::{
     Analyzer, AnalyzerConfig, CandleDirection, Level, LevelState, LevelType, MlFeatures, Range,
     TimeframeFeatures, Trend, TrendState, MlInferenceHandle,
 };
+use charter_config::Config as AppConfig;
 use charter_ui::TopBar;
 
 /// Loading state for background operations.
@@ -207,6 +208,9 @@ pub struct State {
     pub show_symbol_picker: bool,
     pub symbol_picker_state: SymbolPickerState,
     tokio_runtime: Option<tokio::runtime::Runtime>,
+
+    // Application config
+    pub app_config: AppConfig,
 }
 
 impl State {
@@ -275,8 +279,11 @@ impl State {
             .build()
             .expect("Failed to create tokio runtime");
 
-        // Default symbol
-        let default_symbol = "BTCUSDT".to_string();
+        // Load application config
+        let app_config = AppConfig::load_default();
+
+        // Default symbol from config
+        let default_symbol = app_config.general.default_symbol.clone();
 
         // Start background data loading from MEXC
         let sender = bg_sender.clone();
@@ -352,6 +359,21 @@ impl State {
             }
         };
 
+        // Convert display config to TaDisplaySettings
+        let ta_settings = TaDisplaySettings {
+            show_ta: app_config.ta.display.show_ta,
+            show_ranges: app_config.ta.display.show_ranges,
+            show_hold_levels: app_config.ta.display.show_hold_levels,
+            show_greedy_levels: app_config.ta.display.show_greedy_levels,
+            show_active_levels: app_config.ta.display.show_active_levels,
+            show_hit_levels: app_config.ta.display.show_hit_levels,
+            show_broken_levels: app_config.ta.display.show_broken_levels,
+            show_trends: app_config.ta.display.show_trends,
+            show_active_trends: app_config.ta.display.show_active_trends,
+            show_hit_trends: app_config.ta.display.show_hit_trends,
+            show_broken_trends: app_config.ta.display.show_broken_trends,
+        };
+
         let state = Self {
             surface,
             device,
@@ -363,7 +385,7 @@ impl State {
             timeframes,
             current_timeframe: 0,
             ta_data,
-            ta_settings: TaDisplaySettings::default(),
+            ta_settings,
             hovered_range: None,
             hovered_level: None,
             hovered_trend: None,
@@ -389,6 +411,7 @@ impl State {
             show_symbol_picker: false,
             symbol_picker_state: SymbolPickerState::default(),
             tokio_runtime: Some(tokio_runtime),
+            app_config,
         };
 
         // Don't update visible range yet - data is loading
@@ -753,17 +776,28 @@ impl State {
         }
     }
 
+    /// Get AnalyzerConfig for a specific timeframe index.
+    fn analyzer_config_for_timeframe(&self, tf_idx: usize) -> AnalyzerConfig {
+        let tf_label = Timeframe::all()[tf_idx].label();
+        let ta_config = self.app_config.ta_analysis_for_timeframe(tf_label);
+        AnalyzerConfig::default()
+            .doji_threshold(ta_config.doji_threshold)
+            .min_range_candles(ta_config.min_range_candles)
+            .level_tolerance(ta_config.level_tolerance)
+            .create_greedy_levels(ta_config.create_greedy_levels)
+    }
+
     /// Compute TA in background thread for a timeframe.
     fn compute_ta_background(&self, timeframe: usize) {
         let candles = self.timeframes[timeframe].candles.clone();
         let sender = self.bg_sender.clone();
+        let ta_config = self.analyzer_config_for_timeframe(timeframe);
 
         thread::spawn(move || {
             let _ = sender.send(BackgroundMessage::LoadingStateChanged(
                 LoadingState::ComputingTa { timeframe },
             ));
 
-            let ta_config = AnalyzerConfig::default();
             let mut analyzer = Analyzer::with_config(ta_config);
 
             for candle in &candles {
@@ -792,8 +826,8 @@ impl State {
         const ML_TIMEFRAME_INDICES: [usize; 4] = [2, 4, 8, 9];
         const MIN_CANDLES: usize = 100;
 
-        // Collect timeframes that need TA computation
-        let mut timeframes_to_compute: Vec<(usize, Vec<Candle>)> = Vec::new();
+        // Collect timeframes that need TA computation (with their configs)
+        let mut timeframes_to_compute: Vec<(usize, Vec<Candle>, AnalyzerConfig)> = Vec::new();
 
         for &tf_idx in &ML_TIMEFRAME_INDICES {
             if tf_idx >= self.timeframes.len() {
@@ -811,7 +845,8 @@ impl State {
                 continue;
             }
 
-            timeframes_to_compute.push((tf_idx, candles.clone()));
+            let ta_config = self.analyzer_config_for_timeframe(tf_idx);
+            timeframes_to_compute.push((tf_idx, candles.clone(), ta_config));
         }
 
         if timeframes_to_compute.is_empty() {
@@ -825,8 +860,7 @@ impl State {
         let _ = sender.send(BackgroundMessage::MlTaProgress { completed: 0, total });
 
         thread::spawn(move || {
-            for (completed, (tf_idx, candles)) in timeframes_to_compute.into_iter().enumerate() {
-                let ta_config = AnalyzerConfig::default();
+            for (completed, (tf_idx, candles, ta_config)) in timeframes_to_compute.into_iter().enumerate() {
                 let mut analyzer = Analyzer::with_config(ta_config);
 
                 for candle in &candles {
@@ -1091,7 +1125,7 @@ impl State {
             TimeframeTaData::with_data(ranges, levels, trends)
         } else {
             // Fallback: compute TA on-the-fly (slow path)
-            let ta_config = AnalyzerConfig::default();
+            let ta_config = self.analyzer_config_for_timeframe(current_tf_idx);
             let mut analyzer = Analyzer::with_config(ta_config);
             for candle in &current_tf_candles {
                 analyzer.process_candle(*candle);
@@ -1200,10 +1234,11 @@ impl State {
         let current_price = current_candle.close;
 
         // Compute features for the 6 essential timeframes (matching training)
-        let ta_config = AnalyzerConfig::default();
         let mut tf_features: Vec<TimeframeFeatures> = Vec::new();
 
         for (feature_idx, &tf_idx) in ML_TIMEFRAME_INDICES.iter().enumerate() {
+            // Get per-timeframe TA config
+            let ta_config = self.analyzer_config_for_timeframe(tf_idx);
             if tf_idx >= self.timeframes.len() {
                 continue;
             }

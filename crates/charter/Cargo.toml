@@ -12,6 +12,7 @@ name = "charter-ml-export"
 path = "src/bin/ml_export.rs"
 
 [dependencies]
+charter-config.workspace = true
 charter-core.workspace = true
 charter-data.workspace = true
 charter-indicators.workspace = true

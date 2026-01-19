@@ -1,0 +1,75 @@
+# Charter Configuration File
+# Place this file at ./config.toml or ~/.config/charter/config.toml
+
+[general]
+# Default trading symbol to load on startup
+default_symbol = "BTCUSDT"
+
+[api]
+# MEXC WebSocket URL
+ws_url = "wss://wbs-api.mexc.com/ws"
+# Number of days of historical data to fetch
+history_days = 90
+
+[ta]
+# Technical Analysis configuration
+
+[ta.default]
+# Default TA parameters (used when timeframe-specific values not set)
+doji_threshold = 0.001
+min_range_candles = 3
+level_tolerance = 0.0
+create_greedy_levels = true
+
+# Per-timeframe overrides
+# Only specify values you want to override from defaults
+
+[ta.timeframes.1m]
+min_range_candles = 4
+
+[ta.timeframes.3m]
+min_range_candles = 4
+
+[ta.timeframes.5m]
+min_range_candles = 3
+
+[ta.timeframes.30m]
+min_range_candles = 3
+
+[ta.timeframes.1h]
+min_range_candles = 2
+
+[ta.timeframes.3h]
+min_range_candles = 2
+
+[ta.timeframes.5h]
+min_range_candles = 2
+
+[ta.timeframes.10h]
+min_range_candles = 2
+
+[ta.timeframes.1d]
+min_range_candles = 1
+
+[ta.timeframes.1w]
+min_range_candles = 1
+
+[ta.timeframes.3w]
+min_range_candles = 1
+
+[ta.timeframes.1M]
+min_range_candles = 1
+
+[ta.display]
+# Display settings for TA overlay
+show_ta = false
+show_ranges = true
+show_hold_levels = true
+show_greedy_levels = true
+show_active_levels = true
+show_hit_levels = true
+show_broken_levels = false
+show_trends = true
+show_active_trends = true
+show_hit_trends = true
+show_broken_trends = false

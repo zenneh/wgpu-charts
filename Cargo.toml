@@ -2,6 +2,7 @@
 resolver = "3"
 members = [
     "crates/charter-core",
+    "crates/charter-config",
     "crates/charter-data",
     "crates/charter-indicators",
     "crates/charter-render",
@@ -19,6 +20,7 @@ edition = "2024"
 [workspace.dependencies]
 # Internal crates
 charter-core = { path = "crates/charter-core" }
+charter-config = { path = "crates/charter-config" }
 charter-data = { path = "crates/charter-data" }
 charter-indicators = { path = "crates/charter-indicators" }
 charter-render = { path = "crates/charter-render" }

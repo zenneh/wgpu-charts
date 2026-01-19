@@ -1,0 +1,11 @@
+[package]
+name = "charter-config"
+version = "0.1.0"
+edition = "2021"
+description = "Configuration management for charter"
+
+[dependencies]
+serde = { version = "1.0", features = ["derive"] }
+toml = "0.8"
+dirs = "5.0"
+thiserror = "1.0"
