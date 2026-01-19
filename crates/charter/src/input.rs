@@ -56,6 +56,10 @@ pub enum InputAction {
     CursorMoved { x: f32, y: f32 },
     /// Set replay index from click position.
     SetReplayIndex,
+    /// Toggle the symbol picker.
+    ToggleSymbolPicker,
+    /// Start live data updates.
+    StartLiveUpdates,
 }
 
 /// Handles input events and converts them to semantic actions.
@@ -122,6 +126,8 @@ impl InputHandler {
             KeyCode::KeyP => Some(InputAction::ToggleTa),
             KeyCode::KeyM => Some(InputAction::ToggleMacdPanel),
             KeyCode::KeyR => Some(InputAction::ToggleReplayMode),
+            KeyCode::KeyS | KeyCode::Slash => Some(InputAction::ToggleSymbolPicker),
+            KeyCode::KeyL => Some(InputAction::StartLiveUpdates),
             KeyCode::BracketRight => Some(InputAction::ReplayStepForward),
             KeyCode::BracketLeft => Some(InputAction::ReplayStepBackward),
             KeyCode::Comma => Some(InputAction::ReplayDecreaseStep),

@@ -9,6 +9,7 @@ members = [
     "crates/charter-ta",
     "crates/charter-backtest",
     "crates/charter",
+    "crates/mexc-api",
 ]
 
 [workspace.package]

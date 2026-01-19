@@ -28,5 +28,6 @@ pub const INDICES_PER_CANDLE: u32 = 18; // 6 indices per quad * 3 quads
 pub const MIN_CANDLE_PIXELS: f32 = 3.0; // Minimum candle width in pixels
 
 /// Layout constants.
-pub const STATS_PANEL_WIDTH: f32 = 200.0;
+pub const STATS_PANEL_WIDTH: f32 = 0.0; // Removed right sidebar
+pub const TOP_BAR_HEIGHT: f32 = 24.0;
 pub const VOLUME_HEIGHT_RATIO: f32 = 0.2; // Volume panel takes 20% of chart area height

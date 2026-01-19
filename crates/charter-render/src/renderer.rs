@@ -390,6 +390,147 @@ impl ChartRenderer {
         }
     }
 
+    /// Update only the candle and volume data of a TimeframeData, preserving TA buffers.
+    /// This is used for live updates where we don't want to lose computed TA data.
+    pub fn update_candle_data(
+        &self,
+        device: &wgpu::Device,
+        existing: &TimeframeData,
+        candles: Vec<Candle>,
+        label: &str,
+    ) -> TimeframeData {
+        // Compute price normalization for packed candles
+        let price_normalization = PriceNormalization::from_candles(&candles);
+
+        // Pack candles to u16 format
+        let packed_candles = price_normalization.pack_candles(&candles);
+
+        // Ensure we have at least one element for GPU buffers
+        let candles_for_buffer = if packed_candles.is_empty() {
+            vec![PackedCandleGpu { open: 0, high: 0, low: 0, close: 0 }]
+        } else {
+            packed_candles
+        };
+
+        let candle_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some(&format!("Candle Buffer {}", label)),
+            contents: bytemuck::cast_slice(&candles_for_buffer),
+            usage: wgpu::BufferUsages::STORAGE,
+        });
+
+        let candle_bind_group = self.candle_pipeline.create_bind_group(
+            device,
+            &candle_buffer,
+            &self.render_params_buffer,
+        );
+
+        let volume_gpu: Vec<VolumeGpu> = candles.iter().map(VolumeGpu::from_candle).collect();
+        let max_volume = candles.iter().map(|c| c.volume).fold(0.0f32, f32::max);
+
+        let volume_for_buffer = if volume_gpu.is_empty() {
+            vec![VolumeGpu { volume: 0.0, is_bullish: 1, _padding1: 0.0, _padding2: 0.0 }]
+        } else {
+            volume_gpu.clone()
+        };
+
+        let volume_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some(&format!("Volume Buffer {}", label)),
+            contents: bytemuck::cast_slice(&volume_for_buffer),
+            usage: wgpu::BufferUsages::STORAGE,
+        });
+
+        let volume_bind_group = self.volume_pipeline.create_bind_group(
+            device,
+            &volume_buffer,
+            &self.volume_params_buffer,
+        );
+
+        // Create LOD levels
+        let candles_gpu: Vec<CandleGpu> = candles.iter().map(CandleGpu::from).collect();
+        let mut lod_levels = Vec::new();
+        let lod_config = existing.lod_config.clone();
+
+        for &factor in lod_config.factors() {
+            if candles_gpu.len() > factor * 5 {
+                let lod_candles_gpu = aggregate_candles_lod(&candles_gpu, factor);
+                let lod_packed = price_normalization.pack_candles_gpu(&lod_candles_gpu);
+                let lod_volume = aggregate_volume_lod(&volume_gpu, &candles_gpu, factor);
+                let lod_max_volume = lod_volume.iter().map(|v| v.volume).fold(0.0f32, f32::max);
+
+                let lod_candle_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: Some(&format!("Candle Buffer {} LOD {}", label, factor)),
+                    contents: bytemuck::cast_slice(&lod_packed),
+                    usage: wgpu::BufferUsages::STORAGE,
+                });
+
+                let lod_candle_bind_group = self.candle_pipeline.create_bind_group(
+                    device,
+                    &lod_candle_buffer,
+                    &self.render_params_buffer,
+                );
+
+                let lod_volume_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: Some(&format!("Volume Buffer {} LOD {}", label, factor)),
+                    contents: bytemuck::cast_slice(&lod_volume),
+                    usage: wgpu::BufferUsages::STORAGE,
+                });
+
+                let lod_volume_bind_group = self.volume_pipeline.create_bind_group(
+                    device,
+                    &lod_volume_buffer,
+                    &self.volume_params_buffer,
+                );
+
+                lod_levels.push(LodData {
+                    candle_buffer: lod_candle_buffer,
+                    candle_bind_group: lod_candle_bind_group,
+                    volume_buffer: lod_volume_buffer,
+                    volume_bind_group: lod_volume_bind_group,
+                    count: lod_packed.len() as u32,
+                    max_volume: lod_max_volume,
+                    factor,
+                });
+            }
+        }
+
+        // Recreate TA bind group with existing buffers (buffers can't be cloned, need new bind group)
+        let ta_range_buffer = self.ta_pipeline.create_range_buffer(device);
+        let ta_level_buffer = self.ta_pipeline.create_level_buffer(device);
+        let ta_trend_buffer = self.ta_pipeline.create_trend_buffer(device);
+        let ta_params_buffer = self.ta_pipeline.create_params_buffer(device);
+        let ta_bind_group = self.ta_pipeline.create_bind_group(
+            device,
+            &ta_range_buffer,
+            &ta_level_buffer,
+            &ta_params_buffer,
+            &ta_trend_buffer,
+        );
+
+        let count = candles.len() as u32;
+
+        TimeframeData {
+            candles,
+            candle_buffer,
+            candle_bind_group,
+            volume_buffer,
+            volume_bind_group,
+            count,
+            max_volume,
+            price_normalization,
+            lod_levels,
+            lod_config,
+            ta_range_buffer,
+            ta_level_buffer,
+            ta_trend_buffer,
+            ta_params_buffer,
+            ta_bind_group,
+            // Preserve TA counts from existing data
+            ta_range_count: existing.ta_range_count,
+            ta_level_count: existing.ta_level_count,
+            ta_trend_count: existing.ta_trend_count,
+        }
+    }
+
     pub fn resize(&mut self, width: u32, height: u32) {
         self.config_width = width;
         self.config_height = height;

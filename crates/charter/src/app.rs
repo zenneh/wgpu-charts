@@ -35,6 +35,13 @@ impl ApplicationHandler<State> for App {
         }
     }
 
+    fn about_to_wait(&mut self, _event_loop: &ActiveEventLoop) {
+        // Request redraw to process background messages (live updates)
+        if let Some(state) = &self.state {
+            state.window.request_redraw();
+        }
+    }
+
     #[allow(unused_mut)]
     fn user_event(&mut self, _event_loop: &ActiveEventLoop, mut event: State) {
         self.state = Some(event);
