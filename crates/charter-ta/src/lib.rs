@@ -94,6 +94,7 @@
 pub mod analyzer;
 pub mod inference;
 pub mod ml;
+pub mod multi_timeframe;
 pub mod rules;
 pub mod types;
 
@@ -115,3 +116,9 @@ pub use ml::{
 
 // Re-export inference types
 pub use inference::{MlInference, MlInferenceHandle, ScalerParams};
+
+// Re-export multi-timeframe types
+pub use multi_timeframe::{
+    IncrementalAggregator, MultiTimeframeAnalyzer, TimeframeAnalyzerState,
+    ml_export_timeframes,
+};

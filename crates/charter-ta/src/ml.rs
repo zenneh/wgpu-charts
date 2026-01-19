@@ -165,6 +165,7 @@ pub struct TimeframeFeatures {
 
 impl TimeframeFeatures {
     /// Extract features from levels and trends for a timeframe.
+    /// SLOW: Use `extract_fast` for incremental backtest/export scenarios.
     pub fn extract(
         timeframe_index: usize,
         levels: &[Level],
@@ -273,6 +274,143 @@ impl TimeframeFeatures {
             .iter()
             .filter(|t| t.state != TrendState::Broken)
             .count() as u16;
+
+        features
+    }
+
+    /// Fast single-pass extraction for active levels/trends only.
+    ///
+    /// This is O(n) where n = number of ACTIVE levels, vs the regular extract
+    /// which is O(m) where m = ALL levels including broken ones.
+    /// For long backtests, active levels << all levels, making this much faster.
+    pub fn extract_fast<'a>(
+        timeframe_index: usize,
+        active_levels: impl Iterator<Item = &'a Level>,
+        active_trends: impl Iterator<Item = &'a Trend>,
+        current_price: f32,
+        current_candle_index: usize,
+    ) -> Self {
+        let mut features = Self {
+            timeframe_index,
+            ..Default::default()
+        };
+
+        // Track top 3 closest levels per category using fixed-size arrays.
+        // Each entry is (distance, level_ref) - we keep the 3 smallest distances.
+        struct TopK<'a> {
+            items: [(f32, Option<&'a Level>); LEVELS_PER_CATEGORY],
+            count: usize,
+        }
+
+        impl<'a> TopK<'a> {
+            fn new() -> Self {
+                Self {
+                    items: [(f32::MAX, None); LEVELS_PER_CATEGORY],
+                    count: 0,
+                }
+            }
+
+            #[inline]
+            fn insert(&mut self, distance: f32, level: &'a Level) {
+                // Find insertion point
+                let mut insert_at = LEVELS_PER_CATEGORY;
+                for i in 0..LEVELS_PER_CATEGORY {
+                    if distance < self.items[i].0 {
+                        insert_at = i;
+                        break;
+                    }
+                }
+
+                if insert_at < LEVELS_PER_CATEGORY {
+                    // Shift items to make room
+                    for i in (insert_at + 1..LEVELS_PER_CATEGORY).rev() {
+                        self.items[i] = self.items[i - 1];
+                    }
+                    self.items[insert_at] = (distance, Some(level));
+                    self.count = (self.count + 1).min(LEVELS_PER_CATEGORY);
+                }
+            }
+        }
+
+        let mut bullish_hold = TopK::new();
+        let mut bearish_hold = TopK::new();
+        let mut bullish_greedy = TopK::new();
+        let mut bearish_greedy = TopK::new();
+        let mut active_level_count = 0u16;
+
+        // Single pass through active levels
+        for level in active_levels {
+            active_level_count += 1;
+            let distance = (level.price - current_price).abs();
+
+            match (level.direction, level.level_type) {
+                (CandleDirection::Bullish, LevelType::Hold) => bullish_hold.insert(distance, level),
+                (CandleDirection::Bearish, LevelType::Hold) => bearish_hold.insert(distance, level),
+                (CandleDirection::Bullish, LevelType::GreedyHold) => bullish_greedy.insert(distance, level),
+                (CandleDirection::Bearish, LevelType::GreedyHold) => bearish_greedy.insert(distance, level),
+                _ => {}
+            }
+        }
+
+        // Extract features from top 3
+        for (i, (_, level_opt)) in bullish_hold.items.iter().enumerate() {
+            if let Some(level) = level_opt {
+                features.bullish_hold_levels[i] =
+                    LevelFeatures::from_level(level, current_price, current_candle_index);
+            }
+        }
+        for (i, (_, level_opt)) in bearish_hold.items.iter().enumerate() {
+            if let Some(level) = level_opt {
+                features.bearish_hold_levels[i] =
+                    LevelFeatures::from_level(level, current_price, current_candle_index);
+            }
+        }
+        for (i, (_, level_opt)) in bullish_greedy.items.iter().enumerate() {
+            if let Some(level) = level_opt {
+                features.bullish_greedy_levels[i] =
+                    LevelFeatures::from_level(level, current_price, current_candle_index);
+            }
+        }
+        for (i, (_, level_opt)) in bearish_greedy.items.iter().enumerate() {
+            if let Some(level) = level_opt {
+                features.bearish_greedy_levels[i] =
+                    LevelFeatures::from_level(level, current_price, current_candle_index);
+            }
+        }
+
+        // Find latest trends in single pass
+        let mut latest_bullish: Option<&Trend> = None;
+        let mut latest_bearish: Option<&Trend> = None;
+        let mut active_trend_count = 0u16;
+
+        for trend in active_trends {
+            active_trend_count += 1;
+            match trend.direction {
+                CandleDirection::Bullish => {
+                    if latest_bullish.map_or(true, |t| trend.created_at_index > t.created_at_index) {
+                        latest_bullish = Some(trend);
+                    }
+                }
+                CandleDirection::Bearish => {
+                    if latest_bearish.map_or(true, |t| trend.created_at_index > t.created_at_index) {
+                        latest_bearish = Some(trend);
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        if let Some(trend) = latest_bullish {
+            features.bullish_trend =
+                TrendFeatures::from_trend(trend, current_price, current_candle_index);
+        }
+        if let Some(trend) = latest_bearish {
+            features.bearish_trend =
+                TrendFeatures::from_trend(trend, current_price, current_candle_index);
+        }
+
+        features.active_level_count = active_level_count;
+        features.active_trend_count = active_trend_count;
 
         features
     }

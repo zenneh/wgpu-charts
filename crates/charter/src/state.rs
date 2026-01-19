@@ -39,6 +39,7 @@ use charter_ui::TopBar;
 
 /// Loading state for background operations.
 #[derive(Debug, Clone, PartialEq)]
+#[allow(dead_code)]
 pub enum LoadingState {
     /// No loading in progress.
     Idle,
@@ -634,6 +635,15 @@ impl State {
                 }
                 BackgroundMessage::ConnectionStatus(connected) => {
                     self.ws_connected = connected;
+                    // Show or hide the current price line based on connection status
+                    if connected {
+                        // Get current price from latest candle
+                        if let Some(last_candle) = self.timeframes[0].candles.last() {
+                            self.update_current_price_line(Some(last_candle.close));
+                        }
+                    } else {
+                        self.update_current_price_line(None);
+                    }
                     updated = true;
                 }
                 BackgroundMessage::SyncProgressUpdate(progress) => {
@@ -751,7 +761,19 @@ impl State {
         // Update render params with new price_normalization (critical for correct rendering)
         self.update_visible_range();
 
+        // Update current price line if websocket is connected
+        if self.ws_connected {
+            self.update_current_price_line(Some(candle.close));
+        }
+
         self.window.request_redraw();
+    }
+
+    /// Update the current price line display.
+    fn update_current_price_line(&mut self, price: Option<f32>) {
+        let tf = &self.timeframes[self.current_timeframe];
+        let x_max = (tf.candles.len() as f32) * CANDLE_SPACING;
+        self.renderer.set_current_price(&self.queue, price, 0.0, x_max);
     }
 
     /// Re-aggregate all higher timeframes from the base 1-minute data.
@@ -2970,6 +2992,9 @@ impl State {
                 wgpu::IndexFormat::Uint16,
             );
             render_pass.draw_indexed(0..INDICES_PER_CANDLE, 0, 0..effective_visible_count);
+
+            // Render current price line (dotted line when ws connected)
+            self.renderer.render_current_price(&mut render_pass);
 
             // Render TA (ranges and levels) if enabled
             if self.ta_settings.show_ta {

@@ -101,7 +101,7 @@ def objective(trial: optuna.Trial, X_train, y_train, X_val, y_val) -> float:
         'reg_lambda': trial.suggest_float('reg_lambda', 0, 2),
         'objective': 'binary:logistic',
         'eval_metric': 'auc',
-        'use_label_encoder': False,
+        'early_stopping_rounds': 20,
         'random_state': 42,
         'n_jobs': -1,
         'verbosity': 0,
@@ -112,18 +112,13 @@ def objective(trial: optuna.Trial, X_train, y_train, X_val, y_val) -> float:
     X_train_scaled = scaler.fit_transform(X_train)
     X_val_scaled = scaler.transform(X_val)
 
-    # Train model
+    # Train model with early stopping
     model = XGBClassifier(**params)
-
-    # Add pruning callback for early termination of unpromising trials
-    pruning_callback = optuna.integration.XGBoostPruningCallback(trial, 'validation_0-auc')
 
     model.fit(
         X_train_scaled, y_train,
         eval_set=[(X_val_scaled, y_val)],
-        early_stopping_rounds=20,
         verbose=False,
-        callbacks=[pruning_callback]
     )
 
     # Evaluate
@@ -147,7 +142,7 @@ def train_best_model(best_params: dict, X_train, y_train, X_val, y_val) -> tuple
     final_params.update({
         'objective': 'binary:logistic',
         'eval_metric': 'auc',
-        'use_label_encoder': False,
+        'early_stopping_rounds': 20,
         'random_state': 42,
         'n_jobs': -1,
         'verbosity': 1,
@@ -159,7 +154,6 @@ def train_best_model(best_params: dict, X_train, y_train, X_val, y_val) -> tuple
     model.fit(
         X_train_scaled, y_train,
         eval_set=[(X_val_scaled, y_val)],
-        early_stopping_rounds=20,
         verbose=True
     )
 

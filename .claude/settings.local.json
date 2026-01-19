@@ -33,7 +33,8 @@
       "WebFetch(domain:raw.githubusercontent.com)",
       "WebFetch(domain:github.com)",
       "Bash(direnv reload:*)",
-      "Bash(duckdb:*)"
+      "Bash(duckdb:*)",
+      "Bash(target/release/charter-backtest:*)"
     ]
   }
 }

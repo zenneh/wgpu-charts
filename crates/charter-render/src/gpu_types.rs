@@ -197,6 +197,43 @@ pub struct GuidelineParams {
 /// Maximum number of guidelines that can be rendered.
 pub const MAX_GUIDELINES: usize = 32;
 
+/// Current price line parameters - renders a dotted horizontal line at the current price.
+#[repr(C)]
+#[derive(Debug, Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct CurrentPriceParams {
+    pub y_value: f32,           // Price level
+    pub x_min: f32,             // Left edge
+    pub x_max: f32,             // Right edge
+    pub line_thickness: f32,    // Thickness in world units
+    pub r: f32,                 // Red component
+    pub g: f32,                 // Green component
+    pub b: f32,                 // Blue component
+    pub visible: u32,           // 1 = visible, 0 = hidden
+    pub dot_spacing: f32,       // Spacing between dots in world units
+    pub screen_width: f32,      // Screen width in pixels
+    pub _padding1: f32,
+    pub _padding2: f32,
+}
+
+impl Default for CurrentPriceParams {
+    fn default() -> Self {
+        Self {
+            y_value: 0.0,
+            x_min: 0.0,
+            x_max: 0.0,
+            line_thickness: 0.0,
+            r: 1.0,      // Yellow/gold color
+            g: 0.843,
+            b: 0.0,
+            visible: 0,
+            dot_spacing: 10.0,
+            screen_width: 1920.0,
+            _padding1: 0.0,
+            _padding2: 0.0,
+        }
+    }
+}
+
 /// Indicator line GPU struct (for rendering indicator output).
 #[repr(C)]
 #[derive(Debug, Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]

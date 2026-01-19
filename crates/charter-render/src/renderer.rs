@@ -6,11 +6,14 @@ use charter_core::Candle;
 
 use crate::camera::{Camera, CameraUniform};
 use crate::gpu_types::{
-    aggregate_candles_lod, aggregate_volume_lod, CandleGpu, GuidelineGpu, GuidelineParams,
-    LodConfig, PackedCandleGpu, PriceNormalization, RenderParams, VolumeGpu, VolumeRenderParams,
-    MAX_GUIDELINES,
+    aggregate_candles_lod, aggregate_volume_lod, CandleGpu, CurrentPriceParams, GuidelineGpu,
+    GuidelineParams, LodConfig, PackedCandleGpu, PriceNormalization, RenderParams, VolumeGpu,
+    VolumeRenderParams, MAX_GUIDELINES,
 };
-use crate::pipeline::{CandlePipeline, GuidelinePipeline, IndicatorPipeline, TaPipeline, VolumePipeline};
+use crate::pipeline::{
+    CandlePipeline, CurrentPricePipeline, GuidelinePipeline, IndicatorPipeline, TaPipeline,
+    VolumePipeline,
+};
 use crate::{BASE_CANDLE_WIDTH, CANDLE_SPACING, MIN_CANDLE_PIXELS, STATS_PANEL_WIDTH, VOLUME_HEIGHT_RATIO};
 
 /// LOD data for a single level.
@@ -115,6 +118,12 @@ pub struct ChartRenderer {
     pub guideline_count: u32,
     pub guideline_values: Vec<f32>, // Y-values for price labels
 
+    // Current price line (dotted line at current price when ws connected)
+    pub current_price_pipeline: CurrentPricePipeline,
+    pub current_price_params_buffer: wgpu::Buffer,
+    pub current_price_bind_group: wgpu::BindGroup,
+    pub current_price: Option<f32>,
+
     pub visible_start: u32,
     pub visible_count: u32,
 
@@ -210,6 +219,13 @@ impl ChartRenderer {
         let guideline_params_buffer = guideline_pipeline.create_guideline_params_buffer(device, x_max, price_range);
         let guideline_bind_group = guideline_pipeline.create_bind_group(device, &guideline_buffer, &guideline_params_buffer);
 
+        // Current price line
+        let current_price_pipeline =
+            CurrentPricePipeline::new(device, format, &candle_pipeline.camera_bind_group_layout);
+        let current_price_params_buffer = current_price_pipeline.create_params_buffer(device);
+        let current_price_bind_group =
+            current_price_pipeline.create_bind_group(device, &current_price_params_buffer);
+
         Self {
             candle_pipeline,
             volume_pipeline,
@@ -231,6 +247,10 @@ impl ChartRenderer {
             guideline_bind_group,
             guideline_count: 0,
             guideline_values: Vec::new(),
+            current_price_pipeline,
+            current_price_params_buffer,
+            current_price_bind_group,
+            current_price: None,
             visible_start: 0,
             visible_count: 0,
             current_lod_factor: 1,
@@ -780,5 +800,52 @@ impl ChartRenderer {
 
     pub fn config_height(&self) -> u32 {
         self.config_height
+    }
+
+    /// Update the current price line. Set to None to hide it.
+    pub fn set_current_price(&mut self, queue: &wgpu::Queue, price: Option<f32>, x_min: f32, x_max: f32) {
+        self.current_price = price;
+
+        let chart_height = self.config_height as f32 * (1.0 - VOLUME_HEIGHT_RATIO);
+        let aspect = (self.config_width as f32 - STATS_PANEL_WIDTH) / chart_height;
+        let (y_min, y_max) = self.camera.visible_y_range(aspect);
+        let price_range = y_max - y_min;
+        let world_units_per_pixel = price_range / chart_height;
+        let line_thickness = (2.0 * world_units_per_pixel).max(price_range * 0.001);
+
+        let params = CurrentPriceParams {
+            y_value: price.unwrap_or(0.0),
+            x_min,
+            x_max,
+            line_thickness,
+            r: 1.0,       // Gold/yellow color
+            g: 0.843,
+            b: 0.0,
+            visible: if price.is_some() { 1 } else { 0 },
+            dot_spacing: 10.0,
+            screen_width: self.config_width as f32,
+            _padding1: 0.0,
+            _padding2: 0.0,
+        };
+
+        queue.write_buffer(
+            &self.current_price_params_buffer,
+            0,
+            bytemuck::cast_slice(&[params]),
+        );
+    }
+
+    /// Render the current price line.
+    pub fn render_current_price<'a>(
+        &'a self,
+        render_pass: &mut wgpu::RenderPass<'a>,
+    ) {
+        if self.current_price.is_some() {
+            self.current_price_pipeline.render_line(
+                render_pass,
+                &self.camera_bind_group,
+                &self.current_price_bind_group,
+            );
+        }
     }
 }

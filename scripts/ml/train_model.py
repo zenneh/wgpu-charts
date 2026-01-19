@@ -110,13 +110,14 @@ def train_xgboost(X_train, y_train, X_val, y_val, custom_params=None) -> tuple:
         print("   Using default hyperparameters")
         params = default_params
 
+    # Add early stopping to constructor (new XGBoost API)
+    params['early_stopping_rounds'] = 20
     model = XGBClassifier(**params)
 
     # Train with early stopping
     model.fit(
         X_train_scaled, y_train,
         eval_set=[(X_val_scaled, y_val)],
-        early_stopping_rounds=20,
         verbose=True
     )
 

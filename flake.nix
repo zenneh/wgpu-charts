@@ -42,6 +42,8 @@
             onnxmltools
             plotly
             matplotlib
+            optuna
+            optuna_integration
           ]))
         ];
 

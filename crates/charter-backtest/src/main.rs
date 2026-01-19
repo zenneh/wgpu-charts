@@ -12,10 +12,11 @@ use std::env;
 use std::time::Instant;
 
 use anyhow::Result;
-use charter_core::{aggregate_candles, Candle, Timeframe};
+use charter_core::Candle;
 use charter_data::load_candles_from_csv;
 use charter_ta::{
-    Analyzer, AnalyzerConfig, MlFeatures, MlInferenceHandle, TimeframeFeatures,
+    AnalyzerConfig, MlFeatures, MlInferenceHandle, MultiTimeframeAnalyzer, TimeframeFeatures,
+    ml_export_timeframes,
 };
 
 // ============================================================================
@@ -23,28 +24,40 @@ use charter_ta::{
 // ============================================================================
 
 /// Minimum confidence threshold to enter a trade (0.0 - 1.0).
-const MIN_CONFIDENCE: f32 = 0.15;
+/// Note: Model typically outputs very low confidence (~0.03 avg), so this should be low.
+const MIN_CONFIDENCE: f32 = 0.02;
 
 /// Risk per trade as fraction of bankroll.
-const RISK_PER_TRADE: f32 = 0.02; // 2%
+const RISK_PER_TRADE: f32 = 0.01; // 1% risk per trade
 
 /// Stop loss as percentage of entry price.
-const STOP_LOSS_PCT: f32 = 0.005; // 0.5%
+const STOP_LOSS_PCT: f32 = 0.008; // 0.8% (wider to avoid noise)
 
 /// Take profit as percentage of entry price.
-const TAKE_PROFIT_PCT: f32 = 0.01; // 1.0%
+const TAKE_PROFIT_PCT: f32 = 0.012; // 1.2% (1.5:1 R:R ratio)
 
 /// Trading fee per trade (taker fee).
 const FEE_PCT: f32 = 0.0001; // 0.01%
 
 /// Leverage multiplier (1x = no leverage, 100x = max).
-const LEVERAGE: f32 = 1.0;
+const LEVERAGE: f32 = 50.0; // Moderate leverage
+
+/// RSI threshold for longs - only enter long when RSI is below this (oversold zone)
+const RSI_LONG_MAX: f32 = 0.42; // RSI < 42 for longs
+
+/// RSI threshold for shorts - only enter short when RSI is above this (overbought zone)
+const RSI_SHORT_MIN: f32 = 0.58; // RSI > 58 for shorts
+
+/// Minimum volume ratio to take a trade (vs 100-candle average)
+const MIN_VOLUME_RATIO: f32 = 0.3; // Lower threshold
 
 /// Minimum candles for TA warmup.
+#[allow(dead_code)]
 const MIN_CANDLES: usize = 100;
 
-/// Timeframe indices for ML features: 5m(2), 1h(4), 1d(8), 1w(9)
-const ML_TIMEFRAME_INDICES: [usize; 4] = [2, 4, 8, 9];
+/// Timeframe indices for ML features: 1m(0), 5m(2), 30m(3), 1h(4), 1d(8)
+#[allow(dead_code)]
+const ML_TIMEFRAME_INDICES: [usize; 5] = [0, 2, 3, 4, 8];
 
 // ============================================================================
 // Trading Types
@@ -61,8 +74,8 @@ struct Trade {
     direction: Direction,
     entry_price: f32,
     entry_time: f64,
-    margin: f32,         // Margin (collateral) in USD
-    size: f32,           // Position size in USD (margin * leverage)
+    margin: f32, // Margin (collateral) in USD
+    size: f32,   // Position size in USD (margin * leverage)
     leverage: f32,
     stop_loss: f32,
     take_profit: f32,
@@ -74,7 +87,13 @@ struct Trade {
 }
 
 impl Trade {
-    fn new(direction: Direction, entry_price: f32, entry_time: f64, margin: f32, leverage: f32) -> Self {
+    fn new(
+        direction: Direction,
+        entry_price: f32,
+        entry_time: f64,
+        margin: f32,
+        leverage: f32,
+    ) -> Self {
         let size = margin * leverage;
 
         // Stop loss and take profit are tighter with leverage
@@ -184,6 +203,7 @@ struct BacktestEngine {
 
     // Stats
     total_predictions: usize,
+    #[allow(dead_code)]
     correct_predictions: usize,
 }
 
@@ -205,6 +225,7 @@ impl BacktestEngine {
         candle: &Candle,
         features: Option<&MlFeatures>,
         leverage: f32,
+        volume_ratio: f32,
     ) -> Result<()> {
         // Check if current trade should be closed
         if let Some(ref mut trade) = self.current_trade {
@@ -219,14 +240,20 @@ impl BacktestEngine {
         // Try to open new trade if no position
         if self.current_trade.is_none() {
             if let Some(features) = features {
-                self.try_open_trade(candle, features, leverage)?;
+                self.try_open_trade(candle, features, leverage, volume_ratio)?;
             }
         }
 
         Ok(())
     }
 
-    fn try_open_trade(&mut self, candle: &Candle, features: &MlFeatures, leverage: f32) -> Result<()> {
+    fn try_open_trade(
+        &mut self,
+        candle: &Candle,
+        features: &MlFeatures,
+        leverage: f32,
+        volume_ratio: f32,
+    ) -> Result<()> {
         // Get ML prediction
         let prediction = match self.ml_inference.predict(features) {
             Ok(p) => p,
@@ -240,10 +267,27 @@ impl BacktestEngine {
             return Ok(());
         }
 
-        // Determine direction
+        // Volume filter: skip very low volume periods
+        if volume_ratio < MIN_VOLUME_RATIO {
+            return Ok(());
+        }
+
+        // Get RSI from features
+        let rsi = features.rsi_14;
+
+        // Determine direction based on ML prediction + RSI confluence
+        // Only take trades where RSI confirms the ML direction
         let direction = if prediction.direction_up_prob > 0.5 {
+            // ML predicts UP - only take long if RSI is in lower half (potential bounce)
+            if rsi > RSI_LONG_MAX {
+                return Ok(()); // RSI too high for a long entry
+            }
             Direction::Long
         } else {
+            // ML predicts DOWN - only take short if RSI is in upper half (potential reversal)
+            if rsi < RSI_SHORT_MIN {
+                return Ok(()); // RSI too low for a short entry
+            }
             Direction::Short
         };
 
@@ -253,8 +297,10 @@ impl BacktestEngine {
         let margin = (self.balance * RISK_PER_TRADE) / (STOP_LOSS_PCT * leverage);
         let margin = margin.min(self.balance * 0.5); // Max 50% of balance as margin
 
-        if margin < 10.0 {
-            return Ok(()); // Min margin
+        // Minimum margin: 0.1% of balance (allows small starting balances)
+        let min_margin = self.balance * 0.001;
+        if margin < min_margin.max(0.01) {
+            return Ok(()); // Skip if margin is too small
         }
 
         // Open trade with leverage
@@ -283,8 +329,16 @@ impl BacktestEngine {
 
         // Basic stats
         let total_trades = self.trades.len();
-        let winning_trades: Vec<_> = self.trades.iter().filter(|t| t.pnl.unwrap_or(0.0) > 0.0).collect();
-        let losing_trades: Vec<_> = self.trades.iter().filter(|t| t.pnl.unwrap_or(0.0) <= 0.0).collect();
+        let winning_trades: Vec<_> = self
+            .trades
+            .iter()
+            .filter(|t| t.pnl.unwrap_or(0.0) > 0.0)
+            .collect();
+        let losing_trades: Vec<_> = self
+            .trades
+            .iter()
+            .filter(|t| t.pnl.unwrap_or(0.0) <= 0.0)
+            .collect();
 
         let total_pnl: f32 = self.trades.iter().map(|t| t.pnl.unwrap_or(0.0)).sum();
         let gross_profit: f32 = winning_trades.iter().map(|t| t.pnl.unwrap_or(0.0)).sum();
@@ -317,21 +371,40 @@ impl BacktestEngine {
         let return_pct = (self.balance - self.initial_balance) / self.initial_balance * 100.0;
 
         // Exit reason breakdown
-        let sl_exits = self.trades.iter().filter(|t| t.exit_reason.as_deref() == Some("stop_loss")).count();
-        let tp_exits = self.trades.iter().filter(|t| t.exit_reason.as_deref() == Some("take_profit")).count();
+        let sl_exits = self
+            .trades
+            .iter()
+            .filter(|t| t.exit_reason.as_deref() == Some("stop_loss"))
+            .count();
+        let tp_exits = self
+            .trades
+            .iter()
+            .filter(|t| t.exit_reason.as_deref() == Some("take_profit"))
+            .count();
 
         println!("📊 PERFORMANCE SUMMARY");
         println!("   ─────────────────────────────────────");
         println!("   Initial Balance:    ${:>12.2}", self.initial_balance);
         println!("   Final Balance:      ${:>12.2}", self.balance);
-        println!("   Total P&L:          ${:>12.2} ({:+.2}%)", total_pnl, return_pct);
+        println!(
+            "   Total P&L:          ${:>12.2} ({:+.2}%)",
+            total_pnl, return_pct
+        );
         println!();
 
         println!("📈 TRADE STATISTICS");
         println!("   ─────────────────────────────────────");
         println!("   Total Trades:       {:>12}", total_trades);
-        println!("   Winning Trades:     {:>12} ({:.1}%)", winning_trades.len(), win_rate);
-        println!("   Losing Trades:      {:>12} ({:.1}%)", losing_trades.len(), 100.0 - win_rate);
+        println!(
+            "   Winning Trades:     {:>12} ({:.1}%)",
+            winning_trades.len(),
+            win_rate
+        );
+        println!(
+            "   Losing Trades:      {:>12} ({:.1}%)",
+            losing_trades.len(),
+            100.0 - win_rate
+        );
         println!();
         println!("   Gross Profit:       ${:>12.2}", gross_profit);
         println!("   Gross Loss:         ${:>12.2}", gross_loss);
@@ -343,8 +416,16 @@ impl BacktestEngine {
 
         println!("🎯 EXIT ANALYSIS");
         println!("   ─────────────────────────────────────");
-        println!("   Stop Loss Exits:    {:>12} ({:.1}%)", sl_exits, sl_exits as f32 / total_trades.max(1) as f32 * 100.0);
-        println!("   Take Profit Exits:  {:>12} ({:.1}%)", tp_exits, tp_exits as f32 / total_trades.max(1) as f32 * 100.0);
+        println!(
+            "   Stop Loss Exits:    {:>12} ({:.1}%)",
+            sl_exits,
+            sl_exits as f32 / total_trades.max(1) as f32 * 100.0
+        );
+        println!(
+            "   Take Profit Exits:  {:>12} ({:.1}%)",
+            tp_exits,
+            tp_exits as f32 / total_trades.max(1) as f32 * 100.0
+        );
         println!();
 
         // Calculate max drawdown
@@ -364,11 +445,23 @@ impl BacktestEngine {
 
         // Sharpe ratio approximation (assuming daily returns)
         if total_trades > 1 {
-            let returns: Vec<f32> = self.trades.iter().map(|t| t.pnl.unwrap_or(0.0) / self.initial_balance).collect();
+            let returns: Vec<f32> = self
+                .trades
+                .iter()
+                .map(|t| t.pnl.unwrap_or(0.0) / self.initial_balance)
+                .collect();
             let avg_return = returns.iter().sum::<f32>() / returns.len() as f32;
-            let variance: f32 = returns.iter().map(|r| (r - avg_return).powi(2)).sum::<f32>() / returns.len() as f32;
+            let variance: f32 = returns
+                .iter()
+                .map(|r| (r - avg_return).powi(2))
+                .sum::<f32>()
+                / returns.len() as f32;
             let std_dev = variance.sqrt();
-            let sharpe = if std_dev > 0.0 { avg_return / std_dev * (252_f32).sqrt() } else { 0.0 };
+            let sharpe = if std_dev > 0.0 {
+                avg_return / std_dev * (252_f32).sqrt()
+            } else {
+                0.0
+            };
             println!("   Sharpe Ratio (ann): {:>12.2}", sharpe);
         }
 
@@ -387,7 +480,9 @@ impl BacktestEngine {
         println!();
 
         // Count liquidations
-        let liquidations = self.trades.iter()
+        let liquidations = self
+            .trades
+            .iter()
             .filter(|t| t.exit_reason.as_deref() == Some("liquidation"))
             .count();
         if liquidations > 0 {
@@ -415,7 +510,7 @@ fn main() -> Result<()> {
     let args: Vec<String> = env::args().collect();
     let mut model_path = "data/charter_model.onnx".to_string();
     let mut data_path = "data/btc.csv".to_string();
-    let mut initial_balance = 10000.0f32;
+    let mut initial_balance = 100.0f32;
     let mut leverage = LEVERAGE;
 
     let mut i = 1;
@@ -430,7 +525,7 @@ fn main() -> Result<()> {
                 i += 2;
             }
             "--initial-balance" if i + 1 < args.len() => {
-                initial_balance = args[i + 1].parse().unwrap_or(10000.0);
+                initial_balance = args[i + 1].parse().unwrap_or(10.0);
                 i += 2;
             }
             "--leverage" if i + 1 < args.len() => {
@@ -457,137 +552,139 @@ fn main() -> Result<()> {
     let all_candles = load_candles_from_csv(&data_path)?;
     println!("✓ {} candles", all_candles.len());
 
-    // Use last 1.5M candles for backtest (~1042 days = ~149 weeks)
-    // This ensures we have enough 1w candles (>100 needed for TA)
-    let max_candles = 1_500_000;
-    let candles: Vec<Candle> = if all_candles.len() > max_candles {
+    // Use last N candles for backtest
+    let max_candles = 500_000; // ~347 days for comprehensive test
+    let candles_1m: Vec<Candle> = if all_candles.len() > max_candles {
         let skip = all_candles.len() - max_candles;
         all_candles[skip..].to_vec()
     } else {
         all_candles
     };
 
-    // Aggregate to timeframes
-    print!("📊 Aggregating timeframes... ");
-    let timeframes = vec![
-        Timeframe::Min1,
-        Timeframe::Min3,
-        Timeframe::Min5,
-        Timeframe::Min30,
-        Timeframe::Hour1,
-        Timeframe::Hour3,
-        Timeframe::Hour5,
-        Timeframe::Hour10,
-        Timeframe::Day1,
-        Timeframe::Week1,
-    ];
-    let mut timeframe_candles: Vec<Vec<Candle>> = Vec::new();
-    for tf in &timeframes {
-        timeframe_candles.push(aggregate_candles(&candles, *tf));
-    }
-    println!("✓");
-
-    // Run TA for each ML timeframe
-    print!("📈 Computing TA for ML timeframes... ");
-    let mut ta_data: Vec<(Vec<charter_ta::Level>, Vec<charter_ta::Trend>)> = vec![(vec![], vec![]); timeframes.len()];
-
-    for &tf_idx in &ML_TIMEFRAME_INDICES {
-        if tf_idx >= timeframe_candles.len() {
-            eprintln!("   Skipping tf_idx {} - out of range", tf_idx);
-            continue;
-        }
-        let tf_candles = &timeframe_candles[tf_idx];
-        if tf_candles.len() < MIN_CANDLES {
-            eprintln!("   Skipping tf_idx {} - only {} candles (need {})", tf_idx, tf_candles.len(), MIN_CANDLES);
-            continue;
-        }
-
-        let config = AnalyzerConfig::default();
-        let mut analyzer = Analyzer::with_config(config);
-        for candle in tf_candles {
-            analyzer.process_candle(*candle);
-        }
-        let levels = analyzer.all_levels().to_vec();
-        let trends = analyzer.all_trends().to_vec();
-        eprintln!("   tf_idx {}: {} candles -> {} levels, {} trends", tf_idx, tf_candles.len(), levels.len(), trends.len());
-        ta_data[tf_idx] = (levels, trends);
-    }
-    println!("✓");
+    // Create incremental multi-timeframe analyzer (FAST - no upfront computation)
+    print!("📊 Setting up incremental TA... ");
+    let timeframes = ml_export_timeframes(); // 1m, 5m, 30m, 1h, 1d
+    let config = AnalyzerConfig::default();
+    let mut mta = MultiTimeframeAnalyzer::new(timeframes.clone(), config);
+    println!(
+        "✓ ({} timeframes: {:?})",
+        timeframes.len(),
+        timeframes.iter().map(|t| t.label()).collect::<Vec<_>>()
+    );
 
     // Initialize backtest engine
     let mut engine = BacktestEngine::new(initial_balance, ml_inference);
 
-    // Use 5m as primary timeframe for trading
-    let primary_tf_idx = 2; // 5m
-    let primary_candles = &timeframe_candles[primary_tf_idx];
+    // RSI calculator
+    let mut rsi_calc = RsiState::new(14);
+    let mut vol_avg = VolumeAverage::new(100);
+
+    // We trade on 5-minute boundaries (every 5 1m candles)
+    let trade_interval_1m = 5; // Trade every 5 1m candles = 5 minutes
+    let warmup_1m = 2000; // Warmup in 1m candles
 
     println!();
-    println!("🚀 Running backtest on {} candles (~{} days)...",
-        primary_candles.len(),
-        primary_candles.len() / 288
+    println!(
+        "🚀 Running backtest on {} 1m candles (~{} days)...",
+        candles_1m.len(),
+        candles_1m.len() / 1440
     );
     println!();
 
     // Progress tracking
-    let total = primary_candles.len();
+    let total = candles_1m.len();
     let mut last_pct = 0;
     let mut features_extracted = 0;
     let mut features_failed = 0;
+    let mut prev_close = candles_1m.first().map(|c| c.close).unwrap_or(0.0);
 
-    // Skip warmup period and trade every N candles for speed
-    let warmup = MIN_CANDLES * 2;
-    let trade_interval = 5; // Only consider trades every 5 candles (25 min on 5m)
+    // Process 1m candles incrementally
+    for (idx, candle) in candles_1m.iter().enumerate() {
+        // Update TA incrementally (FAST)
+        mta.process_1m_candle(candle);
 
-    for (idx, candle) in primary_candles.iter().enumerate() {
+        // Update indicators
+        rsi_calc.update(candle.close);
+        vol_avg.update(candle.volume);
+
         // Skip warmup
-        if idx < warmup {
+        if idx < warmup_1m {
+            prev_close = candle.close;
             continue;
         }
 
+        // Calculate volume ratio for filters
+        let volume_ratio = vol_avg.normalized(candle.volume);
+
         // Always check for exits on open trades
         if engine.current_trade.is_some() {
-            engine.process_candle(candle, None, leverage)?;
+            engine.process_candle(candle, None, leverage, volume_ratio)?;
         }
 
-        // Only try to open new trades every N candles
-        if idx % trade_interval == 0 && engine.current_trade.is_none() {
-            let features = extract_features(
+        // Only try to open new trades every N 1m candles
+        if idx % trade_interval_1m == 0 && engine.current_trade.is_none() {
+            // Extract features from current MTA state
+            let features = extract_features_incremental(
                 candle,
-                idx,
-                &timeframe_candles,
-                &ta_data,
-                primary_candles,
+                &mta,
+                rsi_calc.value(),
+                volume_ratio,
+                prev_close,
             );
 
-            if features.is_some() {
-                features_extracted += 1;
-                engine.process_candle(candle, features.as_ref(), leverage)?;
+            if let Some(ref f) = features {
+                if f.timeframes.len() == 5 {
+                    features_extracted += 1;
+                    engine.process_candle(candle, features.as_ref(), leverage, volume_ratio)?;
+                } else {
+                    features_failed += 1;
+                }
             } else {
                 features_failed += 1;
             }
         }
 
+        prev_close = candle.close;
+
         // Progress with bankroll
         let pct = idx * 100 / total;
         if pct > last_pct && pct % 5 == 0 {
             let trades = engine.trades.len();
-            let open = if engine.current_trade.is_some() { " [OPEN]" } else { "" };
-            print!("\r   Progress: {:>3}% | Balance: ${:>10.2} | Trades: {:>4}{}",
-                   pct, engine.balance, trades, open);
+            let open = if engine.current_trade.is_some() {
+                " [OPEN]"
+            } else {
+                ""
+            };
+            print!(
+                "\r   Progress: {:>3}% | Balance: ${:>10.2} | Trades: {:>4}{}",
+                pct, engine.balance, trades, open
+            );
             std::io::Write::flush(&mut std::io::stdout())?;
             last_pct = pct;
         }
     }
 
     // Close any open trade at end
-    if let Some(last_candle) = primary_candles.last() {
+    if let Some(last_candle) = candles_1m.last() {
         engine.close_open_trade(last_candle);
     }
 
     println!("\r   Progress: 100%");
     println!();
-    println!("📊 Feature extraction: {} succeeded, {} failed", features_extracted, features_failed);
-    println!("   Total predictions attempted: {}", engine.total_predictions);
+    println!(
+        "📊 Feature extraction: {} succeeded, {} failed",
+        features_extracted, features_failed
+    );
+    println!(
+        "   Total predictions attempted: {}",
+        engine.total_predictions
+    );
+
+    // Print TA stats
+    println!("📈 TA Statistics:");
+    for (tf, levels, trends) in mta.ta_counts() {
+        println!("   • {}: {} levels, {} trends", tf.label(), levels, trends);
+    }
 
     // Print results
     engine.print_results();
@@ -602,8 +699,165 @@ fn main() -> Result<()> {
     Ok(())
 }
 
+// ============================================================================
+// Incremental Indicator Calculators
+// ============================================================================
+
+/// Incremental RSI calculator using Wilder's smoothing.
+struct RsiState {
+    period: usize,
+    avg_gain: f32,
+    avg_loss: f32,
+    prev_close: f32,
+    count: usize,
+    gains: Vec<f32>,
+    losses: Vec<f32>,
+}
+
+impl RsiState {
+    fn new(period: usize) -> Self {
+        Self {
+            period,
+            avg_gain: 0.0,
+            avg_loss: 0.0,
+            prev_close: 0.0,
+            count: 0,
+            gains: Vec::with_capacity(period),
+            losses: Vec::with_capacity(period),
+        }
+    }
+
+    fn update(&mut self, close: f32) {
+        if self.count == 0 {
+            self.prev_close = close;
+            self.count = 1;
+            return;
+        }
+
+        let change = close - self.prev_close;
+        let gain = if change > 0.0 { change } else { 0.0 };
+        let loss = if change < 0.0 { -change } else { 0.0 };
+        self.prev_close = close;
+
+        if self.count <= self.period {
+            self.gains.push(gain);
+            self.losses.push(loss);
+            self.count += 1;
+
+            if self.count == self.period + 1 {
+                self.avg_gain = self.gains.iter().sum::<f32>() / self.period as f32;
+                self.avg_loss = self.losses.iter().sum::<f32>() / self.period as f32;
+                self.gains.clear();
+                self.losses.clear();
+            }
+        } else {
+            self.avg_gain = (self.avg_gain * (self.period - 1) as f32 + gain) / self.period as f32;
+            self.avg_loss = (self.avg_loss * (self.period - 1) as f32 + loss) / self.period as f32;
+            self.count += 1;
+        }
+    }
+
+    fn value(&self) -> f32 {
+        if self.count <= self.period {
+            return 0.5;
+        }
+        if self.avg_loss == 0.0 {
+            return 1.0;
+        }
+        let rs = self.avg_gain / self.avg_loss;
+        let rsi = 100.0 - (100.0 / (1.0 + rs));
+        rsi / 100.0
+    }
+}
+
+/// Rolling volume average calculator.
+struct VolumeAverage {
+    window: Vec<f32>,
+    window_size: usize,
+    sum: f32,
+    idx: usize,
+    filled: bool,
+}
+
+impl VolumeAverage {
+    fn new(window_size: usize) -> Self {
+        Self {
+            window: vec![0.0; window_size],
+            window_size,
+            sum: 0.0,
+            idx: 0,
+            filled: false,
+        }
+    }
+
+    fn update(&mut self, volume: f32) {
+        self.sum -= self.window[self.idx];
+        self.window[self.idx] = volume;
+        self.sum += volume;
+        self.idx = (self.idx + 1) % self.window_size;
+        if self.idx == 0 {
+            self.filled = true;
+        }
+    }
+
+    fn normalized(&self, current_volume: f32) -> f32 {
+        let count = if self.filled {
+            self.window_size
+        } else {
+            self.idx.max(1)
+        };
+        let avg = self.sum / count as f32;
+        if avg > 0.0 { current_volume / avg } else { 1.0 }
+    }
+}
+
+/// Extract ML features from incremental multi-timeframe analyzer.
+fn extract_features_incremental(
+    candle: &Candle,
+    mta: &MultiTimeframeAnalyzer,
+    rsi: f32,
+    volume_normalized: f32,
+    prev_close: f32,
+) -> Option<MlFeatures> {
+    let current_price = candle.close;
+
+    // Extract features from each timeframe
+    let tf_features = mta.extract_all_features(current_price);
+
+    // Need all 5 timeframes
+    if tf_features.len() != 5 {
+        return None;
+    }
+
+    // Calculate global features
+    let price_change = if prev_close > 0.0 {
+        (candle.close - prev_close) / prev_close
+    } else {
+        0.0
+    };
+
+    let body = (candle.close - candle.open).abs();
+    let range = candle.high - candle.low;
+    let body_ratio = if range > 0.0 { body / range } else { 0.5 };
+
+    Some(MlFeatures {
+        timeframes: tf_features,
+        current_price,
+        current_volume_normalized: volume_normalized,
+        price_change_normalized: price_change,
+        body_ratio,
+        is_bullish: if candle.close > candle.open { 1.0 } else { 0.0 },
+        rsi_14: rsi,
+    })
+}
+
+// ============================================================================
+// Legacy RSI function (kept for reference)
+// ============================================================================
+
 /// Calculate RSI (Relative Strength Index) for a given candle index.
 /// Returns value normalized to 0-1 range (typical RSI is 0-100, so we divide by 100).
+#[allow(dead_code)]
 fn calculate_rsi(candles: &[Candle], current_idx: usize, period: usize) -> f32 {
     if current_idx < period + 1 || candles.is_empty() {
         return 0.5; // Neutral if not enough data
@@ -658,6 +912,7 @@ fn calculate_rsi(candles: &[Candle], current_idx: usize, period: usize) -> f32 {
 }
 
 /// Extract ML features for a candle.
+#[allow(dead_code)]
 fn extract_features(
     candle: &Candle,
     candle_idx: usize,
@@ -707,8 +962,8 @@ fn extract_features(
         tf_features.push(features);
     }
 
-    // Need all 4 timeframes for the model (302 features = 4 × 74 + 6 with RSI)
-    if tf_features.len() != 4 {
+    // Need all 5 timeframes for the model (376 features = 5 × 74 + 6 with RSI)
+    if tf_features.len() != 5 {
         return None;
     }
 
@@ -758,6 +1013,7 @@ fn extract_features(
     })
 }
 
+#[allow(dead_code)]
 fn find_candle_index(candles: &[Candle], timestamp: f64) -> Option<usize> {
     if candles.is_empty() {
         return None;
@@ -775,7 +1031,9 @@ fn find_candle_index(candles: &[Candle], timestamp: f64) -> Option<usize> {
         }
     }
 
-    if lo > 0 && (candles[lo].timestamp - timestamp).abs() > (candles[lo - 1].timestamp - timestamp).abs() {
+    if lo > 0
+        && (candles[lo].timestamp - timestamp).abs() > (candles[lo - 1].timestamp - timestamp).abs()
+    {
         Some(lo - 1)
     } else {
         Some(lo)

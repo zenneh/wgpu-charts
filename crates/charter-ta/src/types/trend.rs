@@ -519,6 +519,7 @@ mod tests {
         }
     }
 
+    #[allow(dead_code)]
     fn make_bullish_range(id: u64, start: usize, end: usize, first_high: f32, last_high: f32) -> Range {
         Range {
             id: super::super::range::RangeId::new(id),
