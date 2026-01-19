@@ -323,10 +323,10 @@ pub fn show_ta_panel(
                         };
 
                         // Draw prediction box
-                        egui::Frame::none()
+                        egui::Frame::new()
                             .fill(bg_color)
                             .inner_margin(4.0)
-                            .rounding(4.0)
+                            .corner_radius(4.0)
                             .show(ui, |ui| {
                                 ui.horizontal(|ui| {
                                     ui.colored_label(dir_color, format!("{} {}", arrow, dir_text));

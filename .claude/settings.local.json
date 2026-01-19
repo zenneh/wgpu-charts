@@ -26,7 +26,12 @@
       "WebFetch(domain:www.mexc.com)",
       "WebSearch",
       "Bash(git clone:*)",
-      "WebFetch(domain:mexcdevelop.github.io)"
+      "WebFetch(domain:mexcdevelop.github.io)",
+      "Bash(curl:*)",
+      "Bash(START_TIME=1761058764382:*)",
+      "Bash(END_TIME=1768834764382:*)",
+      "WebFetch(domain:raw.githubusercontent.com)",
+      "WebFetch(domain:github.com)"
     ]
   }
 }

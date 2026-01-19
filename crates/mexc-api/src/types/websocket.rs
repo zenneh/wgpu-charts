@@ -86,41 +86,62 @@ pub struct WsTradesData {
     pub event: String,
 }
 
-/// WebSocket kline data.
+/// WebSocket kline data (new MEXC V3 format).
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct WsKline {
-    /// Open time.
-    #[serde(rename = "t")]
+    /// Open time (window start).
+    #[serde(alias = "t", alias = "windowstart")]
     pub time: i64,
     /// Open price.
-    #[serde(rename = "o")]
+    #[serde(alias = "o", alias = "openingprice")]
     pub open: StringDecimal,
     /// High price.
-    #[serde(rename = "h")]
+    #[serde(alias = "h", alias = "highestprice")]
     pub high: StringDecimal,
     /// Low price.
-    #[serde(rename = "l")]
+    #[serde(alias = "l", alias = "lowestprice")]
     pub low: StringDecimal,
     /// Close price.
-    #[serde(rename = "c")]
+    #[serde(alias = "c", alias = "closingprice")]
     pub close: StringDecimal,
     /// Volume.
-    #[serde(rename = "v")]
+    #[serde(alias = "v", alias = "volume")]
     pub volume: StringDecimal,
-    /// Quote volume.
-    #[serde(rename = "a")]
+    /// Quote volume (amount).
+    #[serde(alias = "a", alias = "amount", default)]
     pub quote_volume: StringDecimal,
+    /// Interval (new format).
+    #[serde(default)]
+    pub interval: Option<String>,
+    /// Window end (new format).
+    #[serde(alias = "windowend", default)]
+    pub window_end: Option<i64>,
 }
 
-/// WebSocket kline data wrapper.
+/// WebSocket kline data wrapper (old format).
 #[derive(Debug, Clone, Deserialize)]
 pub struct WsKlineData {
-    /// Kline data.
+    /// Kline data (old format).
     #[serde(rename = "k")]
     pub kline: WsKline,
     /// Event type.
     #[serde(rename = "e")]
     pub event: String,
+}
+
+/// WebSocket kline data wrapper (new MEXC V3 format with pb suffix).
+#[derive(Debug, Clone, Deserialize)]
+pub struct WsKlineDataV3 {
+    /// Channel name.
+    pub channel: String,
+    /// Symbol.
+    pub symbol: String,
+    /// Kline data (named publicspotkline in new format).
+    #[serde(rename = "publicspotkline")]
+    pub kline: WsKline,
+    /// Create time.
+    #[serde(rename = "createtime")]
+    pub create_time: i64,
 }
 
 /// WebSocket depth update.
@@ -438,25 +459,45 @@ pub enum WsChannel {
 }
 
 impl WsChannel {
-    /// Get the channel string for subscription.
+    /// Get the channel string for subscription (MEXC V3 protobuf format with .pb suffix).
     pub fn to_channel_string(&self) -> String {
         match self {
-            WsChannel::Trades(symbol) => format!("spot@public.deals.v3.api@{symbol}"),
+            WsChannel::Trades(symbol) => format!("spot@public.deals.v3.api.pb@{symbol}"),
             WsChannel::Klines(symbol, interval) => {
-                format!("spot@public.kline.v3.api@{symbol}@{interval}")
+                // Convert interval format: "1m" -> "Min1", "1h" -> "Min60", "1d" -> "Day1"
+                let mexc_interval = Self::convert_interval(interval);
+                format!("spot@public.kline.v3.api.pb@{symbol}@{mexc_interval}")
             }
             WsChannel::DepthIncremental(symbol) => {
-                format!("spot@public.increase.depth.v3.api@{symbol}")
+                format!("spot@public.increase.depth.v3.api.pb@{symbol}")
             }
             WsChannel::DepthLimit(symbol, levels) => {
-                format!("spot@public.limit.depth.v3.api@{symbol}@{levels}")
+                format!("spot@public.limit.depth.v3.api.pb@{symbol}@{levels}")
             }
-            WsChannel::MiniTicker(symbol) => format!("spot@public.miniTicker.v3.api@{symbol}"),
-            WsChannel::AllMiniTickers => "spot@public.miniTickers.v3.api".to_string(),
-            WsChannel::BookTicker(symbol) => format!("spot@public.bookTicker.v3.api@{symbol}"),
+            WsChannel::MiniTicker(symbol) => format!("spot@public.miniTicker.v3.api.pb@{symbol}"),
+            WsChannel::AllMiniTickers => "spot@public.miniTickers.v3.api.pb".to_string(),
+            WsChannel::BookTicker(symbol) => format!("spot@public.bookTicker.v3.api.pb@{symbol}"),
             WsChannel::Account => "spot@private.account.v3.api".to_string(),
             WsChannel::Orders => "spot@private.orders.v3.api".to_string(),
             WsChannel::Trades24h => "spot@private.deals.v3.api".to_string(),
+        }
+    }
+
+    /// Convert standard interval format to MEXC format.
+    /// "1m" -> "Min1", "5m" -> "Min5", "1h" -> "Min60", "4h" -> "Hour4", "1d" -> "Day1"
+    fn convert_interval(interval: &str) -> String {
+        match interval {
+            "1m" => "Min1".to_string(),
+            "5m" => "Min5".to_string(),
+            "15m" => "Min15".to_string(),
+            "30m" => "Min30".to_string(),
+            "60m" | "1h" => "Min60".to_string(),
+            "4h" => "Hour4".to_string(),
+            "8h" => "Hour8".to_string(),
+            "1d" => "Day1".to_string(),
+            "1w" => "Week1".to_string(),
+            "1M" => "Month1".to_string(),
+            other => other.to_string(), // Pass through if already in correct format
         }
     }
 }

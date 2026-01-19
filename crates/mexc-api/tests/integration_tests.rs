@@ -130,12 +130,12 @@ mod types {
         assert_eq!(canceled, OrderStatus::Canceled);
     }
 
-    /// Test KlineInterval serialization.
+    /// Test KlineInterval serialization (MEXC uses different interval strings).
     #[test]
     fn test_kline_interval() {
         assert_eq!(KlineInterval::OneMinute.to_string(), "1m");
         assert_eq!(KlineInterval::FiveMinutes.to_string(), "5m");
-        assert_eq!(KlineInterval::OneHour.to_string(), "1h");
+        assert_eq!(KlineInterval::OneHour.to_string(), "60m"); // MEXC uses 60m, not 1h
         assert_eq!(KlineInterval::OneDay.to_string(), "1d");
         assert_eq!(KlineInterval::OneMonth.to_string(), "1M");
     }
@@ -148,28 +148,41 @@ mod types {
         assert_eq!(TimeInForce::Fok.to_string(), "FOK");
     }
 
-    /// Test Kline deserialization from array.
+    /// Test Kline deserialization from array (MEXC format with 8 fields).
     #[test]
     fn test_kline_deserialization() {
+        // MEXC returns 8 fields: [open_time, open, high, low, close, volume, close_time, quote_volume]
         let json = r#"[
-            1704067200000,
-            "50000.00",
-            "50100.00",
-            "49900.00",
-            "50050.00",
-            "100.5",
-            1704070800000,
-            "5025000.00",
-            150,
-            "60.5",
-            "3030000.00",
-            "0"
+            1768834140000,
+            "92870.25",
+            "92882.81",
+            "92854.19",
+            "92879.11",
+            "4.0603234",
+            1768834200000,
+            "377031.46"
         ]"#;
 
         let kline: Kline = serde_json::from_str(json).unwrap();
-        assert_eq!(kline.open_time, 1704067200000);
-        assert_eq!(kline.close_time, 1704070800000);
-        assert_eq!(kline.trades, 150);
+        assert_eq!(kline.open_time, 1768834140000);
+        assert_eq!(kline.close_time, 1768834200000);
+        // These fields are not provided by MEXC, so they default to 0
+        assert_eq!(kline.trades, 0);
+    }
+
+    /// Test Kline array deserialization (multiple klines).
+    #[test]
+    fn test_kline_array_deserialization() {
+        // Real MEXC API response format
+        let json = r#"[
+            [1768834140000,"92870.25","92882.81","92854.19","92879.11","4.0603234",1768834200000,"377031.46"],
+            [1768834200000,"92879.11","92910.64","92874.99","92889.37","4.34657083",1768834260000,"403746.24"]
+        ]"#;
+
+        let klines: Vec<Kline> = serde_json::from_str(json).unwrap();
+        assert_eq!(klines.len(), 2);
+        assert_eq!(klines[0].open_time, 1768834140000);
+        assert_eq!(klines[1].open_time, 1768834200000);
     }
 
     /// Test Balance total calculation.
@@ -184,37 +197,38 @@ mod types {
         assert_eq!(balance.total(), Decimal::from_str("2.0").unwrap());
     }
 
-    /// Test WsChannel string generation.
+    /// Test WsChannel string generation (V3 protobuf format with .pb suffix).
     #[test]
     fn test_ws_channel_strings() {
         assert_eq!(
             WsChannel::Trades("BTCUSDT".to_string()).to_channel_string(),
-            "spot@public.deals.v3.api@BTCUSDT"
+            "spot@public.deals.v3.api.pb@BTCUSDT"
         );
 
+        // Klines channel converts interval format (1m -> Min1)
         assert_eq!(
             WsChannel::Klines("BTCUSDT".to_string(), "1m".to_string()).to_channel_string(),
-            "spot@public.kline.v3.api@BTCUSDT@1m"
+            "spot@public.kline.v3.api.pb@BTCUSDT@Min1"
         );
 
         assert_eq!(
             WsChannel::DepthIncremental("BTCUSDT".to_string()).to_channel_string(),
-            "spot@public.increase.depth.v3.api@BTCUSDT"
+            "spot@public.increase.depth.v3.api.pb@BTCUSDT"
         );
 
         assert_eq!(
             WsChannel::DepthLimit("BTCUSDT".to_string(), 20).to_channel_string(),
-            "spot@public.limit.depth.v3.api@BTCUSDT@20"
+            "spot@public.limit.depth.v3.api.pb@BTCUSDT@20"
         );
 
         assert_eq!(
             WsChannel::MiniTicker("BTCUSDT".to_string()).to_channel_string(),
-            "spot@public.miniTicker.v3.api@BTCUSDT"
+            "spot@public.miniTicker.v3.api.pb@BTCUSDT"
         );
 
         assert_eq!(
             WsChannel::AllMiniTickers.to_channel_string(),
-            "spot@public.miniTickers.v3.api"
+            "spot@public.miniTickers.v3.api.pb"
         );
     }
 }

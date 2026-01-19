@@ -118,6 +118,7 @@
 pub mod client;
 pub mod config;
 pub mod error;
+pub mod proto;
 pub mod rate_limit;
 pub mod spot;
 pub mod types;
@@ -140,7 +141,7 @@ pub const SPOT_BASE_URL: &str = "https://api.mexc.com";
 pub const FUTURES_BASE_URL: &str = "https://contract.mexc.com";
 
 /// WebSocket URL for MEXC Spot streams
-pub const SPOT_WS_URL: &str = "wss://wbs.mexc.com/ws";
+pub const SPOT_WS_URL: &str = "wss://wbs-api.mexc.com/ws";
 
 /// WebSocket URL for MEXC Futures streams
 pub const FUTURES_WS_URL: &str = "wss://contract.mexc.com/edge";

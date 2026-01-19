@@ -176,6 +176,7 @@ pub struct Kline {
 }
 
 // Custom deserializer for Kline since it comes as an array
+// MEXC returns 8 fields: [open_time, open, high, low, close, volume, close_time, quote_volume]
 impl<'de> Deserialize<'de> for Kline {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
@@ -185,8 +186,12 @@ impl<'de> Deserialize<'de> for Kline {
 
         let arr: Vec<serde_json::Value> = Vec::deserialize(deserializer)?;
 
-        if arr.len() < 11 {
-            return Err(D::Error::custom("kline array too short"));
+        // MEXC returns 8 fields, not 11 like Binance
+        if arr.len() < 8 {
+            return Err(D::Error::custom(format!(
+                "kline array too short: expected 8, got {}",
+                arr.len()
+            )));
         }
 
         let parse_decimal = |v: &serde_json::Value| -> Result<StringDecimal, D::Error> {
@@ -212,6 +217,8 @@ impl<'de> Deserialize<'de> for Kline {
                 .ok_or_else(|| D::Error::custom("expected integer"))
         };
 
+        // MEXC format: [open_time, open, high, low, close, volume, close_time, quote_volume]
+        // Fields 8-10 (trades, taker volumes) are not provided by MEXC, so we default them
         Ok(Kline {
             open_time: parse_i64(&arr[0])?,
             open: parse_decimal(&arr[1])?,
@@ -221,9 +228,10 @@ impl<'de> Deserialize<'de> for Kline {
             volume: parse_decimal(&arr[5])?,
             close_time: parse_i64(&arr[6])?,
             quote_volume: parse_decimal(&arr[7])?,
-            trades: parse_i64(&arr[8])?,
-            taker_buy_base_volume: parse_decimal(&arr[9])?,
-            taker_buy_quote_volume: parse_decimal(&arr[10])?,
+            // These fields are not provided by MEXC
+            trades: 0,
+            taker_buy_base_volume: StringDecimal(rust_decimal::Decimal::ZERO),
+            taker_buy_quote_volume: StringDecimal(rust_decimal::Decimal::ZERO),
         })
     }
 }

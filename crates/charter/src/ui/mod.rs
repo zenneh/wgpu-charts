@@ -9,8 +9,10 @@
 
 mod loading_overlay;
 mod macd_panel;
+mod symbol_picker;
 mod ta_panel;
 
 pub use loading_overlay::show_loading_overlay;
 pub use macd_panel::{show_macd_panel, MacdPanelResponse};
+pub use symbol_picker::{show_symbol_picker, SymbolPickerState};
 pub use ta_panel::{show_ta_panel, TaHoveredInfo};

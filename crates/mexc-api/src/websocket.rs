@@ -10,9 +10,10 @@ use tokio_tungstenite::{connect_async, tungstenite::Message};
 
 use crate::config::WsConfig;
 use crate::error::{Error, Result};
+use crate::proto::{self, push_data_body};
 use crate::types::{
-    WsBookTicker, WsChannel, WsDepthData, WsEvent, WsKlineData, WsMiniTicker, WsSubscription,
-    WsTradesData,
+    StringDecimal, WsBookTicker, WsChannel, WsDepthData, WsEvent, WsKline, WsKlineData,
+    WsMiniTicker, WsSubscription, WsTradesData,
 };
 
 /// WebSocket connection state.
@@ -88,17 +89,17 @@ impl SpotWebSocket {
             run_connection(config, state, subscriptions, command_rx, event_tx).await;
         });
 
-        // Wait for connection to be established
+        // Wait for connection to be established (up to 15 seconds)
         let mut attempts = 0;
-        while attempts < 50 {
+        while attempts < 150 {
             let current_state = *self.state.lock().await;
             if current_state == ConnectionState::Connected {
                 return Ok(event_rx);
             }
-            if current_state == ConnectionState::Disconnected && attempts > 10 {
+            if current_state == ConnectionState::Disconnected && attempts > 50 {
                 return Err(Error::ConnectionClosed);
             }
-            tokio::time::sleep(Duration::from_millis(100)).await;
+            tokio::time::sleep(Duration::from_millis(10)).await;
             attempts += 1;
         }
 
@@ -243,7 +244,17 @@ async fn run_connection(
                 msg = read.next() => {
                     match msg {
                         Some(Ok(Message::Text(text))) => {
+                            // JSON text message (subscription acks, etc.)
                             if let Some(event) = parse_message(&text) {
+                                if event_tx.send(event).await.is_err() {
+                                    tracing::warn!("Event receiver dropped");
+                                    return;
+                                }
+                            }
+                        }
+                        Some(Ok(Message::Binary(data))) => {
+                            // Protobuf binary message (market data)
+                            if let Some(event) = parse_protobuf_message(&data) {
                                 if event_tx.send(event).await.is_err() {
                                     tracing::warn!("Event receiver dropped");
                                     return;
@@ -330,7 +341,38 @@ fn parse_message(text: &str) -> Option<WsEvent> {
         return Some(WsEvent::Pong);
     }
 
-    // Get channel name
+    // Try new V3 format first (with "channel" key instead of "c")
+    if let Some(channel) = value.get("channel").and_then(|c| c.as_str()) {
+        let timestamp = value.get("createtime").and_then(|t| t.as_i64()).unwrap_or(0);
+        let symbol = value
+            .get("symbol")
+            .and_then(|s| s.as_str())
+            .map(|s| s.to_string())
+            .unwrap_or_default();
+
+        // Parse kline in new V3 format
+        if channel.contains("kline") {
+            if let Some(kline_data) = value.get("publicspotkline") {
+                if let Ok(kline) = serde_json::from_value::<WsKline>(kline_data.clone()) {
+                    // Extract interval from channel name (e.g., ...@Min1)
+                    let interval = channel.split('@').last().unwrap_or("Min1").to_string();
+                    return Some(WsEvent::Kline {
+                        symbol,
+                        interval,
+                        kline,
+                        timestamp,
+                    });
+                }
+            }
+        }
+
+        // Return unknown for other V3 messages we don't handle yet
+        return Some(WsEvent::Unknown {
+            raw: text.to_string(),
+        });
+    }
+
+    // Fall back to old format (with "c" key)
     let channel = value.get("c")?.as_str()?;
     let timestamp = value.get("t").and_then(|t| t.as_i64()).unwrap_or(0);
     let symbol = value
@@ -382,6 +424,47 @@ fn parse_message(text: &str) -> Option<WsEvent> {
     Some(WsEvent::Unknown {
         raw: text.to_string(),
     })
+}
+
+/// Parse a binary protobuf WebSocket message into an event.
+fn parse_protobuf_message(data: &[u8]) -> Option<WsEvent> {
+    use prost::Message;
+
+    // Try to decode the wrapper message
+    let wrapper = proto::PushDataV3ApiWrapper::decode(data).ok()?;
+
+    let channel = wrapper.channel.clone();
+    let symbol = wrapper.symbol.unwrap_or_default();
+    let timestamp = wrapper.create_time.unwrap_or(0);
+
+    // Check the body type
+    match wrapper.body? {
+        push_data_body::Body::PublicSpotKline(kline_data) => {
+            // Convert protobuf kline to WsKline
+            let kline = WsKline {
+                time: kline_data.window_start,
+                open: StringDecimal::from_string(kline_data.opening_price),
+                high: StringDecimal::from_string(kline_data.highest_price),
+                low: StringDecimal::from_string(kline_data.lowest_price),
+                close: StringDecimal::from_string(kline_data.closing_price),
+                volume: StringDecimal::from_string(kline_data.volume),
+                quote_volume: StringDecimal::from_string(kline_data.amount),
+                interval: Some(kline_data.interval.clone()),
+                window_end: Some(kline_data.window_end),
+            };
+
+            Some(WsEvent::Kline {
+                symbol,
+                interval: kline_data.interval,
+                kline,
+                timestamp,
+            })
+        }
+        // Other message types not fully implemented yet
+        _ => Some(WsEvent::Unknown {
+            raw: format!("Protobuf channel: {}", channel),
+        }),
+    }
 }
 
 /// Builder for subscribing to multiple channels.
@@ -513,19 +596,37 @@ mod tests {
 
     #[test]
     fn test_channel_strings() {
+        // V3 protobuf format with .pb suffix
         assert_eq!(
             WsChannel::Trades("BTCUSDT".to_string()).to_channel_string(),
-            "spot@public.deals.v3.api@BTCUSDT"
+            "spot@public.deals.v3.api.pb@BTCUSDT"
         );
 
+        // Klines channel with interval conversion (1m -> Min1)
         assert_eq!(
             WsChannel::Klines("BTCUSDT".to_string(), "1m".to_string()).to_channel_string(),
-            "spot@public.kline.v3.api@BTCUSDT@1m"
+            "spot@public.kline.v3.api.pb@BTCUSDT@Min1"
         );
 
         assert_eq!(
             WsChannel::DepthLimit("BTCUSDT".to_string(), 20).to_channel_string(),
-            "spot@public.limit.depth.v3.api@BTCUSDT@20"
+            "spot@public.limit.depth.v3.api.pb@BTCUSDT@20"
+        );
+    }
+
+    #[test]
+    fn test_interval_conversion() {
+        assert_eq!(
+            WsChannel::Klines("BTC".to_string(), "5m".to_string()).to_channel_string(),
+            "spot@public.kline.v3.api.pb@BTC@Min5"
+        );
+        assert_eq!(
+            WsChannel::Klines("BTC".to_string(), "1h".to_string()).to_channel_string(),
+            "spot@public.kline.v3.api.pb@BTC@Min60"
+        );
+        assert_eq!(
+            WsChannel::Klines("BTC".to_string(), "1d".to_string()).to_channel_string(),
+            "spot@public.kline.v3.api.pb@BTC@Day1"
         );
     }
 

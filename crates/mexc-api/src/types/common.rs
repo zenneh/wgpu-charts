@@ -110,6 +110,8 @@ impl std::fmt::Display for TimeInForce {
 }
 
 /// Kline/candlestick interval.
+/// Note: MEXC uses different interval strings than other exchanges.
+/// For example, hourly is "60m" not "1h".
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Deserialize, Serialize)]
 pub enum KlineInterval {
     /// 1 minute
@@ -124,20 +126,20 @@ pub enum KlineInterval {
     /// 30 minutes
     #[serde(rename = "30m")]
     ThirtyMinutes,
-    /// 1 hour
-    #[serde(rename = "1h")]
+    /// 1 hour (60m for MEXC)
+    #[serde(rename = "60m")]
     OneHour,
-    /// 4 hours
+    /// 4 hours (4h for MEXC)
     #[serde(rename = "4h")]
     FourHours,
-    /// 12 hours
-    #[serde(rename = "12h")]
-    TwelveHours,
+    /// 8 hours (8h for MEXC)
+    #[serde(rename = "8h")]
+    EightHours,
     /// 1 day
     #[serde(rename = "1d")]
     OneDay,
     /// 1 week
-    #[serde(rename = "1w")]
+    #[serde(rename = "1W")]
     OneWeek,
     /// 1 month
     #[serde(rename = "1M")]
@@ -151,11 +153,11 @@ impl std::fmt::Display for KlineInterval {
             KlineInterval::FiveMinutes => write!(f, "5m"),
             KlineInterval::FifteenMinutes => write!(f, "15m"),
             KlineInterval::ThirtyMinutes => write!(f, "30m"),
-            KlineInterval::OneHour => write!(f, "1h"),
+            KlineInterval::OneHour => write!(f, "60m"),
             KlineInterval::FourHours => write!(f, "4h"),
-            KlineInterval::TwelveHours => write!(f, "12h"),
+            KlineInterval::EightHours => write!(f, "8h"),
             KlineInterval::OneDay => write!(f, "1d"),
-            KlineInterval::OneWeek => write!(f, "1w"),
+            KlineInterval::OneWeek => write!(f, "1W"),
             KlineInterval::OneMonth => write!(f, "1M"),
         }
     }
@@ -191,6 +193,11 @@ impl StringDecimal {
     /// Create a new StringDecimal.
     pub fn new(value: Decimal) -> Self {
         Self(value)
+    }
+
+    /// Create a StringDecimal from a string.
+    pub fn from_string(s: String) -> Self {
+        Self(s.parse().unwrap_or_default())
     }
 
     /// Get the inner Decimal value.

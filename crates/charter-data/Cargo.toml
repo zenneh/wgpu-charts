@@ -7,3 +7,6 @@ edition.workspace = true
 charter-core.workspace = true
 csv.workspace = true
 anyhow.workspace = true
+mexc-api = { path = "../mexc-api" }
+tokio = { version = "1", features = ["rt-multi-thread", "sync", "time"] }
+rust_decimal = "1"

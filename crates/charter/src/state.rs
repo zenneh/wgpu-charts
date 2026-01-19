@@ -6,6 +6,7 @@ use std::sync::Arc;
 use std::thread;
 use std::time::Instant;
 
+use tokio::sync::mpsc as tokio_mpsc;
 use winit::{
     event::{ElementState, MouseButton, MouseScrollDelta},
     event_loop::ActiveEventLoop,
@@ -16,10 +17,12 @@ use winit::{
 use crate::indicators::{DynMacd, IndicatorGpuBuffers, IndicatorRegistry, MacdGpuBuffers};
 use crate::input::{InputAction, InputHandler};
 use crate::replay::{ReplayManager, TimeframeTaData};
-use crate::ui::{show_loading_overlay, show_macd_panel, show_ta_panel, MacdPanelResponse, TaHoveredInfo};
+use crate::ui::{
+    show_loading_overlay, show_macd_panel, show_ta_panel,
+    MacdPanelResponse, SymbolPickerState, TaHoveredInfo,
+};
 use charter_core::{aggregate_candles, Candle, Timeframe};
-use charter_data::CsvLoader;
-use charter_data::DataSource;
+use charter_data::{LiveDataEvent, LiveDataManager, MexcSource};
 use charter_indicators::{Indicator, Macd, MacdConfig};
 use charter_render::{
     ChartRenderer, IndicatorParams, IndicatorPointGpu, LevelGpu, RangeGpu, RenderParams,
@@ -39,6 +42,8 @@ pub enum LoadingState {
     Idle,
     /// Loading data from file.
     LoadingData,
+    /// Fetching data from MEXC API.
+    FetchingMexcData { symbol: String },
     /// Aggregating timeframes.
     AggregatingTimeframes { current: usize, total: usize },
     /// Creating GPU buffers.
@@ -58,6 +63,9 @@ impl LoadingState {
         match self {
             LoadingState::Idle => String::new(),
             LoadingState::LoadingData => "Loading data...".to_string(),
+            LoadingState::FetchingMexcData { symbol } => {
+                format!("Fetching {} from MEXC...", symbol)
+            }
             LoadingState::AggregatingTimeframes { current, total } => {
                 format!("Aggregating timeframes ({}/{})", current, total)
             }
@@ -76,7 +84,7 @@ impl LoadingState {
 
 /// Messages sent from background threads.
 pub enum BackgroundMessage {
-    /// Data loaded from file.
+    /// Data loaded from file or API.
     DataLoaded(Vec<Candle>),
     /// A timeframe has been aggregated.
     TimeframeAggregated { index: usize, candles: Vec<Candle> },
@@ -91,6 +99,10 @@ pub enum BackgroundMessage {
     MlTaProgress { completed: usize, total: usize },
     /// Loading state update.
     LoadingStateChanged(LoadingState),
+    /// Live candle update from WebSocket.
+    LiveCandleUpdate { candle: Candle, is_closed: bool },
+    /// WebSocket connection status changed.
+    ConnectionStatus(bool),
     /// Error occurred.
     Error(String),
 }
@@ -188,6 +200,14 @@ pub struct State {
 
     // ML inference (optional - loaded if model exists)
     pub ml_inference: Option<MlInferenceHandle>,
+
+    // MEXC integration
+    pub current_symbol: String,
+    pub live_event_rx: Option<tokio_mpsc::Receiver<LiveDataEvent>>,
+    pub ws_connected: bool,
+    pub show_symbol_picker: bool,
+    pub symbol_picker_state: SymbolPickerState,
+    tokio_runtime: Option<tokio::runtime::Runtime>,
 }
 
 impl State {
@@ -249,16 +269,28 @@ impl State {
             desired_maximum_frame_latency: 2,
         };
 
-        // Start background data loading
-        let sender = bg_sender.clone();
-        thread::spawn(move || {
-            let _ = sender.send(BackgroundMessage::LoadingStateChanged(LoadingState::LoadingData));
+        // Create tokio runtime for async MEXC operations
+        let tokio_runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .expect("Failed to create tokio runtime");
 
-            // Load data
-            let loader = CsvLoader::new("data/btc-new.csv");
-            match loader.load() {
+        // Default symbol
+        let default_symbol = "BTCUSDT".to_string();
+
+        // Start background data loading from MEXC
+        let sender = bg_sender.clone();
+        let symbol = default_symbol.clone();
+        tokio_runtime.spawn(async move {
+            let _ = sender.send(BackgroundMessage::LoadingStateChanged(
+                LoadingState::FetchingMexcData { symbol: symbol.clone() }
+            ));
+
+            // Load data from MEXC API
+            let source = MexcSource::new(&symbol); // 90 days of history
+            match source.load().await {
                 Ok(base_candles) => {
-                    println!("Loaded {} base candles", base_candles.len());
                     let _ = sender.send(BackgroundMessage::DataLoaded(base_candles));
                 }
                 Err(e) => {
@@ -340,7 +372,7 @@ impl State {
             hovered_trend: None,
             indicators: IndicatorRegistry::new(),
             show_macd_panel: false,
-            loading_state: LoadingState::LoadingData,
+            loading_state: LoadingState::FetchingMexcData { symbol: default_symbol.clone() },
             bg_receiver,
             bg_sender,
             pending_timeframes: Vec::new(),
@@ -354,6 +386,13 @@ impl State {
             fps: 0.0,
             replay: ReplayManager::new(),
             ml_inference,
+            // MEXC integration
+            current_symbol: default_symbol,
+            live_event_rx: None,
+            ws_connected: false,
+            show_symbol_picker: false,
+            symbol_picker_state: SymbolPickerState::default(),
+            tokio_runtime: Some(tokio_runtime),
         };
 
         // Don't update visible range yet - data is loading
@@ -457,7 +496,6 @@ impl State {
                             } else {
                                 aggregate_candles(&base_candles, *tf)
                             };
-                            println!("  {} timeframe: {} candles", tf.label(), candles.len());
 
                             let _ = sender.send(BackgroundMessage::TimeframeAggregated {
                                 index: i,
@@ -514,6 +552,15 @@ impl State {
                     eprintln!("Background error: {}", err);
                     self.loading_state = LoadingState::Idle;
                 }
+                BackgroundMessage::LiveCandleUpdate { candle, is_closed } => {
+                    // Update the current 1-minute candle with live data
+                    self.update_live_candle(candle, is_closed);
+                    updated = true;
+                }
+                BackgroundMessage::ConnectionStatus(connected) => {
+                    self.ws_connected = connected;
+                    updated = true;
+                }
             }
         }
 
@@ -536,10 +583,163 @@ impl State {
             // All done - set idle and fit view to show data
             self.loading_state = LoadingState::Idle;
             self.fit_view(); // Properly position camera after data is loaded
+
+            // Start live updates automatically if not already connected
+            if !self.ws_connected {
+                self.start_live_updates();
+            }
+
             updated = true;
         }
 
         updated
+    }
+
+    /// Update the current candle with live data from WebSocket.
+    fn update_live_candle(&mut self, candle: Candle, is_closed: bool) {
+        if is_closed {
+            // Previous candle is closed, append the new one
+            self.timeframes[0].candles.push(candle);
+
+            // Re-aggregate all higher timeframes
+            self.reaggregate_timeframes();
+
+            // Rebuild GPU buffer for 1m timeframe
+            let candles = self.timeframes[0].candles.clone();
+            let new_tf_data = self.renderer.create_timeframe_data(
+                &self.device,
+                candles,
+                "1m",
+            );
+            self.timeframes[0] = new_tf_data;
+        } else {
+            // Update the last candle in place
+            if let Some(last) = self.timeframes[0].candles.last_mut() {
+                last.high = last.high.max(candle.high);
+                last.low = last.low.min(candle.low);
+                last.close = candle.close;
+                last.volume = candle.volume;
+                // Keep open and timestamp unchanged
+            }
+
+            // Rebuild GPU buffer so the update is visible
+            let candles = self.timeframes[0].candles.clone();
+            let new_tf_data = self.renderer.create_timeframe_data(
+                &self.device,
+                candles,
+                "1m",
+            );
+            self.timeframes[0] = new_tf_data;
+        }
+
+        self.window.request_redraw();
+    }
+
+    /// Re-aggregate all higher timeframes from the base 1-minute data.
+    fn reaggregate_timeframes(&mut self) {
+        let base_candles = self.timeframes[0].candles.clone();
+        let timeframe_types = Timeframe::all();
+
+        for (i, tf) in timeframe_types.iter().enumerate().skip(1) {
+            let candles = aggregate_candles(&base_candles, *tf);
+            let new_tf_data = self.renderer.create_timeframe_data(
+                &self.device,
+                candles,
+                tf.label(),
+            );
+            self.timeframes[i] = new_tf_data;
+        }
+    }
+
+    /// Switch to a different trading symbol.
+    pub fn switch_symbol(&mut self, symbol: &str) {
+        if symbol.to_uppercase() == self.current_symbol {
+            return; // Already on this symbol
+        }
+
+        let symbol = symbol.to_uppercase();
+        self.current_symbol = symbol.clone();
+
+        // Update loading state
+        self.loading_state = LoadingState::FetchingMexcData { symbol: symbol.clone() };
+
+        // Clear existing data
+        for tf in &mut self.timeframes {
+            tf.candles.clear();
+        }
+        for ta in &mut self.ta_data {
+            ta.ranges.clear();
+            ta.levels.clear();
+            ta.trends.clear();
+            ta.computed = false;
+            ta.prediction = None;
+        }
+
+        // Close existing WebSocket connection
+        self.live_event_rx = None;
+        self.ws_connected = false;
+
+        // Fetch new data in background
+        if let Some(runtime) = &self.tokio_runtime {
+            let sender = self.bg_sender.clone();
+            let sym = symbol.clone();
+            runtime.spawn(async move {
+                let source = MexcSource::new(&sym);
+                match source.load().await {
+                    Ok(base_candles) => {
+                        let _ = sender.send(BackgroundMessage::DataLoaded(base_candles));
+                    }
+                    Err(e) => {
+                        let _ = sender.send(BackgroundMessage::Error(
+                            format!("Failed to load {}: {}", sym, e)
+                        ));
+                    }
+                }
+            });
+        }
+
+        self.window.request_redraw();
+    }
+
+    /// Start live data subscription for the current symbol.
+    pub fn start_live_updates(&mut self) {
+        if let Some(runtime) = &self.tokio_runtime {
+            let sender = self.bg_sender.clone();
+            let symbol = self.current_symbol.clone();
+
+            runtime.spawn(async move {
+                let mut manager = LiveDataManager::new();
+                match manager.subscribe(&symbol).await {
+                    Ok(mut rx) => {
+                        let _ = sender.send(BackgroundMessage::ConnectionStatus(true));
+
+                        while let Some(event) = rx.recv().await {
+                            match event {
+                                LiveDataEvent::CandleUpdate { candle, is_closed } => {
+                                    let _ = sender.send(BackgroundMessage::LiveCandleUpdate {
+                                        candle,
+                                        is_closed,
+                                    });
+                                }
+                                LiveDataEvent::Connected => {
+                                    let _ = sender.send(BackgroundMessage::ConnectionStatus(true));
+                                }
+                                LiveDataEvent::Disconnected => {
+                                    let _ = sender.send(BackgroundMessage::ConnectionStatus(false));
+                                }
+                                LiveDataEvent::Error(e) => {
+                                    eprintln!("Live data error: {}", e);
+                                }
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!("Failed to subscribe to live updates: {}", e);
+                        let _ = sender.send(BackgroundMessage::ConnectionStatus(false));
+                    }
+                }
+            });
+        }
     }
 
     /// Compute TA in background thread for a timeframe.
@@ -552,9 +752,6 @@ impl State {
                 LoadingState::ComputingTa { timeframe },
             ));
 
-            println!("Computing TA for timeframe {} in background...", timeframe);
-            let start = Instant::now();
-
             let ta_config = AnalyzerConfig::default();
             let mut analyzer = Analyzer::with_config(ta_config);
 
@@ -565,14 +762,6 @@ impl State {
             let ranges = analyzer.ranges().to_vec();
             let levels = analyzer.all_levels().to_vec();
             let trends = analyzer.all_trends().to_vec();
-
-            println!(
-                "  TA computed: {} ranges, {} levels, {} trends in {:.2}s",
-                ranges.len(),
-                levels.len(),
-                trends.len(),
-                start.elapsed().as_secs_f32()
-            );
 
             let _ = sender.send(BackgroundMessage::TaComputed {
                 timeframe,
@@ -625,11 +814,7 @@ impl State {
         let _ = sender.send(BackgroundMessage::MlTaProgress { completed: 0, total });
 
         thread::spawn(move || {
-            println!("Precomputing TA for {} ML timeframes in background...", total);
-            let start = Instant::now();
-
             for (completed, (tf_idx, candles)) in timeframes_to_compute.into_iter().enumerate() {
-                let tf_start = Instant::now();
                 let ta_config = AnalyzerConfig::default();
                 let mut analyzer = Analyzer::with_config(ta_config);
 
@@ -640,14 +825,6 @@ impl State {
                 let ranges = analyzer.ranges().to_vec();
                 let levels = analyzer.all_levels().to_vec();
                 let trends = analyzer.all_trends().to_vec();
-
-                println!(
-                    "  Timeframe {}: {} levels, {} trends in {:.2}s",
-                    tf_idx,
-                    levels.len(),
-                    trends.len(),
-                    tf_start.elapsed().as_secs_f32()
-                );
 
                 // Send TA data for this timeframe
                 let _ = sender.send(BackgroundMessage::TaComputed {
@@ -663,11 +840,6 @@ impl State {
                     total,
                 });
             }
-
-            println!(
-                "ML TA precomputation complete in {:.2}s",
-                start.elapsed().as_secs_f32()
-            );
         });
     }
 
@@ -684,13 +856,27 @@ impl State {
     }
 
     pub fn handle_key(&mut self, event_loop: &ActiveEventLoop, code: KeyCode, is_pressed: bool) {
+        // Don't process key events if symbol picker is open (except Escape)
+        if self.show_symbol_picker && code != KeyCode::Escape {
+            return;
+        }
+
         if let Some(action) = self.input.handle_key(code, is_pressed) {
             match action {
-                InputAction::Exit => event_loop.exit(),
+                InputAction::Exit => {
+                    if self.show_symbol_picker {
+                        self.show_symbol_picker = false;
+                        self.window.request_redraw();
+                    } else {
+                        event_loop.exit()
+                    }
+                }
                 InputAction::FitView => self.fit_view(),
                 InputAction::ToggleTa => self.toggle_ta(),
                 InputAction::ToggleMacdPanel => self.toggle_macd_panel(),
                 InputAction::ToggleReplayMode => self.toggle_replay_mode(),
+                InputAction::ToggleSymbolPicker => self.toggle_symbol_picker(),
+                InputAction::StartLiveUpdates => self.start_live_updates(),
                 InputAction::ReplayStepForward => self.replay_step_forward(),
                 InputAction::ReplayStepBackward => self.replay_step_backward(),
                 InputAction::ReplayDecreaseStep => self.replay_decrease_step_size(),
@@ -709,6 +895,11 @@ impl State {
 
     fn toggle_macd_panel(&mut self) {
         self.show_macd_panel = !self.show_macd_panel;
+        self.window.request_redraw();
+    }
+
+    fn toggle_symbol_picker(&mut self) {
+        self.show_symbol_picker = !self.show_symbol_picker;
         self.window.request_redraw();
     }
 
@@ -1899,6 +2090,11 @@ impl State {
     fn apply_zoom(&mut self, scroll_x: f32, scroll_y: f32, cursor_x: f32, cursor_y: f32) {
         let candles = &self.timeframes[self.current_timeframe].candles;
 
+        // Don't zoom if there's no data
+        if candles.is_empty() {
+            return;
+        }
+
         // Use chart area dimensions (excluding stats panel and volume section)
         let chart_width = self.config.width as f32 - STATS_PANEL_WIDTH;
         let chart_height = self.config.height as f32 * (1.0 - VOLUME_HEIGHT_RATIO);
@@ -1921,15 +2117,15 @@ impl State {
             self.renderer.camera.position[1] + cursor_ndc[1] * self.renderer.camera.scale[1];
 
         let data_width = (candles.len() as f32) * CANDLE_SPACING;
-        let max_x_zoom = (data_width / 2.0 / aspect) * 1.2;
+        let max_x_zoom = (data_width / 2.0 / aspect).max(10.0) * 1.2; // Ensure minimum zoom
 
         let (min_price, max_price) = candles
             .iter()
             .fold((f32::MAX, f32::MIN), |(min, max), c| {
                 (min.min(c.low), max.max(c.high))
             });
-        let price_range = max_price - min_price;
-        let max_y_zoom = (price_range / 2.0) * 1.5;
+        let price_range = (max_price - min_price).max(1.0); // Ensure minimum range
+        let max_y_zoom = (price_range / 2.0).max(10.0) * 1.5; // Ensure minimum zoom
 
         if scroll_x.abs() > 0.001 {
             let zoom_factor = 1.0 - scroll_x * 0.1;
@@ -2028,9 +2224,12 @@ impl State {
         };
 
         let show_macd = self.show_macd_panel;
+        let should_show_symbol_picker = self.show_symbol_picker;
+        let current_symbol = self.current_symbol.clone();
 
         // Copy data for egui closure (will be updated after)
         let ta_settings = RefCell::new(self.ta_settings.clone());
+        let symbol_picker_state = RefCell::new(self.symbol_picker_state.clone());
         // Use replay TA data if in replay mode with locked position, otherwise use precomputed TA
         let ta_data = if self.replay.is_locked() {
             self.replay.ta_data.clone().unwrap_or_else(|| self.ta_data[self.current_timeframe].clone())
@@ -2041,6 +2240,7 @@ impl State {
         let loading_state = self.loading_state.clone();
         let screen_width = self.config.width as f32;
         let macd_response = RefCell::new(MacdPanelResponse::default());
+        let symbol_picker_response = RefCell::new(None::<(bool, Option<String>)>);
 
         // Get guideline values and visible range for price labels
         let guideline_values = self.renderer.guideline_values.clone();
@@ -2116,6 +2316,16 @@ impl State {
 
             // Loading indicator overlay (extracted to ui::loading_overlay)
             show_loading_overlay(ctx, &loading_state);
+
+            // Symbol picker overlay
+            if should_show_symbol_picker {
+                let response = crate::ui::show_symbol_picker(
+                    ctx,
+                    &mut symbol_picker_state.borrow_mut(),
+                    &current_symbol,
+                );
+                *symbol_picker_response.borrow_mut() = Some((response.closed, response.selected_symbol));
+            }
 
             // Replay mode overlay and cursor line
             if self.replay.enabled {
@@ -2283,6 +2493,21 @@ impl State {
         if macd_changed && !self.indicators.is_empty() {
             self.update_macd_gpu_buffers();
         }
+
+        // Handle symbol picker response
+        if let Some((closed, selected)) = symbol_picker_response.borrow().clone() {
+            if closed {
+                self.show_symbol_picker = false;
+            }
+            if let Some(symbol) = selected {
+                self.symbol_picker_state.add_recent(&self.current_symbol);
+                self.switch_symbol(&symbol);
+                self.show_symbol_picker = false;
+            }
+        }
+
+        // Update symbol picker state if it changed
+        self.symbol_picker_state = symbol_picker_state.into_inner();
 
         self.egui_state
             .handle_platform_output(&self.window, full_output.platform_output);
