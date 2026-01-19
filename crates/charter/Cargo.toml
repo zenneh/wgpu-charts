@@ -17,6 +17,7 @@ charter-core.workspace = true
 charter-data.workspace = true
 charter-indicators.workspace = true
 charter-render.workspace = true
+charter-sync.workspace = true
 charter-ta.workspace = true
 charter-ui.workspace = true
 wgpu.workspace = true

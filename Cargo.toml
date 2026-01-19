@@ -8,6 +8,7 @@ members = [
     "crates/charter-render",
     "crates/charter-ui",
     "crates/charter-ta",
+    "crates/charter-sync",
     "crates/charter-backtest",
     "crates/charter",
     "crates/mexc-api",
@@ -26,6 +27,7 @@ charter-indicators = { path = "crates/charter-indicators" }
 charter-render = { path = "crates/charter-render" }
 charter-ui = { path = "crates/charter-ui" }
 charter-ta = { path = "crates/charter-ta" }
+charter-sync = { path = "crates/charter-sync" }
 
 # External dependencies
 wgpu = "24.0.0"

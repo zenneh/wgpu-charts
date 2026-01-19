@@ -21,8 +21,8 @@
 
       # Native dependencies if needed
       buildInputs = with pkgs; [
-        # Add libraries your project depends on if needed
-        # openssl
+        duckdb
+        pkg-config
       ];
     in {
 

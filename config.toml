@@ -73,3 +73,14 @@ show_trends = true
 show_active_trends = true
 show_hit_trends = true
 show_broken_trends = false
+
+[sync]
+# Historical data sync configuration
+# Enable sync on startup
+enabled = true
+# Number of days of historical data to sync (default: 365)
+sync_days = 365
+# Delay between API batch fetches in milliseconds (default: 100)
+batch_delay_ms = 100
+# Custom database path (optional, defaults to ~/.local/share/charter/candles.duckdb)
+# db_path = "/path/to/candles.duckdb"

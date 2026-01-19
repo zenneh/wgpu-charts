@@ -7,4 +7,5 @@ edition.workspace = true
 charter-core.workspace = true
 charter-indicators.workspace = true
 charter-render.workspace = true
+charter-sync.workspace = true
 egui.workspace = true

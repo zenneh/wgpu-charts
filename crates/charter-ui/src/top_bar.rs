@@ -1,6 +1,7 @@
 //! Top bar UI component (dwm-style).
 
 use charter_core::Candle;
+use charter_sync::SyncState;
 use egui::{Color32, Context, Frame, RichText, Ui};
 
 /// Top bar height in pixels.
@@ -9,20 +10,31 @@ pub const TOP_BAR_HEIGHT: f32 = 24.0;
 /// Timeframe labels.
 pub const TIMEFRAME_LABELS: &[&str] = &["1m", "3m", "5m", "30m", "1h", "3h", "5h", "10h", "1d", "1w", "3w", "1M"];
 
+/// Response from top bar interactions.
+#[derive(Debug, Default)]
+pub struct TopBarResponse {
+    /// Clicked timeframe index, if any.
+    pub clicked_timeframe: Option<usize>,
+    /// Whether sync toggle was clicked.
+    pub toggle_sync: bool,
+}
+
 /// Top bar UI component.
 pub struct TopBar;
 
 impl TopBar {
     /// Show the top bar.
-    /// Returns Some(timeframe_index) if a timeframe was clicked.
+    /// Returns a TopBarResponse with any user interactions.
     pub fn show(
         ctx: &Context,
         symbol: &str,
         current_timeframe: usize,
         candle: Option<&Candle>,
         ws_connected: bool,
-    ) -> Option<usize> {
-        let mut clicked_timeframe = None;
+        sync_enabled: bool,
+        sync_state: &SyncState,
+    ) -> TopBarResponse {
+        let mut response = TopBarResponse::default();
 
         egui::TopBottomPanel::top("top_bar")
             .exact_height(TOP_BAR_HEIGHT)
@@ -79,6 +91,12 @@ impl TopBar {
                         });
                     }
 
+                    // Sync section
+                    let sync_response = Self::show_sync_section(ui, sync_enabled, sync_state);
+                    if sync_response.clicked() {
+                        response.toggle_sync = true;
+                    }
+
                     // Spacer to push timeframes to the right
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         ui.spacing_mut().item_spacing.x = 0.0;
@@ -97,19 +115,74 @@ impl TopBar {
                                 Color32::from_rgb(150, 150, 150)
                             };
 
-                            let response = Self::section_clickable(ui, bg_color, |ui| {
+                            let tf_response = Self::section_clickable(ui, bg_color, |ui| {
                                 ui.label(RichText::new(*label).color(text_color));
                             });
 
-                            if response.clicked() {
-                                clicked_timeframe = Some(i);
+                            if tf_response.clicked() {
+                                response.clicked_timeframe = Some(i);
                             }
                         }
                     });
                 });
             });
 
-        clicked_timeframe
+        response
+    }
+
+    /// Show the sync section with toggle and progress.
+    fn show_sync_section(ui: &mut Ui, sync_enabled: bool, sync_state: &SyncState) -> egui::Response {
+        let (bg_color, text, text_color) = match sync_state {
+            SyncState::Idle => {
+                if sync_enabled {
+                    (Color32::from_rgb(40, 60, 80), "Sync".to_string(), Color32::from_rgb(100, 150, 200))
+                } else {
+                    (Color32::from_rgb(40, 40, 40), "Sync".to_string(), Color32::from_rgb(120, 120, 120))
+                }
+            }
+            SyncState::Syncing { fetched, estimated_total, candles_per_sec } => {
+                let fetched_str = format_count(*fetched);
+                let total_str = format_count(*estimated_total);
+                let rate_str = format!("{:.0}/s", candles_per_sec);
+                (
+                    Color32::from_rgb(40, 60, 100),
+                    format!("{}/{} {}", fetched_str, total_str, rate_str),
+                    Color32::from_rgb(100, 180, 255),
+                )
+            }
+            SyncState::Complete { total_candles } => {
+                let total_str = format_count(*total_candles);
+                (
+                    Color32::from_rgb(40, 70, 50),
+                    format!("{} synced", total_str),
+                    Color32::from_rgb(100, 200, 100),
+                )
+            }
+            SyncState::Error(err) => {
+                let short_err = if err.len() > 15 {
+                    format!("{}...", &err[..12])
+                } else {
+                    err.clone()
+                };
+                (
+                    Color32::from_rgb(80, 40, 40),
+                    format!("Err: {}", short_err),
+                    Color32::from_rgb(255, 100, 100),
+                )
+            }
+        };
+
+        Self::section_clickable(ui, bg_color, |ui| {
+            // Sync icon
+            let icon = match sync_state {
+                SyncState::Idle => if sync_enabled { "\u{21BB}" } else { "\u{21BB}" }, // ↻
+                SyncState::Syncing { .. } => "\u{21BB}", // ↻ (rotating)
+                SyncState::Complete { .. } => "\u{2713}", // ✓
+                SyncState::Error(_) => "\u{2717}", // ✗
+            };
+            ui.label(RichText::new(icon).color(text_color));
+            ui.label(RichText::new(text).color(text_color).small());
+        })
     }
 
     fn section(ui: &mut Ui, bg_color: Color32, content: impl FnOnce(&mut Ui)) {
@@ -136,5 +209,16 @@ impl TopBar {
             })
             .response
             .interact(egui::Sense::click())
+    }
+}
+
+/// Format a count with K/M suffixes for readability.
+fn format_count(count: u64) -> String {
+    if count >= 1_000_000 {
+        format!("{:.1}M", count as f64 / 1_000_000.0)
+    } else if count >= 1_000 {
+        format!("{:.1}K", count as f64 / 1_000.0)
+    } else {
+        count.to_string()
     }
 }

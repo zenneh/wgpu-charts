@@ -24,6 +24,7 @@ pub struct Config {
     pub general: GeneralConfig,
     pub api: ApiConfig,
     pub ta: TaConfig,
+    pub sync: SyncConfig,
 }
 
 impl Default for Config {
@@ -32,6 +33,7 @@ impl Default for Config {
             general: GeneralConfig::default(),
             api: ApiConfig::default(),
             ta: TaConfig::default(),
+            sync: SyncConfig::default(),
         }
     }
 }
@@ -124,6 +126,44 @@ impl Default for ApiConfig {
             ws_url: "wss://wbs-api.mexc.com/ws".to_string(),
             history_days: 90,
         }
+    }
+}
+
+/// Sync configuration for historical data.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SyncConfig {
+    /// Whether sync is enabled by default on startup.
+    pub enabled: bool,
+    /// Path to the DuckDB database file.
+    /// Defaults to ~/.local/share/charter/candles.duckdb
+    pub db_path: Option<PathBuf>,
+    /// Delay between batch fetches in milliseconds.
+    pub batch_delay_ms: u64,
+    /// Number of days of historical data to sync.
+    pub sync_days: u32,
+}
+
+impl Default for SyncConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            db_path: None, // Will use default path
+            batch_delay_ms: 100,
+            sync_days: 365, // 1 year by default
+        }
+    }
+}
+
+impl SyncConfig {
+    /// Get the database path, using default if not specified.
+    pub fn get_db_path(&self) -> PathBuf {
+        self.db_path.clone().unwrap_or_else(|| {
+            dirs::data_local_dir()
+                .unwrap_or_else(|| PathBuf::from("."))
+                .join("charter")
+                .join("candles.duckdb")
+        })
     }
 }
 

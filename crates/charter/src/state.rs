@@ -34,6 +34,7 @@ use charter_ta::{
     TimeframeFeatures, Trend, TrendState, MlInferenceHandle,
 };
 use charter_config::Config as AppConfig;
+use charter_sync::{SyncManager, SyncProgress, SyncState};
 use charter_ui::TopBar;
 
 /// Loading state for background operations.
@@ -106,6 +107,12 @@ pub enum BackgroundMessage {
     ConnectionStatus(bool),
     /// Error occurred.
     Error(String),
+    /// Sync progress update.
+    SyncProgressUpdate(SyncProgress),
+    /// Sync completed successfully.
+    SyncComplete { total_candles: u64 },
+    /// Sync encountered an error.
+    SyncError(String),
 }
 
 /// Settings for TA display filtering.
@@ -211,6 +218,11 @@ pub struct State {
 
     // Application config
     pub app_config: AppConfig,
+
+    // Historical data sync
+    pub sync_enabled: bool,
+    pub sync_state: SyncState,
+    pub sync_manager: Option<SyncManager>,
 }
 
 impl State {
@@ -285,22 +297,41 @@ impl State {
         // Default symbol from config
         let default_symbol = app_config.general.default_symbol.clone();
 
-        // Start background data loading from MEXC
+        // Start background data loading - first try DuckDB, then fall back to MEXC API
         let sender = bg_sender.clone();
         let symbol = default_symbol.clone();
+        let db_path = app_config.sync.get_db_path();
         tokio_runtime.spawn(async move {
             let _ = sender.send(BackgroundMessage::LoadingStateChanged(
                 LoadingState::FetchingMexcData { symbol: symbol.clone() }
             ));
 
-            // Load data from MEXC API
-            let source = MexcSource::new(&symbol); // 90 days of history
-            match source.load().await {
-                Ok(base_candles) => {
-                    let _ = sender.send(BackgroundMessage::DataLoaded(base_candles));
+            // First, try to load from DuckDB if it has data
+            let db_candles = if let Ok(db) = charter_sync::CandleDb::open(&db_path) {
+                match db.load_candles(&symbol) {
+                    Ok(candles) if !candles.is_empty() => {
+                        log::info!("Loaded {} candles from DuckDB for {}", candles.len(), symbol);
+                        Some(candles)
+                    }
+                    _ => None,
                 }
-                Err(e) => {
-                    let _ = sender.send(BackgroundMessage::Error(format!("Failed to load data: {}", e)));
+            } else {
+                None
+            };
+
+            // If we have DB data, use it; otherwise fetch from API
+            if let Some(candles) = db_candles {
+                let _ = sender.send(BackgroundMessage::DataLoaded(candles));
+            } else {
+                // Fall back to MEXC API
+                let source = MexcSource::new(&symbol);
+                match source.load().await {
+                    Ok(base_candles) => {
+                        let _ = sender.send(BackgroundMessage::DataLoaded(base_candles));
+                    }
+                    Err(e) => {
+                        let _ = sender.send(BackgroundMessage::Error(format!("Failed to load data: {}", e)));
+                    }
                 }
             }
         });
@@ -411,7 +442,15 @@ impl State {
             show_symbol_picker: false,
             symbol_picker_state: SymbolPickerState::default(),
             tokio_runtime: Some(tokio_runtime),
-            app_config,
+            app_config: app_config.clone(),
+            // Sync
+            sync_enabled: app_config.sync.enabled,
+            sync_state: SyncState::default(),
+            sync_manager: Some(SyncManager::new(
+                app_config.sync.get_db_path(),
+                app_config.sync.batch_delay_ms,
+                app_config.sync.sync_days,
+            )),
         };
 
         // Don't update visible range yet - data is loading
@@ -493,6 +532,15 @@ impl State {
                     self.loading_state = state;
                 }
                 BackgroundMessage::DataLoaded(base_candles) => {
+                    // Clear existing TA data - it will be recomputed with the new candle data
+                    for ta in &mut self.ta_data {
+                        ta.ranges.clear();
+                        ta.levels.clear();
+                        ta.trends.clear();
+                        ta.computed = false;
+                        ta.prediction = None;
+                    }
+
                     // Data loaded - start aggregating timeframes in background
                     self.loading_state = LoadingState::AggregatingTimeframes {
                         current: 0,
@@ -588,6 +636,42 @@ impl State {
                     self.ws_connected = connected;
                     updated = true;
                 }
+                BackgroundMessage::SyncProgressUpdate(progress) => {
+                    self.sync_state = SyncState::Syncing {
+                        fetched: progress.fetched,
+                        estimated_total: progress.estimated_total,
+                        candles_per_sec: progress.candles_per_sec,
+                    };
+                    updated = true;
+                }
+                BackgroundMessage::SyncComplete { total_candles } => {
+                    self.sync_state = SyncState::Complete { total_candles };
+                    self.sync_enabled = false; // Disable toggle after completion
+
+                    // Reload data from DuckDB to display the synced candles
+                    if let Some(runtime) = &self.tokio_runtime {
+                        let sender = self.bg_sender.clone();
+                        let symbol = self.current_symbol.clone();
+                        let db_path = self.app_config.sync.get_db_path();
+                        runtime.spawn(async move {
+                            if let Ok(db) = charter_sync::CandleDb::open(&db_path) {
+                                if let Ok(candles) = db.load_candles(&symbol) {
+                                    if !candles.is_empty() {
+                                        log::info!("Reloading {} candles from DuckDB after sync", candles.len());
+                                        let _ = sender.send(BackgroundMessage::DataLoaded(candles));
+                                    }
+                                }
+                            }
+                        });
+                    }
+                    updated = true;
+                }
+                BackgroundMessage::SyncError(err) => {
+                    eprintln!("Sync error: {}", err);
+                    self.sync_state = SyncState::Error(err);
+                    self.sync_enabled = false;
+                    updated = true;
+                }
             }
         }
 
@@ -614,6 +698,11 @@ impl State {
             // Start live updates automatically if not already connected
             if !self.ws_connected {
                 self.start_live_updates();
+            }
+
+            // Auto-start sync if enabled in config and not already syncing
+            if self.sync_enabled && !matches!(self.sync_state, SyncState::Syncing { .. }) {
+                self.start_sync();
             }
 
             updated = true;
@@ -713,20 +802,39 @@ impl State {
         self.live_event_rx = None;
         self.ws_connected = false;
 
-        // Fetch new data in background
+        // Fetch new data in background - first try DuckDB, then fall back to API
         if let Some(runtime) = &self.tokio_runtime {
             let sender = self.bg_sender.clone();
             let sym = symbol.clone();
+            let db_path = self.app_config.sync.get_db_path();
             runtime.spawn(async move {
-                let source = MexcSource::new(&sym);
-                match source.load().await {
-                    Ok(base_candles) => {
-                        let _ = sender.send(BackgroundMessage::DataLoaded(base_candles));
+                // First, try to load from DuckDB if it has data
+                let db_candles = if let Ok(db) = charter_sync::CandleDb::open(&db_path) {
+                    match db.load_candles(&sym) {
+                        Ok(candles) if !candles.is_empty() => {
+                            log::info!("Loaded {} candles from DuckDB for {}", candles.len(), sym);
+                            Some(candles)
+                        }
+                        _ => None,
                     }
-                    Err(e) => {
-                        let _ = sender.send(BackgroundMessage::Error(
-                            format!("Failed to load {}: {}", sym, e)
-                        ));
+                } else {
+                    None
+                };
+
+                // If we have DB data, use it; otherwise fetch from API
+                if let Some(candles) = db_candles {
+                    let _ = sender.send(BackgroundMessage::DataLoaded(candles));
+                } else {
+                    let source = MexcSource::new(&sym);
+                    match source.load().await {
+                        Ok(base_candles) => {
+                            let _ = sender.send(BackgroundMessage::DataLoaded(base_candles));
+                        }
+                        Err(e) => {
+                            let _ = sender.send(BackgroundMessage::Error(
+                                format!("Failed to load {}: {}", sym, e)
+                            ));
+                        }
                     }
                 }
             });
@@ -770,6 +878,61 @@ impl State {
                     Err(e) => {
                         eprintln!("Failed to subscribe to live updates: {}", e);
                         let _ = sender.send(BackgroundMessage::ConnectionStatus(false));
+                    }
+                }
+            });
+        }
+    }
+
+    /// Toggle historical data sync on/off.
+    pub fn toggle_sync(&mut self) {
+        self.sync_enabled = !self.sync_enabled;
+
+        if self.sync_enabled {
+            self.start_sync();
+        } else {
+            // Stop sync
+            if let Some(manager) = &self.sync_manager {
+                manager.cancel();
+            }
+            self.sync_state = SyncState::Idle;
+        }
+    }
+
+    /// Start the sync process (called when sync_enabled becomes true).
+    fn start_sync(&mut self) {
+        // Don't start if already syncing
+        if matches!(self.sync_state, SyncState::Syncing { .. }) {
+            return;
+        }
+
+        self.sync_state = SyncState::Syncing {
+            fetched: 0,
+            estimated_total: 0,
+            candles_per_sec: 0.0,
+        };
+
+        if let (Some(runtime), Some(manager)) = (&self.tokio_runtime, &self.sync_manager) {
+            let symbol = self.current_symbol.clone();
+            let (mut progress_rx, handle) = manager.start_sync(symbol, runtime.handle());
+            let sender = self.bg_sender.clone();
+
+            // Spawn task to forward progress updates
+            runtime.spawn(async move {
+                while let Some(progress) = progress_rx.recv().await {
+                    let _ = sender.send(BackgroundMessage::SyncProgressUpdate(progress));
+                }
+
+                // Check result when sync completes
+                match handle.await {
+                    Ok(Ok(total)) => {
+                        let _ = sender.send(BackgroundMessage::SyncComplete { total_candles: total });
+                    }
+                    Ok(Err(e)) => {
+                        let _ = sender.send(BackgroundMessage::SyncError(e.to_string()));
+                    }
+                    Err(e) => {
+                        let _ = sender.send(BackgroundMessage::SyncError(format!("Task panicked: {}", e)));
                     }
                 }
             });
@@ -2334,7 +2497,10 @@ impl State {
         let current_symbol = self.current_symbol.clone();
         let current_timeframe = self.current_timeframe;
         let ws_connected = self.ws_connected;
+        let sync_enabled = self.sync_enabled;
+        let sync_state = self.sync_state.clone();
         let new_timeframe = RefCell::new(None::<usize>);
+        let should_toggle_sync = RefCell::new(false);
 
         // Copy data for egui closure (will be updated after)
         let ta_settings = RefCell::new(self.ta_settings.clone());
@@ -2392,15 +2558,21 @@ impl State {
                     }
                 });
 
-            // Top bar with symbol, OHLC data, and timeframe selector
-            if let Some(tf) = TopBar::show(
+            // Top bar with symbol, OHLC data, timeframe selector, and sync toggle
+            let top_bar_response = TopBar::show(
                 ctx,
                 &current_symbol,
                 current_timeframe,
                 candle.as_ref(),
                 ws_connected,
-            ) {
+                sync_enabled,
+                &sync_state,
+            );
+            if let Some(tf) = top_bar_response.clicked_timeframe {
                 *new_timeframe.borrow_mut() = Some(tf);
+            }
+            if top_bar_response.toggle_sync {
+                *should_toggle_sync.borrow_mut() = true;
             }
 
             // TA control panel (extracted to ui::ta_panel)
@@ -2622,6 +2794,11 @@ impl State {
         // Apply timeframe change from top bar
         if let Some(tf) = new_timeframe.into_inner() {
             self.switch_timeframe(tf);
+        }
+
+        // Apply sync toggle from top bar
+        if should_toggle_sync.into_inner() {
+            self.toggle_sync();
         }
 
         self.egui_state
