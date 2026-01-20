@@ -1,11 +1,14 @@
 //! Core types for technical analysis.
 
-pub mod direction;
+pub mod candle;
+pub mod config;
 pub mod level;
 pub mod range;
-pub mod trend;
 
-pub use direction::{CandleDirection, CandleMetadata};
-pub use level::{BucketKey, Level, LevelBreak, LevelEvent, LevelHit, LevelId, LevelInteraction, LevelState, LevelTracker, LevelType, OptimizedLevelTracker};
-pub use range::{detect_ranges, Range, RangeBuilder, RangeId};
-pub use trend::{Trend, TrendBreak, TrendEvent, TrendHit, TrendId, TrendInteraction, TrendState, TrendTracker};
+pub use candle::{CandleDirection, CandleMetadata};
+pub use config::{AnalyzerConfig, TimeframeConfig};
+pub use level::{
+    Level, LevelBreak, LevelDirection, LevelEvent, LevelHit, LevelId, LevelIndex,
+    LevelInteraction, LevelState, LevelType,
+};
+pub use range::{detect_ranges, detect_ranges_reverse, Range, RangeBuilder, RangeId};
