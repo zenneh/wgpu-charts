@@ -9,7 +9,7 @@ mod input;
 mod input_mode;
 mod replay;
 mod state;
-mod state_legacy;
+// mod state_legacy; // Migrated to new state module
 mod ui;
 
 use anyhow::Result;
@@ -18,10 +18,7 @@ use winit::event_loop::EventLoop;
 use app::App;
 
 fn run() -> Result<()> {
-    #[cfg(not(target_arch = "wasm32"))]
-    {
-        env_logger::init();
-    }
+    env_logger::init();
 
     let event_loop = EventLoop::with_user_event().build()?;
     let mut app = App::new();

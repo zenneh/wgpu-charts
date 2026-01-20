@@ -4,8 +4,59 @@
 //! loading state, replay mode, live data connection, and current symbol.
 
 use crate::replay::ReplayManager;
-use super::LoadingState;
 use charter_ta::MlInferenceHandle;
+
+/// Current loading state of the application.
+#[derive(Debug, Clone)]
+pub enum LoadingState {
+    /// No loading in progress.
+    Idle,
+    /// Fetching candle data from MEXC API.
+    FetchingMexcData { symbol: String },
+    /// Aggregating candles into higher timeframes.
+    AggregatingTimeframes { current: usize, total: usize },
+    /// Creating GPU buffers for timeframe data.
+    CreatingBuffers { current: usize, total: usize },
+    /// Computing technical analysis for a timeframe.
+    ComputingTa { timeframe: usize },
+    /// Computing TA for ML inference across multiple timeframes.
+    ComputingMlTa { completed: usize, total: usize },
+}
+
+impl LoadingState {
+    /// Check if currently in a loading state.
+    pub fn is_loading(&self) -> bool {
+        !matches!(self, LoadingState::Idle)
+    }
+
+    /// Get a human-readable message for the current state.
+    pub fn message(&self) -> String {
+        match self {
+            LoadingState::Idle => String::new(),
+            LoadingState::FetchingMexcData { symbol } => format!("Loading {} data...", symbol),
+            LoadingState::AggregatingTimeframes { current, total } => {
+                format!("Aggregating timeframes ({}/{})", current, total)
+            }
+            LoadingState::CreatingBuffers { current, total } => {
+                format!("Creating buffers ({}/{})", current, total)
+            }
+            LoadingState::ComputingTa { timeframe } => {
+                let tf_labels = ["1m", "3m", "5m", "30m", "1h", "3h", "5h", "10h", "1d", "1w", "3w", "1M"];
+                let label = tf_labels.get(*timeframe).unwrap_or(&"?");
+                format!("Computing TA for {}...", label)
+            }
+            LoadingState::ComputingMlTa { completed, total } => {
+                format!("Computing ML TA ({}/{})", completed, total)
+            }
+        }
+    }
+}
+
+impl Default for LoadingState {
+    fn default() -> Self {
+        Self::Idle
+    }
+}
 
 /// Interaction state for the current user session.
 ///

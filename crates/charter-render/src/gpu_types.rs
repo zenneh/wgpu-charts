@@ -570,8 +570,10 @@ pub struct DrawingRenderParams {
     pub line_thickness: f32,
     /// Line thickness for vertical lines (in X-axis world units).
     pub x_line_thickness: f32,
-    /// Anchor handle size in world units.
+    /// Anchor handle size in Y-axis world units.
     pub anchor_size: f32,
+    /// Anchor handle size in X-axis world units.
+    pub anchor_size_x: f32,
     /// Number of horizontal rays.
     pub hray_count: u32,
     /// Number of rays/trendlines.
@@ -582,7 +584,6 @@ pub struct DrawingRenderParams {
     pub anchor_count: u32,
     pub _padding1: u32,
     pub _padding2: u32,
-    pub _padding3: u32,
 }
 
 /// Maximum number of each drawing type.

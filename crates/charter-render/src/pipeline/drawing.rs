@@ -78,6 +78,7 @@ pub struct DrawingRenderData {
     line_thickness: f32,
     x_line_thickness: f32,
     anchor_size: f32,
+    anchor_size_x: f32,
 }
 
 impl DrawingRenderData {
@@ -114,13 +115,13 @@ impl DrawingRenderData {
             line_thickness: 2.0,
             x_line_thickness: 2.0,
             anchor_size: 1.0,
+            anchor_size_x: 1.0,
             hray_count: 0,
             ray_count: 0,
             rect_count: 0,
             anchor_count: 0,
             _padding1: 0,
             _padding2: 0,
-            _padding3: 0,
         };
 
         let params_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -165,6 +166,7 @@ impl DrawingRenderData {
             line_thickness: 2.0,
             x_line_thickness: 2.0,
             anchor_size: 1.0,
+            anchor_size_x: 1.0,
         }
     }
 
@@ -280,13 +282,13 @@ impl DrawingRenderData {
                 line_thickness: self.line_thickness,
                 x_line_thickness: self.x_line_thickness,
                 anchor_size: self.anchor_size,
+                anchor_size_x: self.anchor_size_x,
                 hray_count: self.hray_count,
                 ray_count: self.ray_count,
                 rect_count: self.rect_count,
                 anchor_count: self.anchor_count,
                 _padding1: 0,
                 _padding2: 0,
-                _padding3: 0,
             };
 
             if params != self.cached_params {
@@ -673,13 +675,13 @@ impl DrawingPipeline {
             line_thickness: 1.0,
             x_line_thickness: 1.0,
             anchor_size: 0.5,
+            anchor_size_x: 0.5,
             hray_count: 0,
             ray_count: 0,
             rect_count: 0,
             anchor_count: 0,
             _padding1: 0,
             _padding2: 0,
-            _padding3: 0,
         };
         device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("Drawing Params Buffer"),

@@ -16,14 +16,14 @@ struct DrawingRenderParams {
     x_max: f32,
     line_thickness: f32,      // For horizontal lines (Y-axis units)
     x_line_thickness: f32,    // For vertical lines (X-axis units)
-    anchor_size: f32,
+    anchor_size: f32,         // Anchor size in Y-axis units
+    anchor_size_x: f32,       // Anchor size in X-axis units
     hray_count: u32,
     ray_count: u32,
     rect_count: u32,
     anchor_count: u32,
     _padding1: u32,
     _padding2: u32,
-    _padding3: u32,
 };
 
 struct DrawingHRayGpu {
@@ -135,9 +135,8 @@ fn vs_hray(@builtin(vertex_index) vertex_index: u32, @builtin(instance_index) in
     let x_factor = get_quad_x_factor(quad_index);
     let y_sign = get_quad_y_sign(quad_index);
 
-    // Extend horizontal ray from left visible edge (x_min) to right visible edge (x_max)
-    // This ensures the ray spans the full canvas width
-    let x = mix(params.x_min, params.x_max, x_factor);
+    // Extend horizontal ray from its start point (x_start) to right visible edge (x_max)
+    let x = mix(hray.x_start, params.x_max, x_factor);
     let y = hray.y_value + y_sign * half_thickness;
 
     let pos = camera.view_proj * vec4<f32>(x, y, 0.0, 1.0);
@@ -306,12 +305,14 @@ fn vs_anchor(@builtin(vertex_index) vertex_index: u32, @builtin(instance_index) 
     let anchor = anchors[instance_index];
     let quad_index = vertex_index % 6u;
 
-    let half_size = params.anchor_size * 0.5;
+    // Use separate sizes for x and y dimensions due to different world scales
+    let half_size_x = params.anchor_size_x * 0.5;
+    let half_size_y = params.anchor_size * 0.5;
 
     // Get position offsets using quad helper functions
     // Map x_factor from [0, 1] to [-1, 1] for symmetric anchor
-    let x_offset = (get_quad_x_factor(quad_index) * 2.0 - 1.0) * half_size;
-    let y_offset = get_quad_y_sign(quad_index) * half_size;
+    let x_offset = (get_quad_x_factor(quad_index) * 2.0 - 1.0) * half_size_x;
+    let y_offset = get_quad_y_sign(quad_index) * half_size_y;
 
     let x = anchor.x + x_offset;
     let y = anchor.y + y_offset;

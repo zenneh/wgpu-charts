@@ -78,15 +78,14 @@ fn add_drawing_to_buffers(
                 _padding: 0,
             });
 
-            if is_selected {
-                let is_hovered = hovered_anchor.map_or(false, |(id, idx)| id == hr.id && idx == 0);
-                anchors.push(AnchorGpu {
-                    x: hr.anchor.candle_index * candle_spacing,
-                    y: hr.anchor.price,
-                    is_hovered: u32::from(is_hovered),
-                    is_selected: 1,
-                });
-            }
+            // Always show anchor for horizontal rays
+            let is_hovered = hovered_anchor.map_or(false, |(id, idx)| id == hr.id && idx == 0);
+            anchors.push(AnchorGpu {
+                x: hr.anchor.candle_index * candle_spacing,
+                y: hr.anchor.price,
+                is_hovered: u32::from(is_hovered),
+                is_selected: u32::from(is_selected),
+            });
         }
         Drawing::Ray(ray) => {
             rays.push(DrawingRayGpu {
@@ -100,16 +99,15 @@ fn add_drawing_to_buffers(
                 a: ray.color[3],
             });
 
-            if is_selected {
-                for (idx, anchor) in [&ray.start, &ray.end].iter().enumerate() {
-                    let is_hovered = hovered_anchor.map_or(false, |(id, i)| id == ray.id && i == idx);
-                    anchors.push(AnchorGpu {
-                        x: anchor.candle_index * candle_spacing,
-                        y: anchor.price,
-                        is_hovered: u32::from(is_hovered),
-                        is_selected: 1,
-                    });
-                }
+            // Always show anchors for rays
+            for (idx, anchor) in [&ray.start, &ray.end].iter().enumerate() {
+                let is_hovered = hovered_anchor.map_or(false, |(id, i)| id == ray.id && i == idx);
+                anchors.push(AnchorGpu {
+                    x: anchor.candle_index * candle_spacing,
+                    y: anchor.price,
+                    is_hovered: u32::from(is_hovered),
+                    is_selected: u32::from(is_selected),
+                });
             }
         }
         Drawing::Rectangle(rect) => {
@@ -128,16 +126,15 @@ fn add_drawing_to_buffers(
                 border_a: rect.border_color[3],
             });
 
-            if is_selected {
-                for (idx, anchor) in [&rect.corner1, &rect.corner2].iter().enumerate() {
-                    let is_hovered = hovered_anchor.map_or(false, |(id, i)| id == rect.id && i == idx);
-                    anchors.push(AnchorGpu {
-                        x: anchor.candle_index * candle_spacing,
-                        y: anchor.price,
-                        is_hovered: u32::from(is_hovered),
-                        is_selected: 1,
-                    });
-                }
+            // Always show anchors for rectangles
+            for (idx, anchor) in [&rect.corner1, &rect.corner2].iter().enumerate() {
+                let is_hovered = hovered_anchor.map_or(false, |(id, i)| id == rect.id && i == idx);
+                anchors.push(AnchorGpu {
+                    x: anchor.candle_index * candle_spacing,
+                    y: anchor.price,
+                    is_hovered: u32::from(is_hovered),
+                    is_selected: u32::from(is_selected),
+                });
             }
         }
     }

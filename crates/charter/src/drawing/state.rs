@@ -161,8 +161,12 @@ impl DrawingManager {
     pub fn update_cursor(&mut self, world_x: f32, world_y: f32, candles: &[Candle], candle_spacing: f32) {
         self.cursor_pos = Some(self.snap_target(world_x, world_y, candles, candle_spacing));
 
-        // Update hover state only in Select mode when not dragging
-        if self.tool == DrawingTool::Select {
+        // Update hover state when not actively drawing a new shape and not dragging
+        let can_hover = self.tool == DrawingTool::Select
+            || self.tool == DrawingTool::None
+            || !self.tool.is_drawing_tool();
+
+        if can_hover {
             if let InteractionState::Idle = self.interaction {
                 self.update_hover(world_x, world_y, candle_spacing);
             }
@@ -171,19 +175,63 @@ impl DrawingManager {
         }
     }
 
+    /// Update cursor with scale information for better hit detection.
+    pub fn update_cursor_with_scale(
+        &mut self,
+        world_x: f32,
+        world_y: f32,
+        candles: &[Candle],
+        candle_spacing: f32,
+        x_world_per_pixel: f32,
+        y_world_per_pixel: f32,
+    ) {
+        self.cursor_pos = Some(self.snap_target(world_x, world_y, candles, candle_spacing));
+
+        // Update hover state when not actively drawing a new shape and not dragging
+        let can_hover = self.tool == DrawingTool::Select
+            || self.tool == DrawingTool::None
+            || !self.tool.is_drawing_tool();
+
+        if can_hover {
+            if let InteractionState::Idle = self.interaction {
+                self.update_hover_with_scale(world_x, world_y, candle_spacing, x_world_per_pixel, y_world_per_pixel);
+            }
+        } else {
+            self.hovered_anchor = None;
+        }
+    }
+
     /// Find if cursor is hovering over an anchor.
     fn update_hover(&mut self, world_x: f32, world_y: f32, candle_spacing: f32) {
-        const ANCHOR_HIT_RADIUS_X: f32 = 0.8;
-        const ANCHOR_HIT_RADIUS_Y: f32 = 15.0;
+        // Fallback: use candle_spacing for both dimensions (not ideal but works)
+        self.update_hover_with_scale(world_x, world_y, candle_spacing, candle_spacing, candle_spacing);
+    }
+
+    /// Find if cursor is hovering over an anchor with proper scale factors.
+    fn update_hover_with_scale(
+        &mut self,
+        world_x: f32,
+        world_y: f32,
+        candle_spacing: f32,
+        x_world_per_pixel: f32,
+        y_world_per_pixel: f32,
+    ) {
+        // Hit radius in pixels (should match visual anchor size)
+        const ANCHOR_HIT_RADIUS_PIXELS: f32 = 12.0;
 
         self.hovered_anchor = None;
 
-        // Only check selected drawing's anchors, or all if nothing selected
-        let drawings_to_check: Vec<_> = if let Some(selected_id) = self.selected {
-            self.drawings.iter().filter(|d| d.id() == selected_id).collect()
-        } else {
-            self.drawings.iter().collect()
-        };
+        // Convert pixel radius to world coordinates
+        let hit_radius_x = ANCHOR_HIT_RADIUS_PIXELS * x_world_per_pixel;
+        let hit_radius_y = ANCHOR_HIT_RADIUS_PIXELS * y_world_per_pixel;
+
+        // Check all drawings for anchor hover (prioritize selected drawing first)
+        let mut drawings_to_check: Vec<_> = self.drawings.iter().collect();
+
+        // Put selected drawing first so it gets priority
+        if let Some(selected_id) = self.selected {
+            drawings_to_check.sort_by_key(|d| if d.id() == selected_id { 0 } else { 1 });
+        }
 
         for drawing in drawings_to_check {
             for (idx, anchor) in drawing.anchors().iter().enumerate() {
@@ -192,7 +240,7 @@ impl DrawingManager {
                 let dx = (world_x - ax).abs();
                 let dy = (world_y - ay).abs();
 
-                if dx < ANCHOR_HIT_RADIUS_X * candle_spacing && dy < ANCHOR_HIT_RADIUS_Y {
+                if dx < hit_radius_x && dy < hit_radius_y {
                     self.hovered_anchor = Some((drawing.id(), idx));
                     return;
                 }

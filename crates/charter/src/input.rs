@@ -157,6 +157,9 @@ impl InputHandler {
             KeyCode::KeyB => Some(InputAction::SelectDrawingTool(crate::drawing::DrawingTool::Rectangle)),
             KeyCode::KeyV => Some(InputAction::SelectDrawingTool(crate::drawing::DrawingTool::Select)),
 
+            // Delete selected drawing
+            KeyCode::Backspace | KeyCode::Delete => Some(InputAction::DrawingDelete),
+
             _ => None,
         }
     }

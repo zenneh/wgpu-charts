@@ -10,10 +10,10 @@ use winit::{
     window::Window,
 };
 
-use crate::state_legacy::State;
+use crate::state::AppState;
 
 pub struct App {
-    state: Option<State>,
+    state: Option<AppState>,
 }
 
 impl App {
@@ -22,7 +22,7 @@ impl App {
     }
 }
 
-impl ApplicationHandler<State> for App {
+impl ApplicationHandler<AppState> for App {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         #[allow(unused_mut)]
         let mut window_attributes = Window::default_attributes();
@@ -31,7 +31,7 @@ impl ApplicationHandler<State> for App {
 
         #[cfg(not(target_arch = "wasm32"))]
         {
-            self.state = Some(pollster::block_on(State::new(window)).unwrap());
+            self.state = Some(pollster::block_on(AppState::new(window)).unwrap());
         }
     }
 
@@ -43,7 +43,7 @@ impl ApplicationHandler<State> for App {
     }
 
     #[allow(unused_mut)]
-    fn user_event(&mut self, _event_loop: &ActiveEventLoop, mut event: State) {
+    fn user_event(&mut self, _event_loop: &ActiveEventLoop, mut event: AppState) {
         self.state = Some(event);
     }
 
@@ -59,7 +59,7 @@ impl ApplicationHandler<State> for App {
         };
 
         // Let egui handle the event first
-        let egui_response = state.egui_state.on_window_event(&state.window, &event);
+        let egui_response = state.ui.egui_state.on_window_event(&state.window, &event);
         if egui_response.consumed {
             state.window.request_redraw();
             return;

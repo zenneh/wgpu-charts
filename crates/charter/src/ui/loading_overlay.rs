@@ -3,7 +3,7 @@
 //! This module provides the loading overlay that is displayed during
 //! background operations like data loading, aggregation, and TA computation.
 
-use crate::state_legacy::LoadingState;
+use crate::state::LoadingState;
 
 /// Shows the loading overlay when loading is in progress.
 ///
