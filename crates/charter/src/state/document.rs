@@ -106,9 +106,6 @@ pub struct DocumentState {
 
     /// Index of currently hovered level (if any).
     pub hovered_level: Option<usize>,
-
-    /// Index of currently hovered trend (if any).
-    pub hovered_trend: Option<usize>,
 }
 
 impl DocumentState {
@@ -126,7 +123,6 @@ impl DocumentState {
             indicators: IndicatorRegistry::new(),
             hovered_range: None,
             hovered_level: None,
-            hovered_trend: None,
         }
     }
 
@@ -178,9 +174,7 @@ impl DocumentState {
         for ta in &mut self.ta_data {
             ta.ranges.clear();
             ta.levels.clear();
-            ta.trends.clear();
             ta.computed = false;
-            ta.prediction = None;
         }
     }
 

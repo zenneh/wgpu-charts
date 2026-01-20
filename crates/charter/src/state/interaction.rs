@@ -4,7 +4,6 @@
 //! loading state, replay mode, live data connection, and current symbol.
 
 use crate::replay::ReplayManager;
-use charter_ta::MlInferenceHandle;
 
 /// Current loading state of the application.
 #[derive(Debug, Clone)]
@@ -19,8 +18,6 @@ pub enum LoadingState {
     CreatingBuffers { current: usize, total: usize },
     /// Computing technical analysis for a timeframe.
     ComputingTa { timeframe: usize },
-    /// Computing TA for ML inference across multiple timeframes.
-    ComputingMlTa { completed: usize, total: usize },
 }
 
 impl LoadingState {
@@ -45,9 +42,6 @@ impl LoadingState {
                 let label = tf_labels.get(*timeframe).unwrap_or(&"?");
                 format!("Computing TA for {}...", label)
             }
-            LoadingState::ComputingMlTa { completed, total } => {
-                format!("Computing ML TA ({}/{})", completed, total)
-            }
         }
     }
 }
@@ -65,7 +59,6 @@ impl Default for LoadingState {
 /// - Replay mode state
 /// - Live data connection status
 /// - Current trading symbol
-/// - ML inference handle
 pub struct InteractionState {
     /// Current loading operation state.
     pub loading_state: LoadingState,
@@ -81,9 +74,6 @@ pub struct InteractionState {
 
     /// Receiver for live data events.
     pub live_event_rx: Option<tokio::sync::mpsc::Receiver<charter_data::LiveDataEvent>>,
-
-    /// ML inference handle (if model is loaded).
-    pub ml_inference: Option<MlInferenceHandle>,
 }
 
 impl InteractionState {
@@ -95,7 +85,6 @@ impl InteractionState {
             current_symbol: default_symbol,
             ws_connected: false,
             live_event_rx: None,
-            ml_inference: None,
         }
     }
 
@@ -119,11 +108,6 @@ impl InteractionState {
         self.ws_connected
     }
 
-    /// Check if ML inference is available.
-    pub fn has_ml_inference(&self) -> bool {
-        self.ml_inference.is_some()
-    }
-
     /// Set the loading state.
     pub fn set_loading_state(&mut self, state: LoadingState) {
         self.loading_state = state;
@@ -142,17 +126,6 @@ impl InteractionState {
     /// Toggle replay mode.
     pub fn toggle_replay(&mut self, current_timeframe_idx: usize) -> bool {
         self.replay.toggle(current_timeframe_idx)
-    }
-
-    /// Load ML inference model from path.
-    pub fn load_ml_model(&mut self, path: &str) -> Result<(), String> {
-        match MlInferenceHandle::load(path) {
-            Ok(handle) => {
-                self.ml_inference = Some(handle);
-                Ok(())
-            }
-            Err(e) => Err(e.to_string()),
-        }
     }
 }
 

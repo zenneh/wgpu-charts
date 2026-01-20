@@ -63,8 +63,8 @@ use charter_render::{
 };
 use charter_sync::SyncManager;
 use charter_ta::{
-    Analyzer, AnalyzerConfig, CandleDirection, Level, LevelState, LevelType, MlFeatures,
-    MlInferenceHandle, Range, TimeframeFeatures, Trend, TrendState,
+    Analyzer, AnalyzerConfig, CandleDirection, DefaultAnalyzer, Level, LevelDirection, LevelState,
+    LevelType, Range, TimeframeConfig,
 };
 use charter_ui::TopBar;
 
@@ -103,10 +103,7 @@ pub enum BackgroundMessage {
         timeframe: usize,
         ranges: Vec<charter_ta::Range>,
         levels: Vec<charter_ta::Level>,
-        trends: Vec<charter_ta::Trend>,
     },
-    /// Progress update for batch ML TA computation.
-    MlTaProgress { completed: usize, total: usize },
     /// Loading state update.
     LoadingStateChanged(LoadingState),
     /// Live candle update from WebSocket.
@@ -409,13 +406,7 @@ impl AppState {
         let mut ta_data = Vec::new();
 
         for tf in timeframe_types {
-            ta_data.push(TimeframeTaData {
-                ranges: Vec::new(),
-                levels: Vec::new(),
-                trends: Vec::new(),
-                computed: false,
-                prediction: None,
-            });
+            ta_data.push(TimeframeTaData::new());
 
             let tf_data = renderer.create_timeframe_data(&device, Vec::new(), tf.label());
             timeframes.push(tf_data);
@@ -435,11 +426,6 @@ impl AppState {
         interaction.loading_state = LoadingState::FetchingMexcData {
             symbol: default_symbol,
         };
-
-        // Try to load ML model if it exists
-        if let Err(e) = interaction.load_ml_model("data/charter_model.onnx") {
-            log::debug!("ML model not available (this is OK): {}", e);
-        }
 
         // Create UI state
         let egui_ctx = egui::Context::default();
@@ -585,14 +571,11 @@ impl AppState {
                     timeframe,
                     ranges,
                     levels,
-                    trends,
                 } => {
                     if let Some(ta) = self.document.ta_data.get_mut(timeframe) {
                         ta.ranges = ranges;
                         ta.levels = levels;
-                        ta.trends = trends;
                         ta.computed = true;
-                        ta.prediction = None;
                     }
                     self.interaction.loading_state = LoadingState::Idle;
 
@@ -600,18 +583,6 @@ impl AppState {
                         && self.document.ta_settings.show_ta
                     {
                         self.update_ta_buffers();
-                    }
-                    updated = true;
-                }
-                BackgroundMessage::MlTaProgress { completed, total } => {
-                    if completed >= total {
-                        self.interaction.loading_state = LoadingState::Idle;
-                        if self.interaction.replay.is_locked() {
-                            self.recompute_replay_ta();
-                        }
-                    } else {
-                        self.interaction.loading_state =
-                            LoadingState::ComputingMlTa { completed, total };
                     }
                     updated = true;
                 }
@@ -1111,9 +1082,6 @@ impl AppState {
         if self.document.ta_settings.show_ta {
             self.ensure_ta_computed();
             self.update_ta_buffers();
-            if self.interaction.replay.enabled && self.interaction.ml_inference.is_some() {
-                self.precompute_ml_ta();
-            }
         }
         self.window.request_redraw();
     }
@@ -1126,11 +1094,8 @@ impl AppState {
         let was_enabled = self.interaction.replay.enabled;
         self.interaction.replay.toggle(self.document.current_timeframe);
 
-        if !was_enabled && self.interaction.replay.enabled {
-            if self.interaction.ml_inference.is_some() && self.document.ta_settings.show_ta {
-                self.precompute_ml_ta();
-            }
-        } else if was_enabled && !self.interaction.replay.enabled {
+        if was_enabled && !self.interaction.replay.enabled {
+            // Exiting replay mode - refresh TA buffers
             if self.document.ta_settings.show_ta {
                 self.update_ta_buffers();
             }
@@ -1218,7 +1183,7 @@ impl AppState {
         };
 
         if current_tf_candles.is_empty() {
-            self.interaction.replay.ta_data = Some(TimeframeTaData::with_data(Vec::new(), Vec::new(), Vec::new()));
+            self.interaction.replay.ta_data = Some(TimeframeTaData::with_data(Vec::new(), Vec::new()));
             self.update_ta_buffers();
             return;
         }
@@ -1226,8 +1191,9 @@ impl AppState {
         let current_tf_idx = self.document.current_timeframe;
         let replay_candle_idx = current_tf_candles.len().saturating_sub(1);
 
-        let mut ta_data = if let Some(ta) = self.document.ta_data.get(current_tf_idx) {
+        let ta_data = if let Some(ta) = self.document.ta_data.get(current_tf_idx) {
             if ta.computed {
+                // Filter ranges and levels to those visible at replay position
                 let ranges: Vec<_> = ta.ranges.iter().filter(|r| r.end_index <= replay_candle_idx).cloned().collect();
                 let levels: Vec<_> = ta.levels.iter().filter(|l| {
                     if l.created_at_index > replay_candle_idx { return false; }
@@ -1238,34 +1204,18 @@ impl AppState {
                     }
                     true
                 }).cloned().collect();
-                let trends: Vec<_> = ta.trends.iter().filter(|t| {
-                    if t.created_at_index > replay_candle_idx { return false; }
-                    if t.state == TrendState::Broken {
-                        if let Some(ref break_event) = t.break_event {
-                            return break_event.candle_index > replay_candle_idx;
-                        }
-                    }
-                    true
-                }).cloned().collect();
-                TimeframeTaData::with_data(ranges, levels, trends)
+                TimeframeTaData::with_data(ranges, levels)
             } else {
-                let ta_config = self.analyzer_config_for_timeframe(current_tf_idx);
-                let mut analyzer = Analyzer::with_config(ta_config);
-                for candle in &current_tf_candles {
-                    analyzer.process_candle(*candle);
-                }
-                TimeframeTaData::with_data(analyzer.ranges().to_vec(), analyzer.all_levels().to_vec(), analyzer.all_trends().to_vec())
+                // Run analysis on current candles
+                let current_price = current_tf_candles.last().map(|c| c.close).unwrap_or(0.0);
+                let config = self.create_analyzer_config();
+                let mut analyzer = DefaultAnalyzer::new(config);
+                let result = analyzer.update(current_tf_idx as u8, &current_tf_candles, current_price);
+                TimeframeTaData::with_data(result.ranges, result.levels)
             }
         } else {
-            TimeframeTaData::with_data(Vec::new(), Vec::new(), Vec::new())
+            TimeframeTaData::with_data(Vec::new(), Vec::new())
         };
-
-        if let Some(ref ml_inference) = self.interaction.ml_inference {
-            let prediction = self.compute_ml_prediction(ml_inference, replay_ts, &current_tf_candles);
-            if let Some(pred) = prediction {
-                ta_data.set_prediction(pred);
-            }
-        }
 
         self.interaction.replay.ta_data = Some(ta_data);
         self.update_ta_buffers();
@@ -1497,83 +1447,49 @@ impl AppState {
     // TA Methods
     // =========================================================================
 
-    fn analyzer_config_for_timeframe(&self, tf_idx: usize) -> AnalyzerConfig {
-        let tf_label = Timeframe::all()[tf_idx].label();
-        let ta_config = self.app_config.ta_analysis_for_timeframe(tf_label);
-        AnalyzerConfig::default()
-            .doji_threshold(ta_config.doji_threshold)
-            .min_range_candles(ta_config.min_range_candles)
-            .level_tolerance(ta_config.level_tolerance)
-            .create_greedy_levels(ta_config.create_greedy_levels)
+    /// Create an analyzer configuration with all timeframes
+    fn create_analyzer_config(&self) -> AnalyzerConfig {
+        let timeframes = Timeframe::all();
+        let configs: Vec<TimeframeConfig> = timeframes
+            .iter()
+            .map(|tf| {
+                let ta_config = self.app_config.ta_analysis_for_timeframe(tf.label());
+                let mut tf_config = TimeframeConfig::new(*tf, ta_config.min_range_candles, ta_config.doji_threshold);
+                if !ta_config.create_greedy_levels {
+                    tf_config = tf_config.without_greedy_levels();
+                }
+                tf_config
+            })
+            .collect();
+        AnalyzerConfig::new(configs)
     }
 
     fn compute_ta_background(&self, timeframe: usize) {
         let candles = self.document.timeframes.get(timeframe).map(|tf| tf.candles.clone()).unwrap_or_default();
         let sender = self.bg_sender.clone();
-        let ta_config = self.analyzer_config_for_timeframe(timeframe);
+        let tf = Timeframe::all()[timeframe];
+        let ta_config = self.app_config.ta_analysis_for_timeframe(tf.label());
 
         thread::spawn(move || {
             let _ = sender.send(BackgroundMessage::LoadingStateChanged(LoadingState::ComputingTa { timeframe }));
 
-            let mut analyzer = Analyzer::with_config(ta_config);
-
-            for candle in &candles {
-                analyzer.process_candle(*candle);
+            // Create config for this single timeframe
+            let mut tf_config = TimeframeConfig::new(tf, ta_config.min_range_candles, ta_config.doji_threshold);
+            if !ta_config.create_greedy_levels {
+                tf_config = tf_config.without_greedy_levels();
             }
+            let config = AnalyzerConfig::new(vec![tf_config]);
+            let mut analyzer = DefaultAnalyzer::new(config);
 
-            let ranges = analyzer.ranges().to_vec();
-            let levels = analyzer.all_levels().to_vec();
-            let trends = analyzer.all_trends().to_vec();
+            // Run analysis
+            let current_price = candles.last().map(|c| c.close).unwrap_or(0.0);
+            let result = analyzer.update(0, &candles, current_price);
 
-            let _ = sender.send(BackgroundMessage::TaComputed { timeframe, ranges, levels, trends });
-        });
-    }
-
-    fn precompute_ml_ta(&self) {
-        const ML_TIMEFRAME_INDICES: [usize; 4] = [2, 4, 8, 9];
-        const MIN_CANDLES: usize = 100;
-
-        let mut timeframes_to_compute: Vec<(usize, Vec<Candle>, AnalyzerConfig)> = Vec::new();
-
-        for &tf_idx in &ML_TIMEFRAME_INDICES {
-            if tf_idx >= self.document.timeframes.len() {
-                continue;
-            }
-            if let Some(ta) = self.document.ta_data.get(tf_idx) {
-                if ta.computed {
-                    continue;
-                }
-            }
-            let candles = &self.document.timeframes[tf_idx].candles;
-            if candles.len() < MIN_CANDLES {
-                continue;
-            }
-            let ta_config = self.analyzer_config_for_timeframe(tf_idx);
-            timeframes_to_compute.push((tf_idx, candles.clone(), ta_config));
-        }
-
-        if timeframes_to_compute.is_empty() {
-            return;
-        }
-
-        let total = timeframes_to_compute.len();
-        let sender = self.bg_sender.clone();
-
-        let _ = sender.send(BackgroundMessage::MlTaProgress { completed: 0, total });
-
-        thread::spawn(move || {
-            for (completed, (tf_idx, candles, ta_config)) in timeframes_to_compute.into_iter().enumerate() {
-                let mut analyzer = Analyzer::with_config(ta_config);
-                for candle in &candles {
-                    analyzer.process_candle(*candle);
-                }
-                let ranges = analyzer.ranges().to_vec();
-                let levels = analyzer.all_levels().to_vec();
-                let trends = analyzer.all_trends().to_vec();
-
-                let _ = sender.send(BackgroundMessage::TaComputed { timeframe: tf_idx, ranges, levels, trends });
-                let _ = sender.send(BackgroundMessage::MlTaProgress { completed: completed + 1, total });
-            }
+            let _ = sender.send(BackgroundMessage::TaComputed {
+                timeframe,
+                ranges: result.ranges,
+                levels: result.levels,
+            });
         });
     }
 
@@ -1652,7 +1568,8 @@ impl AppState {
         let level_count = filtered_levels.len() as u32;
         let mut level_gpus: Vec<LevelGpu> = filtered_levels.iter()
             .map(|l| {
-                let (r, g, b, a) = match (l.direction, l.state) {
+                // Use source_direction (the direction of the range that created the level)
+                let (r, g, b, a) = match (l.source_direction, l.state) {
                     (CandleDirection::Bullish, LevelState::Inactive) => (0.0, 0.5, 0.3, 0.4),
                     (CandleDirection::Bullish, LevelState::Active) => (0.0, 0.8, 0.4, 0.7),
                     (CandleDirection::Bullish, LevelState::Broken) => (0.0, 0.3, 0.2, 0.3),
@@ -1675,41 +1592,9 @@ impl AppState {
             level_gpus.push(LevelGpu { y_value: 0.0, x_start: 0.0, r: 0.0, g: 0.0, b: 0.0, a: 0.0, level_type: 0, hit_count: 0 });
         }
 
-        // Filter and convert trends
-        let filtered_trends: Vec<&Trend> = ta.trends.iter()
-            .filter(|t| {
-                if !self.document.ta_settings.show_trends { return false; }
-                match t.state {
-                    TrendState::Active => self.document.ta_settings.show_active_trends,
-                    TrendState::Hit => self.document.ta_settings.show_hit_trends,
-                    TrendState::Broken => self.document.ta_settings.show_broken_trends,
-                }
-            })
-            .take(MAX_TA_TRENDS)
-            .collect();
-
-        let trend_count = filtered_trends.len() as u32;
-        let mut trend_gpus: Vec<TrendGpu> = filtered_trends.iter()
-            .map(|t| {
-                let (r, g, b, a) = match (t.direction, t.state) {
-                    (CandleDirection::Bullish, TrendState::Active) => (0.0, 0.9, 0.5, 0.8),
-                    (CandleDirection::Bullish, TrendState::Hit) => (0.0, 0.7, 0.4, 0.6),
-                    (CandleDirection::Bullish, TrendState::Broken) => (0.0, 0.4, 0.2, 0.4),
-                    (CandleDirection::Bearish, TrendState::Active) => (0.9, 0.3, 0.3, 0.8),
-                    (CandleDirection::Bearish, TrendState::Hit) => (0.7, 0.2, 0.2, 0.6),
-                    (CandleDirection::Bearish, TrendState::Broken) => (0.4, 0.1, 0.1, 0.4),
-                    (CandleDirection::Doji, _) => (0.5, 0.5, 0.5, 0.5),
-                };
-                TrendGpu {
-                    x_start: t.start.candle_index as f32 * CANDLE_SPACING,
-                    y_start: t.start.price,
-                    x_end: t.end.candle_index as f32 * CANDLE_SPACING,
-                    y_end: t.end.price,
-                    r, g, b, a,
-                }
-            })
-            .collect();
-
+        // Trends are no longer supported - use empty trend buffer
+        let trend_count = 0u32;
+        let mut trend_gpus: Vec<TrendGpu> = Vec::new();
         while trend_gpus.len() < MAX_TA_TRENDS {
             trend_gpus.push(TrendGpu { x_start: 0.0, y_start: 0.0, x_end: 0.0, y_end: 0.0, r: 0.0, g: 0.0, b: 0.0, a: 0.0 });
         }
@@ -2086,139 +1971,6 @@ impl AppState {
         rsi / 100.0
     }
 
-    fn compute_ml_prediction(&self, ml_inference: &MlInferenceHandle, replay_ts: f64, current_tf_candles: &[Candle]) -> Option<charter_ta::MlPrediction> {
-        const MIN_CANDLES: usize = 100;
-        const ML_TIMEFRAME_INDICES: [usize; 4] = [2, 4, 8, 9];
-        const LOOKBACK_SECONDS: f64 = 21.0 * 24.0 * 3600.0;
-        let lookback_start_ts = replay_ts - LOOKBACK_SECONDS;
-
-        let current_candle = current_tf_candles.last()?;
-        let current_candle_idx = current_tf_candles.len().saturating_sub(1);
-        let current_price = current_candle.close;
-
-        let mut tf_features: Vec<TimeframeFeatures> = Vec::new();
-
-        for (feature_idx, &tf_idx) in ML_TIMEFRAME_INDICES.iter().enumerate() {
-            let ta_config = self.analyzer_config_for_timeframe(tf_idx);
-            if tf_idx >= self.document.timeframes.len() {
-                continue;
-            }
-            let tf_data = &self.document.timeframes[tf_idx];
-            let candles = &tf_data.candles;
-            if candles.len() < MIN_CANDLES {
-                continue;
-            }
-
-            let end_idx = candles
-                .binary_search_by(|c| c.timestamp.partial_cmp(&replay_ts).unwrap_or(std::cmp::Ordering::Equal))
-                .unwrap_or_else(|i| i.saturating_sub(1));
-
-            if end_idx == 0 {
-                continue;
-            }
-
-            let tf_candle_idx = end_idx.min(candles.len().saturating_sub(1));
-
-            let (levels, trends, feature_candle_idx) = if let Some(ta) = self.document.ta_data.get(tf_idx) {
-                if ta.computed {
-                    let levels: Vec<_> = ta.levels.iter()
-                        .filter(|l| {
-                            if l.created_at_index > tf_candle_idx { return false; }
-                            if l.state == LevelState::Broken {
-                                if let Some(ref break_event) = l.break_event {
-                                    return break_event.candle_index > tf_candle_idx;
-                                }
-                            }
-                            true
-                        })
-                        .cloned()
-                        .collect();
-                    let trends: Vec<_> = ta.trends.iter()
-                        .filter(|t| {
-                            if t.created_at_index > tf_candle_idx { return false; }
-                            if t.state == TrendState::Broken {
-                                if let Some(ref break_event) = t.break_event {
-                                    return break_event.candle_index > tf_candle_idx;
-                                }
-                            }
-                            true
-                        })
-                        .cloned()
-                        .collect();
-                    (levels, trends, tf_candle_idx)
-                } else {
-                    let start_idx = candles
-                        .binary_search_by(|c| c.timestamp.partial_cmp(&lookback_start_ts).unwrap_or(std::cmp::Ordering::Equal))
-                        .unwrap_or_else(|i| i);
-
-                    let mut analyzer = Analyzer::with_config(ta_config.clone());
-                    for candle in &candles[start_idx..=tf_candle_idx] {
-                        analyzer.process_candle(*candle);
-                    }
-                    let relative_idx = tf_candle_idx - start_idx;
-                    (analyzer.all_levels().to_vec(), analyzer.all_trends().to_vec(), relative_idx)
-                }
-            } else {
-                continue;
-            };
-
-            let features = TimeframeFeatures::extract(feature_idx, &levels, &trends, current_price, feature_candle_idx);
-            tf_features.push(features);
-        }
-
-        if tf_features.is_empty() {
-            return None;
-        }
-
-        let prev_close = if current_candle_idx > 0 {
-            current_tf_candles.get(current_candle_idx - 1).map(|c| c.close).unwrap_or(current_candle.open)
-        } else {
-            current_candle.open
-        };
-        let price_change = if prev_close > 0.0 { (current_candle.close - prev_close) / prev_close } else { 0.0 };
-
-        let body = (current_candle.close - current_candle.open).abs();
-        let range = current_candle.high - current_candle.low;
-        let body_ratio = if range > f32::EPSILON { body / range } else { 0.5 };
-
-        let volume_sum: f32 = current_tf_candles.iter().rev().take(100).map(|c| c.volume).sum();
-        let volume_count = current_tf_candles.len().min(100) as f32;
-        let avg_volume = volume_sum / volume_count.max(1.0);
-        let volume_normalized = if avg_volume > f32::EPSILON { current_candle.volume / avg_volume } else { 1.0 };
-
-        let rsi_14 = Self::calculate_rsi_for_candles(current_tf_candles, current_candle_idx, 14);
-
-        let ml_features = MlFeatures {
-            timeframes: tf_features,
-            current_price,
-            current_volume_normalized: volume_normalized,
-            price_change_normalized: price_change,
-            body_ratio,
-            is_bullish: if current_candle.close > current_candle.open { 1.0 } else { 0.0 },
-            rsi_14,
-        };
-
-        let feature_count = ml_features.feature_count();
-        if feature_count != 302 {
-            eprintln!("ML feature count mismatch: got {} (from {} timeframes), expected 302", feature_count, ml_features.timeframes.len());
-            return None;
-        }
-
-        match ml_inference.predict(&ml_features) {
-            Ok(prediction) => Some(prediction),
-            Err(e) => {
-                static LAST_ERROR: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-                let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
-                let last = LAST_ERROR.load(std::sync::atomic::Ordering::Relaxed);
-                if now > last + 5 {
-                    LAST_ERROR.store(now, std::sync::atomic::Ordering::Relaxed);
-                    eprintln!("ML inference error: {}", e);
-                }
-                None
-            }
-        }
-    }
-
     // =========================================================================
     // Hover State Methods
     // =========================================================================
@@ -2346,62 +2098,10 @@ impl AppState {
         None
     }
 
-    fn find_hovered_trend(&self) -> Option<usize> {
-        if !self.document.ta_settings.show_ta || !self.document.ta_settings.show_trends {
-            return None;
-        }
-
-        let (world_x, world_y) = self.get_cursor_world_pos()?;
-        let ta = self.document.ta_data.get(self.document.current_timeframe)?;
-
-        let chart_height = self.graphics.config.height as f32 * (1.0 - VOLUME_HEIGHT_RATIO);
-        let y_scale = self.graphics.renderer.camera.scale[1] * 2.0 / chart_height;
-        let tolerance = y_scale * 10.0;
-
-        for (i, trend) in ta.trends.iter().enumerate() {
-            let state_visible = match trend.state {
-                TrendState::Active => self.document.ta_settings.show_active_trends,
-                TrendState::Hit => self.document.ta_settings.show_hit_trends,
-                TrendState::Broken => self.document.ta_settings.show_broken_trends,
-            };
-
-            if !state_visible {
-                continue;
-            }
-
-            let start_x = trend.start.candle_index as f32 * CANDLE_SPACING;
-
-            if world_x < start_x {
-                continue;
-            }
-
-            let candle_pos = world_x / CANDLE_SPACING;
-            let dx = trend.end.candle_index as f32 - trend.start.candle_index as f32;
-            let trend_price = if dx.abs() < f32::EPSILON {
-                trend.start.price
-            } else {
-                let slope = (trend.end.price - trend.start.price) / dx;
-                let x = candle_pos - trend.start.candle_index as f32;
-                trend.start.price + slope * x
-            };
-
-            if (world_y - trend_price).abs() < tolerance {
-                return Some(i);
-            }
-        }
-
-        None
-    }
-
     fn update_hover_state(&mut self) {
         self.document.hovered_range = self.find_hovered_range();
         self.document.hovered_level = if self.document.hovered_range.is_none() {
             self.find_hovered_level()
-        } else {
-            None
-        };
-        self.document.hovered_trend = if self.document.hovered_range.is_none() && self.document.hovered_level.is_none() {
-            self.find_hovered_trend()
         } else {
             None
         };
@@ -2445,12 +2145,7 @@ impl AppState {
             }),
             level: self.document.hovered_level.and_then(|idx| {
                 self.document.ta_data.get(self.document.current_timeframe).and_then(|ta| {
-                    ta.levels.get(idx).map(|l| (l.price, l.level_type, l.direction, l.state, l.hits.len()))
-                })
-            }),
-            trend: self.document.hovered_trend.and_then(|idx| {
-                self.document.ta_data.get(self.document.current_timeframe).and_then(|ta| {
-                    ta.trends.get(idx).map(|t| (t.direction, t.state, t.start.price, t.end.price, t.start.candle_index, t.end.candle_index, t.hits.len()))
+                    ta.levels.get(idx).map(|l| (l.price, l.level_type, l.source_direction, l.state, l.hits.len()))
                 })
             }),
         };
@@ -2935,25 +2630,6 @@ impl AppState {
                     render_pass.set_bind_group(0, &self.graphics.renderer.camera_bind_group, &[]);
                     render_pass.set_bind_group(1, &tf.ta_bind_group, &[]);
                     render_pass.draw(0..6, 0..filtered_level_count);
-                }
-
-                // Render trends
-                if self.document.ta_settings.show_trends && !ta.trends.is_empty() {
-                    let filtered_trend_count = ta.trends.iter()
-                        .filter(|t| match t.state {
-                            TrendState::Active => self.document.ta_settings.show_active_trends,
-                            TrendState::Hit => self.document.ta_settings.show_hit_trends,
-                            TrendState::Broken => self.document.ta_settings.show_broken_trends,
-                        })
-                        .take(MAX_TA_TRENDS)
-                        .count() as u32;
-
-                    if filtered_trend_count > 0 {
-                        render_pass.set_pipeline(&self.graphics.renderer.ta_pipeline.trend_pipeline);
-                        render_pass.set_bind_group(0, &self.graphics.renderer.camera_bind_group, &[]);
-                        render_pass.set_bind_group(1, &tf.ta_bind_group, &[]);
-                        render_pass.draw(0..6, 0..filtered_trend_count);
-                    }
                 }
             }
 

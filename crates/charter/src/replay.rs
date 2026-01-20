@@ -5,17 +5,14 @@
 
 use charter_core::{aggregate_candles, Candle, Timeframe};
 use charter_render::TimeframeData;
-use charter_ta::{Level, MlPrediction, Range, Trend};
+use charter_ta::{Level, Range};
 
 /// TA data computed for a single timeframe.
 #[derive(Debug, Clone)]
 pub struct TimeframeTaData {
     pub ranges: Vec<Range>,
     pub levels: Vec<Level>,
-    pub trends: Vec<Trend>,
     pub computed: bool,
-    /// ML prediction for this timeframe (if model is loaded).
-    pub prediction: Option<MlPrediction>,
 }
 
 impl TimeframeTaData {
@@ -24,26 +21,17 @@ impl TimeframeTaData {
         Self {
             ranges: Vec::new(),
             levels: Vec::new(),
-            trends: Vec::new(),
             computed: false,
-            prediction: None,
         }
     }
 
     /// Creates a new computed TimeframeTaData with the given data.
-    pub fn with_data(ranges: Vec<Range>, levels: Vec<Level>, trends: Vec<Trend>) -> Self {
+    pub fn with_data(ranges: Vec<Range>, levels: Vec<Level>) -> Self {
         Self {
             ranges,
             levels,
-            trends,
             computed: true,
-            prediction: None,
         }
-    }
-
-    /// Sets the ML prediction for this timeframe.
-    pub fn set_prediction(&mut self, prediction: MlPrediction) {
-        self.prediction = Some(prediction);
     }
 }
 
@@ -514,8 +502,6 @@ mod tests {
         let ta = TimeframeTaData::default();
         assert!(ta.ranges.is_empty());
         assert!(ta.levels.is_empty());
-        assert!(ta.trends.is_empty());
         assert!(!ta.computed);
-        assert!(ta.prediction.is_none());
     }
 }

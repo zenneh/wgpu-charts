@@ -1,12 +1,12 @@
 //! Technical Analysis control panel UI.
 //!
 //! This module provides the TA settings panel that allows users to configure
-//! which TA elements (ranges, levels, trends) are displayed on the chart.
+//! which TA elements (ranges, levels) are displayed on the chart.
 
 use crate::replay::TimeframeTaData;
 use crate::state::TaDisplaySettings;
 use charter_render::STATS_PANEL_WIDTH;
-use charter_ta::{CandleDirection, LevelState, LevelType, TrendState};
+use charter_ta::{CandleDirection, LevelState, LevelType};
 
 /// Statistics computed from TA data.
 #[derive(Debug, Clone, Default)]
@@ -25,14 +25,6 @@ pub struct TaStats {
     pub hold_broken: usize,
     pub greedy_levels: usize,
     pub greedy_broken: usize,
-
-    // Trend stats
-    pub total_trends: usize,
-    pub active_trends: usize,
-    pub broken_trends: usize,
-    pub trends_with_hits: usize,
-    pub total_trend_hits: usize,
-    pub avg_trend_hits_before_break: f32,
 }
 
 impl TaStats {
@@ -82,32 +74,6 @@ impl TaStats {
             stats.avg_hits_before_break = broken_level_hits as f32 / stats.broken_levels as f32;
         }
 
-        // Trend statistics
-        stats.total_trends = ta_data.trends.len();
-        for trend in &ta_data.trends {
-            if trend.state == TrendState::Broken {
-                stats.broken_trends += 1;
-            } else {
-                stats.active_trends += 1;
-            }
-
-            if !trend.hits.is_empty() {
-                stats.trends_with_hits += 1;
-            }
-            stats.total_trend_hits += trend.hits.len();
-        }
-
-        // Average hits before break for trends
-        let broken_trend_hits: usize = ta_data
-            .trends
-            .iter()
-            .filter(|t| t.state == TrendState::Broken)
-            .map(|t| t.hits.len())
-            .sum();
-        if stats.broken_trends > 0 {
-            stats.avg_trend_hits_before_break = broken_trend_hits as f32 / stats.broken_trends as f32;
-        }
-
         stats
     }
 
@@ -126,15 +92,6 @@ impl TaStats {
             0.0
         } else {
             (self.respected_hits as f32 / self.total_level_hits as f32) * 100.0
-        }
-    }
-
-    /// Percentage of trends that are still active (not broken).
-    pub fn trend_hold_rate(&self) -> f32 {
-        if self.total_trends == 0 {
-            0.0
-        } else {
-            (self.active_trends as f32 / self.total_trends as f32) * 100.0
         }
     }
 
@@ -164,8 +121,6 @@ pub struct TaHoveredInfo {
     pub range: Option<(CandleDirection, usize, f32, f32, usize, usize)>,
     /// Hovered level info: (price, level_type, direction, state, hit_count)
     pub level: Option<(f32, LevelType, CandleDirection, LevelState, usize)>,
-    /// Hovered trend info: (direction, state, start_price, end_price, start_idx, end_idx, hit_count)
-    pub trend: Option<(CandleDirection, TrendState, f32, f32, usize, usize, usize)>,
 }
 
 /// Response from the TA panel indicating what actions should be taken.
@@ -201,9 +156,9 @@ pub fn show_ta_panel(
     let mut ta_settings = settings.clone();
 
     // Get counts from TA data
-    let (range_count, level_count, trend_count) = ta_data
-        .map(|ta| (ta.ranges.len(), ta.levels.len(), ta.trends.len()))
-        .unwrap_or((0, 0, 0));
+    let (range_count, level_count) = ta_data
+        .map(|ta| (ta.ranges.len(), ta.levels.len()))
+        .unwrap_or((0, 0));
 
     egui::Window::new("Technical Analysis")
         .default_pos([screen_width - STATS_PANEL_WIDTH - 220.0, 10.0])
@@ -228,19 +183,8 @@ pub fn show_ta_panel(
                 ui.checkbox(&mut ta_settings.show_broken_levels, "Broken");
 
                 ui.separator();
-                ui.checkbox(&mut ta_settings.show_trends, "Show Trends");
-                if ta_settings.show_trends {
-                    ui.indent("trend_states", |ui| {
-                        ui.checkbox(&mut ta_settings.show_active_trends, "Active");
-                        ui.checkbox(&mut ta_settings.show_hit_trends, "Hit");
-                        ui.checkbox(&mut ta_settings.show_broken_trends, "Broken");
-                    });
-                }
-
-                ui.separator();
                 ui.label(format!("Ranges: {}", range_count));
                 ui.label(format!("Levels: {}", level_count));
-                ui.label(format!("Trends: {}", trend_count));
 
                 // Show TA statistics
                 if let Some(ta) = ta_data {
@@ -280,79 +224,6 @@ pub fn show_ta_panel(
                             stats.greedy_break_rate()
                         ));
                     }
-
-                    if stats.total_trends > 0 {
-                        ui.separator();
-                        ui.label("Trend Statistics:");
-                        ui.label(format!(
-                            "  Active: {} / Broken: {}",
-                            stats.active_trends, stats.broken_trends
-                        ));
-                        ui.label(format!("  Hold rate: {:.1}%", stats.trend_hold_rate()));
-                        if stats.total_trend_hits > 0 {
-                            ui.label(format!("  Total hits: {}", stats.total_trend_hits));
-                        }
-                        if stats.broken_trends > 0 {
-                            ui.label(format!(
-                                "  Avg hits before break: {:.1}",
-                                stats.avg_trend_hits_before_break
-                            ));
-                        }
-                    }
-
-                    // Show ML prediction if available
-                    if let Some(pred) = &ta.prediction {
-                        ui.separator();
-
-                        // Direction prediction with visual indicator
-                        let is_bullish = pred.direction_up_prob > 0.5;
-                        let prob = if is_bullish { pred.direction_up_prob } else { 1.0 - pred.direction_up_prob };
-
-                        let (dir_color, dir_text, arrow) = if is_bullish {
-                            (egui::Color32::from_rgb(0, 200, 0), "BULLISH", "▲")
-                        } else {
-                            (egui::Color32::from_rgb(200, 0, 0), "BEARISH", "▼")
-                        };
-
-                        // Confidence-based background intensity
-                        let bg_alpha = (pred.confidence * 40.0) as u8;
-                        let bg_color = if is_bullish {
-                            egui::Color32::from_rgba_unmultiplied(0, 200, 0, bg_alpha)
-                        } else {
-                            egui::Color32::from_rgba_unmultiplied(200, 0, 0, bg_alpha)
-                        };
-
-                        // Draw prediction box
-                        egui::Frame::new()
-                            .fill(bg_color)
-                            .inner_margin(4.0)
-                            .corner_radius(4.0)
-                            .show(ui, |ui| {
-                                ui.horizontal(|ui| {
-                                    ui.colored_label(dir_color, format!("{} {}", arrow, dir_text));
-                                    ui.label(format!("({:.0}%)", prob * 100.0));
-                                });
-
-                                // Confidence bar
-                                let conf_pct = pred.confidence;
-                                ui.horizontal(|ui| {
-                                    ui.label("Conf:");
-                                    let bar_width = 60.0;
-                                    let (rect, _) = ui.allocate_exact_size(
-                                        egui::vec2(bar_width, 8.0),
-                                        egui::Sense::hover()
-                                    );
-                                    let painter = ui.painter();
-                                    painter.rect_filled(rect, 2.0, egui::Color32::from_gray(60));
-                                    let filled_rect = egui::Rect::from_min_size(
-                                        rect.min,
-                                        egui::vec2(bar_width * conf_pct, 8.0)
-                                    );
-                                    painter.rect_filled(filled_rect, 2.0, dir_color);
-                                    ui.label(format!("{:.0}%", conf_pct * 100.0));
-                                });
-                            });
-                    }
                 }
 
                 // Show hovered element info
@@ -375,18 +246,6 @@ pub fn show_ta_panel(
                     ui.label(format!("  State: {:?}", state));
                     ui.label(format!("  Hits: {}", hits));
                 }
-
-                if let Some((dir, state, start_price, end_price, start_idx, end_idx, hits)) =
-                    hovered.trend
-                {
-                    ui.separator();
-                    ui.label("Hovered Trend:");
-                    ui.label(format!("  Direction: {:?}", dir));
-                    ui.label(format!("  State: {:?}", state));
-                    ui.label(format!("  Start: {:.2} @ idx {}", start_price, start_idx));
-                    ui.label(format!("  End: {:.2} @ idx {}", end_price, end_idx));
-                    ui.label(format!("  Hits: {}", hits));
-                }
             }
         });
 
@@ -397,11 +256,7 @@ pub fn show_ta_panel(
         || ta_settings.show_greedy_levels != settings.show_greedy_levels
         || ta_settings.show_active_levels != settings.show_active_levels
         || ta_settings.show_hit_levels != settings.show_hit_levels
-        || ta_settings.show_broken_levels != settings.show_broken_levels
-        || ta_settings.show_trends != settings.show_trends
-        || ta_settings.show_active_trends != settings.show_active_trends
-        || ta_settings.show_hit_trends != settings.show_hit_trends
-        || ta_settings.show_broken_trends != settings.show_broken_trends;
+        || ta_settings.show_broken_levels != settings.show_broken_levels;
 
     if changed {
         response.settings_changed = true;

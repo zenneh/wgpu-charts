@@ -7,10 +7,6 @@ edition.workspace = true
 name = "charter"
 path = "src/main.rs"
 
-[[bin]]
-name = "charter-ml-export"
-path = "src/bin/ml_export.rs"
-
 [dependencies]
 charter-config.workspace = true
 charter-core.workspace = true
