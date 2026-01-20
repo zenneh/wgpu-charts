@@ -123,6 +123,11 @@ pub struct ChartRenderer {
     pub current_price_params_buffer: wgpu::Buffer,
     pub current_price_bind_group: wgpu::BindGroup,
     pub current_price: Option<f32>,
+    /// Open price of the current candle (for determining bullish/bearish color)
+    current_price_open: f32,
+    /// X bounds for current price line
+    current_price_x_min: f32,
+    current_price_x_max: f32,
 
     pub visible_start: u32,
     pub visible_count: u32,
@@ -251,6 +256,9 @@ impl ChartRenderer {
             current_price_params_buffer,
             current_price_bind_group,
             current_price: None,
+            current_price_open: 0.0,
+            current_price_x_min: 0.0,
+            current_price_x_max: 0.0,
             visible_start: 0,
             visible_count: 0,
             current_lod_factor: 1,
@@ -803,25 +811,92 @@ impl ChartRenderer {
     }
 
     /// Update the current price line. Set to None to hide it.
-    pub fn set_current_price(&mut self, queue: &wgpu::Queue, price: Option<f32>, x_min: f32, x_max: f32) {
+    /// `open_price` is the open price of the current candle, used to determine color (bullish/bearish).
+    pub fn set_current_price(&mut self, queue: &wgpu::Queue, price: Option<f32>, open_price: f32, x_min: f32, x_max: f32) {
         self.current_price = price;
+        self.current_price_open = open_price;
+        self.current_price_x_min = x_min;
+        self.current_price_x_max = x_max;
+
+        // Determine color based on candle direction (bullish = green, bearish = red)
+        let (r, g, b) = if let Some(close) = price {
+            if close >= open_price {
+                (0.0, 0.8, 0.4)  // Green for bullish (close >= open)
+            } else {
+                (0.8, 0.2, 0.2)  // Red for bearish (close < open)
+            }
+        } else {
+            (1.0, 0.843, 0.0)  // Default gold/yellow when no price
+        };
 
         let chart_height = self.config_height as f32 * (1.0 - VOLUME_HEIGHT_RATIO);
         let aspect = (self.config_width as f32 - STATS_PANEL_WIDTH) / chart_height;
         let (y_min, y_max) = self.camera.visible_y_range(aspect);
         let price_range = y_max - y_min;
         let world_units_per_pixel = price_range / chart_height;
-        let line_thickness = (2.0 * world_units_per_pixel).max(price_range * 0.001);
+        // 1.0 for exactly 1 pixel thickness
+        let line_thickness = world_units_per_pixel.max(price_range * 0.0005);
 
         let params = CurrentPriceParams {
             y_value: price.unwrap_or(0.0),
             x_min,
             x_max,
             line_thickness,
-            r: 1.0,       // Gold/yellow color
-            g: 0.843,
-            b: 0.0,
+            r,
+            g,
+            b,
             visible: if price.is_some() { 1 } else { 0 },
+            dot_spacing: 10.0,
+            screen_width: self.config_width as f32,
+            _padding1: 0.0,
+            _padding2: 0.0,
+        };
+
+        queue.write_buffer(
+            &self.current_price_params_buffer,
+            0,
+            bytemuck::cast_slice(&[params]),
+        );
+    }
+
+    /// Update the current price line thickness and x range based on current zoom level.
+    /// Call this after camera changes (zooming, panning) to keep line at constant 1px and full width.
+    pub fn update_current_price_line(&mut self, queue: &wgpu::Queue) {
+        // Only update if we have a visible price line
+        let Some(price) = self.current_price else {
+            return;
+        };
+
+        // Determine color based on candle direction (bullish = green, bearish = red)
+        let (r, g, b) = if price >= self.current_price_open {
+            (0.0, 0.8, 0.4)  // Green for bullish (close >= open)
+        } else {
+            (0.8, 0.2, 0.2)  // Red for bearish (close < open)
+        };
+
+        let chart_height = self.config_height as f32 * (1.0 - VOLUME_HEIGHT_RATIO);
+        let chart_width = self.config_width as f32 - STATS_PANEL_WIDTH;
+        let aspect = chart_width / chart_height;
+        let (y_min, y_max) = self.camera.visible_y_range(aspect);
+        let (x_min, x_max) = self.camera.visible_x_range(aspect);
+        let price_range = y_max - y_min;
+        let world_units_per_pixel = price_range / chart_height;
+        // 1.0 for exactly 1 pixel thickness
+        let line_thickness = world_units_per_pixel.max(price_range * 0.0005);
+
+        // Update stored x range for full canvas width
+        self.current_price_x_min = x_min;
+        self.current_price_x_max = x_max;
+
+        let params = CurrentPriceParams {
+            y_value: price,
+            x_min,
+            x_max,
+            line_thickness,
+            r,
+            g,
+            b,
+            visible: 1,
             dot_spacing: 10.0,
             screen_width: self.config_width as f32,
             _padding1: 0.0,

@@ -7,11 +7,13 @@
 //! 2. Return response structs describing what actions should be taken
 //! 3. Not directly modify application state - that responsibility stays in state.rs
 
+mod drawing_toolbar;
 mod loading_overlay;
 mod macd_panel;
 mod symbol_picker;
 mod ta_panel;
 
+pub use drawing_toolbar::{show_drawing_toolbar, DrawingToolbarResponse};
 pub use loading_overlay::show_loading_overlay;
 pub use macd_panel::{show_macd_panel, MacdPanelResponse};
 pub use symbol_picker::{show_symbol_picker, SymbolPickerState};

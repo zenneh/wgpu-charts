@@ -60,6 +60,14 @@ pub enum InputAction {
     ToggleSymbolPicker,
     /// Start live data updates.
     StartLiveUpdates,
+    /// Cancel the current drawing operation.
+    DrawingCancel,
+    /// Select a drawing tool.
+    SelectDrawingTool(crate::drawing::DrawingTool),
+    /// Toggle snap mode for drawing tools.
+    ToggleSnap,
+    /// Delete the currently selected drawing.
+    DrawingDelete,
 }
 
 /// Handles input events and converts them to semantic actions.
@@ -142,6 +150,13 @@ impl InputHandler {
             KeyCode::Digit8 => Some(InputAction::SwitchTimeframe(7)),
             KeyCode::Digit9 => Some(InputAction::SwitchTimeframe(8)),
             KeyCode::Digit0 => Some(InputAction::SwitchTimeframe(9)),
+
+            // Drawing tools
+            KeyCode::KeyH => Some(InputAction::SelectDrawingTool(crate::drawing::DrawingTool::HorizontalRay)),
+            KeyCode::KeyT => Some(InputAction::SelectDrawingTool(crate::drawing::DrawingTool::Ray)),
+            KeyCode::KeyB => Some(InputAction::SelectDrawingTool(crate::drawing::DrawingTool::Rectangle)),
+            KeyCode::KeyV => Some(InputAction::SelectDrawingTool(crate::drawing::DrawingTool::Select)),
+
             _ => None,
         }
     }

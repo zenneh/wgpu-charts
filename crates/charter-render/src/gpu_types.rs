@@ -476,3 +476,117 @@ pub fn aggregate_volume_lod(volumes: &[VolumeGpu], candles: &[CandleGpu], factor
         })
         .collect()
 }
+
+// ============================================================================
+// User Drawing GPU Types
+// ============================================================================
+
+/// GPU struct for rendering a horizontal ray.
+/// A horizontal line from a start X position extending to the right edge.
+#[repr(C)]
+#[derive(Debug, Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct DrawingHRayGpu {
+    /// Start X position (candle index * spacing).
+    pub x_start: f32,
+    /// Y position (price level).
+    pub y_value: f32,
+    /// Color RGBA.
+    pub r: f32,
+    pub g: f32,
+    pub b: f32,
+    pub a: f32,
+    /// Line style (0 = solid, 1 = dashed, 2 = dotted).
+    pub line_style: u32,
+    pub _padding: u32,
+}
+
+/// GPU struct for rendering a ray/trendline.
+/// A line from start to end, extending to the right edge.
+#[repr(C)]
+#[derive(Debug, Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct DrawingRayGpu {
+    /// Start X position.
+    pub x_start: f32,
+    /// Start Y position.
+    pub y_start: f32,
+    /// End X position.
+    pub x_end: f32,
+    /// End Y position.
+    pub y_end: f32,
+    /// Color RGBA.
+    pub r: f32,
+    pub g: f32,
+    pub b: f32,
+    pub a: f32,
+}
+
+/// GPU struct for rendering a rectangle.
+#[repr(C)]
+#[derive(Debug, Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct DrawingRectGpu {
+    /// Minimum X position.
+    pub x_min: f32,
+    /// Minimum Y position.
+    pub y_min: f32,
+    /// Maximum X position.
+    pub x_max: f32,
+    /// Maximum Y position.
+    pub y_max: f32,
+    /// Fill color RGBA.
+    pub fill_r: f32,
+    pub fill_g: f32,
+    pub fill_b: f32,
+    pub fill_a: f32,
+    /// Border color RGBA.
+    pub border_r: f32,
+    pub border_g: f32,
+    pub border_b: f32,
+    pub border_a: f32,
+}
+
+/// GPU struct for rendering an anchor point handle.
+#[repr(C)]
+#[derive(Debug, Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct AnchorGpu {
+    /// X position.
+    pub x: f32,
+    /// Y position.
+    pub y: f32,
+    /// Whether this anchor is hovered (1 = yes, 0 = no).
+    pub is_hovered: u32,
+    /// Whether this anchor's drawing is selected (1 = yes, 0 = no).
+    pub is_selected: u32,
+}
+
+/// Drawing render parameters.
+#[repr(C)]
+#[derive(Debug, Copy, Clone, PartialEq, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct DrawingRenderParams {
+    /// Left edge X position (for extending rays to left).
+    pub x_min: f32,
+    /// Right edge X position (for extending rays to right).
+    pub x_max: f32,
+    /// Line thickness for horizontal lines (in Y-axis world units).
+    pub line_thickness: f32,
+    /// Line thickness for vertical lines (in X-axis world units).
+    pub x_line_thickness: f32,
+    /// Anchor handle size in world units.
+    pub anchor_size: f32,
+    /// Number of horizontal rays.
+    pub hray_count: u32,
+    /// Number of rays/trendlines.
+    pub ray_count: u32,
+    /// Number of rectangles.
+    pub rect_count: u32,
+    /// Number of anchor handles.
+    pub anchor_count: u32,
+    pub _padding1: u32,
+    pub _padding2: u32,
+    pub _padding3: u32,
+}
+
+/// Maximum number of each drawing type.
+pub const MAX_DRAWING_HRAYS: usize = 256;
+pub const MAX_DRAWING_RAYS: usize = 256;
+pub const MAX_DRAWING_RECTS: usize = 256;
+pub const MAX_DRAWING_ANCHORS: usize = 512;

@@ -10,7 +10,7 @@ use winit::{
     window::Window,
 };
 
-use crate::state::State;
+use crate::state_legacy::State;
 
 pub struct App {
     state: Option<State>,

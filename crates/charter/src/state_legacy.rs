@@ -14,20 +14,22 @@ use winit::{
     window::Window,
 };
 
+use crate::drawing::{prepare_drawing_render_data, DrawingManager, DrawingTool};
 use crate::indicators::{DynMacd, IndicatorGpuBuffers, IndicatorRegistry, MacdGpuBuffers};
 use crate::input::{InputAction, InputHandler};
 use crate::replay::{ReplayManager, TimeframeTaData};
 use crate::ui::{
-    show_loading_overlay, show_macd_panel, show_ta_panel,
-    MacdPanelResponse, SymbolPickerState, TaHoveredInfo,
+    show_drawing_toolbar, show_loading_overlay, show_macd_panel, show_ta_panel,
+    DrawingToolbarResponse, MacdPanelResponse, SymbolPickerState, TaHoveredInfo,
 };
 use charter_core::{aggregate_candles, Candle, Timeframe};
 use charter_data::{LiveDataEvent, LiveDataManager, MexcSource};
 use charter_indicators::{Indicator, Macd, MacdConfig};
 use charter_render::{
-    ChartRenderer, IndicatorParams, IndicatorPointGpu, LevelGpu, RangeGpu, RenderParams,
-    TaRenderParams, TimeframeData, TrendGpu, VolumeRenderParams, CANDLE_SPACING, INDICES_PER_CANDLE,
-    MAX_TA_LEVELS, MAX_TA_RANGES, MAX_TA_TRENDS, STATS_PANEL_WIDTH, VOLUME_HEIGHT_RATIO,
+    ChartRenderer, DrawingPipeline, DrawingRenderParams, IndicatorParams, IndicatorPointGpu,
+    LevelGpu, RangeGpu, RenderParams, TaRenderParams, TimeframeData, TrendGpu, VolumeRenderParams,
+    CANDLE_SPACING, INDICES_PER_CANDLE, MAX_TA_LEVELS, MAX_TA_RANGES, MAX_TA_TRENDS,
+    STATS_PANEL_WIDTH, VOLUME_HEIGHT_RATIO,
 };
 use charter_ta::{
     Analyzer, AnalyzerConfig, CandleDirection, Level, LevelState, LevelType, MlFeatures, Range,
@@ -224,6 +226,20 @@ pub struct State {
     pub sync_enabled: bool,
     pub sync_state: SyncState,
     pub sync_manager: Option<SyncManager>,
+
+    // Drawing tools
+    pub drawing: DrawingManager,
+    pub drawing_pipeline: DrawingPipeline,
+    pub drawing_hray_buffer: wgpu::Buffer,
+    pub drawing_ray_buffer: wgpu::Buffer,
+    pub drawing_rect_buffer: wgpu::Buffer,
+    pub drawing_anchor_buffer: wgpu::Buffer,
+    pub drawing_params_buffer: wgpu::Buffer,
+    pub drawing_bind_group: wgpu::BindGroup,
+
+    // Track whether we've performed the initial view fit
+    // Prevents destroying user's zoom/pan position on data sync
+    has_initial_view: bool,
 }
 
 impl State {
@@ -406,6 +422,22 @@ impl State {
             show_broken_trends: app_config.ta.display.show_broken_trends,
         };
 
+        // Create drawing pipeline and buffers
+        let drawing_pipeline = DrawingPipeline::new(&device, surface_format, &renderer.candle_pipeline.camera_bind_group_layout);
+        let drawing_hray_buffer = drawing_pipeline.create_hray_buffer(&device);
+        let drawing_ray_buffer = drawing_pipeline.create_ray_buffer(&device);
+        let drawing_rect_buffer = drawing_pipeline.create_rect_buffer(&device);
+        let drawing_anchor_buffer = drawing_pipeline.create_anchor_buffer(&device);
+        let drawing_params_buffer = drawing_pipeline.create_params_buffer(&device);
+        let drawing_bind_group = drawing_pipeline.create_bind_group(
+            &device,
+            &drawing_hray_buffer,
+            &drawing_ray_buffer,
+            &drawing_rect_buffer,
+            &drawing_anchor_buffer,
+            &drawing_params_buffer,
+        );
+
         let state = Self {
             surface,
             device,
@@ -452,6 +484,18 @@ impl State {
                 app_config.sync.batch_delay_ms,
                 app_config.sync.sync_days,
             )),
+            // Drawing tools
+            drawing: DrawingManager::new(),
+            drawing_pipeline,
+            drawing_hray_buffer,
+            drawing_ray_buffer,
+            drawing_rect_buffer,
+            drawing_anchor_buffer,
+            drawing_params_buffer,
+            drawing_bind_group,
+
+            // No initial view fit performed yet
+            has_initial_view: false,
         };
 
         // Don't update visible range yet - data is loading
@@ -468,12 +512,23 @@ impl State {
         if !self.indicators.is_empty() {
             self.update_macd_params();
         }
+        // Update current price line thickness when zoom changes
+        self.renderer.update_current_price_line(&self.queue);
     }
 
     /// Update only the MACD params buffers (when view changes).
     /// This is more efficient than update_macd_gpu_buffers which also updates point data.
     fn update_macd_params(&mut self) {
         let visible_start = self.renderer.visible_start as usize;
+
+        // Calculate line thickness to achieve ~1px on screen regardless of zoom
+        let chart_height = self.config.height as f32 * (1.0 - VOLUME_HEIGHT_RATIO);
+        let chart_width = self.config.width as f32 - STATS_PANEL_WIDTH;
+        let aspect = chart_width / chart_height;
+        let (y_min, y_max) = self.renderer.camera.visible_y_range(aspect);
+        let price_range = y_max - y_min;
+        let world_units_per_pixel = price_range / chart_height;
+        let line_thickness = (world_units_per_pixel * 1.5).max(0.001);
 
         for instance in self.indicators.iter() {
             let buffers = match &instance.gpu_buffers {
@@ -497,7 +552,7 @@ impl State {
             let macd_params = IndicatorParams {
                 first_visible: macd_first_visible,
                 point_spacing: CANDLE_SPACING,
-                line_thickness: 2.0,
+                line_thickness,
                 count: buffers.macd_point_count,
             };
             self.queue.write_buffer(
@@ -510,7 +565,7 @@ impl State {
             let signal_params = IndicatorParams {
                 first_visible: signal_first_visible,
                 point_spacing: CANDLE_SPACING,
-                line_thickness: 2.0,
+                line_thickness,
                 count: buffers.signal_point_count,
             };
             self.queue.write_buffer(
@@ -639,10 +694,11 @@ impl State {
                     if connected {
                         // Get current price from latest candle
                         if let Some(last_candle) = self.timeframes[0].candles.last() {
-                            self.update_current_price_line(Some(last_candle.close));
+                            self.update_current_price_line(Some(last_candle.close), last_candle.open);
                         }
                     } else {
-                        self.update_current_price_line(None);
+                        // When disconnecting, hide the line (open_price doesn't matter when None)
+                        self.update_current_price_line(None, 0.0);
                     }
                     updated = true;
                 }
@@ -701,9 +757,18 @@ impl State {
                 self.timeframes[index] = tf_data;
             }
 
-            // All done - set idle and fit view to show data
+            // All done - set idle
             self.loading_state = LoadingState::Idle;
-            self.fit_view(); // Properly position camera after data is loaded
+
+            // Only fit view if this is the first data load
+            // Subsequent syncs should preserve user's zoom/pan position
+            if !self.has_initial_view {
+                self.fit_view(); // First load - position camera to show data
+                self.has_initial_view = true;
+            } else {
+                // Preserve existing view, just update visible range for new data bounds
+                self.update_visible_range();
+            }
 
             // Start live updates automatically if not already connected
             if !self.ws_connected {
@@ -723,7 +788,8 @@ impl State {
 
     /// Update the current candle with live data from WebSocket.
     fn update_live_candle(&mut self, candle: Candle, is_closed: bool) {
-        if is_closed {
+        // Store the open price from the actual stored candle for color determination
+        let stored_open = if is_closed {
             // Previous candle is closed, append the new one
             self.timeframes[0].candles.push(candle);
 
@@ -738,15 +804,21 @@ impl State {
                 "1m",
             );
             self.timeframes[0] = new_tf_data;
+
+            // For a new candle, use its own open
+            candle.open
         } else {
             // Update the last candle in place
-            if let Some(last) = self.timeframes[0].candles.last_mut() {
+            let open_price = if let Some(last) = self.timeframes[0].candles.last_mut() {
                 last.high = last.high.max(candle.high);
                 last.low = last.low.min(candle.low);
                 last.close = candle.close;
                 last.volume = candle.volume;
                 // Keep open and timestamp unchanged
-            }
+                last.open // Use the stored candle's open, not the websocket message's
+            } else {
+                candle.open
+            };
 
             // Rebuild GPU buffer so the update is visible
             let candles = self.timeframes[0].candles.clone();
@@ -756,24 +828,31 @@ impl State {
                 "1m",
             );
             self.timeframes[0] = new_tf_data;
-        }
+
+            open_price
+        };
 
         // Update render params with new price_normalization (critical for correct rendering)
         self.update_visible_range();
 
         // Update current price line if websocket is connected
+        // Use the stored candle's open for correct bullish/bearish color determination
         if self.ws_connected {
-            self.update_current_price_line(Some(candle.close));
+            self.update_current_price_line(Some(candle.close), stored_open);
         }
 
         self.window.request_redraw();
     }
 
     /// Update the current price line display.
-    fn update_current_price_line(&mut self, price: Option<f32>) {
-        let tf = &self.timeframes[self.current_timeframe];
-        let x_max = (tf.candles.len() as f32) * CANDLE_SPACING;
-        self.renderer.set_current_price(&self.queue, price, 0.0, x_max);
+    /// Pass the close price and open price of the current candle to determine color.
+    fn update_current_price_line(&mut self, close_price: Option<f32>, open_price: f32) {
+        // Use visible x range to extend line across full canvas width
+        let chart_width = self.config.width as f32 - STATS_PANEL_WIDTH;
+        let chart_height = self.config.height as f32 * (1.0 - VOLUME_HEIGHT_RATIO);
+        let aspect = chart_width / chart_height;
+        let (x_min, x_max) = self.renderer.camera.visible_x_range(aspect);
+        self.renderer.set_current_price(&self.queue, close_price, open_price, x_min, x_max);
     }
 
     /// Re-aggregate all higher timeframes from the base 1-minute data.
@@ -1093,9 +1172,14 @@ impl State {
 
         if let Some(action) = self.input.handle_key(code, is_pressed) {
             match action {
-                InputAction::Exit => {
+                InputAction::DrawingCancel => {
+                    // Cancel in order: symbol picker -> drawing -> exit app
                     if self.show_symbol_picker {
                         self.show_symbol_picker = false;
+                        self.window.request_redraw();
+                    } else if self.drawing.is_interacting() || self.drawing.tool != DrawingTool::None {
+                        self.drawing.cancel();
+                        self.drawing.set_tool(DrawingTool::None);
                         self.window.request_redraw();
                     } else {
                         event_loop.exit()
@@ -1112,6 +1196,21 @@ impl State {
                 InputAction::ReplayDecreaseStep => self.replay_decrease_step_size(),
                 InputAction::ReplayIncreaseStep => self.replay_increase_step_size(),
                 InputAction::SwitchTimeframe(idx) => self.switch_timeframe(idx),
+                // Drawing tools
+                InputAction::SelectDrawingTool(tool) => {
+                    self.drawing.set_tool(tool);
+                    self.window.request_redraw();
+                }
+                InputAction::ToggleSnap => {
+                    self.drawing.toggle_snap();
+                    self.window.request_redraw();
+                }
+                InputAction::DrawingDelete => {
+                    self.drawing.delete_selected();
+                    self.window.request_redraw();
+                }
+                // Exit is handled by DrawingCancel for now
+                InputAction::Exit => event_loop.exit(),
                 // These actions are not triggered by keyboard input
                 InputAction::Pan { .. }
                 | InputAction::Zoom { .. }
@@ -2164,6 +2263,15 @@ impl State {
         let tf = self.current_timeframe;
         let visible_start = self.renderer.visible_start as usize;
 
+        // Calculate line thickness to achieve ~1px on screen regardless of zoom
+        let chart_height = self.config.height as f32 * (1.0 - VOLUME_HEIGHT_RATIO);
+        let chart_width = self.config.width as f32 - STATS_PANEL_WIDTH;
+        let aspect = chart_width / chart_height;
+        let (y_min, y_max) = self.renderer.camera.visible_y_range(aspect);
+        let price_range = y_max - y_min;
+        let world_units_per_pixel = price_range / chart_height;
+        let line_thickness = (world_units_per_pixel * 1.5).max(0.001);
+
         for i in 0..self.indicators.len() {
             let instance = match self.indicators.get(i) {
                 Some(inst) => inst,
@@ -2218,7 +2326,7 @@ impl State {
             let macd_params = IndicatorParams {
                 first_visible: macd_first_visible,
                 point_spacing: CANDLE_SPACING,
-                line_thickness: 2.0,
+                line_thickness,
                 count: conversion.macd_points.len() as u32,
             };
             self.queue.write_buffer(
@@ -2231,7 +2339,7 @@ impl State {
             let signal_params = IndicatorParams {
                 first_visible: signal_first_visible,
                 point_spacing: CANDLE_SPACING,
-                line_thickness: 2.0,
+                line_thickness,
                 count: conversion.signal_points.len() as u32,
             };
             self.queue.write_buffer(
@@ -2315,7 +2423,42 @@ impl State {
         self.window.request_redraw();
     }
 
+    /// Convert screen coordinates to world (chart) coordinates.
+    fn screen_to_world(&self, screen_x: f32, screen_y: f32) -> (f32, f32) {
+        // Use chart area dimensions (excluding stats panel and volume section)
+        let chart_width = self.config.width as f32 - STATS_PANEL_WIDTH;
+        let chart_height = self.config.height as f32 * (1.0 - VOLUME_HEIGHT_RATIO);
+        let aspect = chart_width / chart_height;
+
+        // Calculate cursor position in NDC relative to the chart area
+        let ndc_x = (screen_x / chart_width) * 2.0 - 1.0;
+        let ndc_y = 1.0 - (screen_y / chart_height) * 2.0;
+
+        // Convert from NDC to world coordinates
+        let world_x = self.renderer.camera.position[0] + ndc_x * self.renderer.camera.scale[0] * aspect;
+        let world_y = self.renderer.camera.position[1] + ndc_y * self.renderer.camera.scale[1];
+
+        (world_x, world_y)
+    }
+
     pub fn handle_mouse_input(&mut self, state: ElementState, button: MouseButton) {
+        // Handle drawing input first if a drawing tool is active
+        if button == MouseButton::Left && self.drawing.tool != DrawingTool::None {
+            if let Some(last_pos) = self.input.last_mouse_pos {
+                let (world_x, world_y) = self.screen_to_world(last_pos[0], last_pos[1]);
+                let candles = &self.timeframes[self.current_timeframe].candles;
+
+                if state == ElementState::Pressed {
+                    if self.drawing.handle_press(world_x, world_y, candles, CANDLE_SPACING) {
+                        self.window.request_redraw();
+                        return; // Drawing consumed the click
+                    }
+                } else {
+                    self.drawing.handle_release();
+                }
+            }
+        }
+
         let replay_index_set = self.replay.index.is_some();
         if let Some(action) =
             self.input
@@ -2338,9 +2481,28 @@ impl State {
     pub fn handle_cursor_moved(&mut self, position: winit::dpi::PhysicalPosition<f64>) {
         let pos = (position.x as f32, position.y as f32);
 
+        // Update drawing cursor position
+        if self.drawing.tool != DrawingTool::None {
+            let (world_x, world_y) = self.screen_to_world(pos.0, pos.1);
+            let candles = &self.timeframes[self.current_timeframe].candles;
+            self.drawing.update_cursor(world_x, world_y, candles, CANDLE_SPACING);
+
+            // Handle drag for drawing operations
+            if self.input.mouse_pressed && self.drawing.is_interacting() {
+                if self.drawing.handle_drag(world_x, world_y, candles, CANDLE_SPACING) {
+                    self.window.request_redraw();
+                }
+            }
+        }
+
         if let Some(action) = self.input.handle_cursor_moved(pos) {
             match action {
                 InputAction::Pan { dx, dy } => {
+                    // Don't pan if we're dragging a drawing
+                    if self.drawing.is_interacting() {
+                        return;
+                    }
+
                     let aspect = self.config.width as f32 / self.config.height as f32;
                     let world_dx = -dx * (self.renderer.camera.scale[0] * aspect * 2.0)
                         / self.config.width as f32;
@@ -2354,11 +2516,19 @@ impl State {
                     self.update_visible_range();
                     self.window.request_redraw();
                 }
-                InputAction::CursorMoved { .. } => {
+                InputAction::CursorMoved { x, y } => {
                     // Update hover state when TA is visible
                     if self.ta_settings.show_ta {
                         self.update_hover_state();
                     }
+
+                    // Request redraw for drawing preview
+                    if self.drawing.tool.is_drawing_tool() {
+                        self.window.request_redraw();
+                    }
+
+                    // Suppress unused variable warning
+                    let _ = (x, y);
                 }
                 _ => {}
             }
@@ -2539,6 +2709,11 @@ impl State {
         let macd_response = RefCell::new(MacdPanelResponse::default());
         let symbol_picker_response = RefCell::new(None::<(bool, Option<String>)>);
 
+        // Drawing toolbar state
+        let drawing_tool = self.drawing.tool;
+        let drawing_snap_enabled = self.drawing.snap_enabled;
+        let drawing_toolbar_response = RefCell::new(DrawingToolbarResponse::default());
+
         // Get guideline values and visible range for price labels
         let guideline_values = self.renderer.guideline_values.clone();
         let aspect = chart_width / chart_height;
@@ -2596,6 +2771,13 @@ impl State {
             if top_bar_response.toggle_sync {
                 *should_toggle_sync.borrow_mut() = true;
             }
+
+            // Drawing toolbar
+            *drawing_toolbar_response.borrow_mut() = show_drawing_toolbar(
+                ctx,
+                drawing_tool,
+                drawing_snap_enabled,
+            );
 
             // TA control panel (extracted to ui::ta_panel)
             {
@@ -2821,6 +3003,15 @@ impl State {
         // Apply sync toggle from top bar
         if should_toggle_sync.into_inner() {
             self.toggle_sync();
+        }
+
+        // Handle drawing toolbar response
+        let drawing_resp = drawing_toolbar_response.into_inner();
+        if let Some(tool) = drawing_resp.selected_tool {
+            self.drawing.set_tool(tool);
+        }
+        if drawing_resp.toggle_snap {
+            self.drawing.toggle_snap();
         }
 
         self.egui_state
@@ -3058,6 +3249,102 @@ impl State {
                         render_pass.draw(0..6, 0..filtered_trend_count);
                     }
                 }
+            }
+
+            // Render user drawings
+            if !self.drawing.drawings.is_empty() || self.drawing.tool != DrawingTool::None {
+                // Use visible x range for extending rays to full canvas width
+                let aspect = chart_width / chart_height;
+                let (x_min, x_max) = self.renderer.camera.visible_x_range(aspect);
+                let (y_min, y_max) = self.renderer.camera.visible_y_range(aspect);
+
+                // Convert drawings to GPU format (includes preview)
+                let render_data = prepare_drawing_render_data(&self.drawing, CANDLE_SPACING);
+
+                // Update buffers
+                if !render_data.hrays.is_empty() {
+                    self.queue.write_buffer(&self.drawing_hray_buffer, 0, bytemuck::cast_slice(&render_data.hrays));
+                }
+                if !render_data.rays.is_empty() {
+                    self.queue.write_buffer(&self.drawing_ray_buffer, 0, bytemuck::cast_slice(&render_data.rays));
+                }
+                if !render_data.rects.is_empty() {
+                    self.queue.write_buffer(&self.drawing_rect_buffer, 0, bytemuck::cast_slice(&render_data.rects));
+                }
+                if !render_data.anchors.is_empty() {
+                    self.queue.write_buffer(&self.drawing_anchor_buffer, 0, bytemuck::cast_slice(&render_data.anchors));
+                }
+
+                // Calculate line thickness to achieve ~1px on screen regardless of zoom
+                // Y-axis: price_range / chart_height = world units per pixel (for horizontal lines)
+                // X-axis: visible_width / chart_width = world units per pixel (for vertical lines)
+                let price_range = y_max - y_min;
+                let visible_width = x_max - x_min;
+                let y_world_per_pixel = price_range / chart_height;
+                let x_world_per_pixel = visible_width / chart_width;
+
+                // Target 1.5 pixels for slight anti-aliasing, with minimum for very high zoom
+                let line_thickness = (y_world_per_pixel * 1.5).max(0.001);
+                let x_line_thickness = (x_world_per_pixel * 1.5).max(0.001);
+                // Anchor size should be visible (~8 pixels) but scale with zoom
+                let anchor_size = (y_world_per_pixel * 8.0).max(0.01);
+
+                // Update params
+                let params = DrawingRenderParams {
+                    x_min,
+                    x_max,
+                    line_thickness,
+                    x_line_thickness,
+                    anchor_size,
+                    hray_count: render_data.hrays.len() as u32,
+                    ray_count: render_data.rays.len() as u32,
+                    rect_count: render_data.rects.len() as u32,
+                    anchor_count: render_data.anchors.len() as u32,
+                    _padding1: 0,
+                    _padding2: 0,
+                    _padding3: 0,
+                };
+                self.queue.write_buffer(&self.drawing_params_buffer, 0, bytemuck::cast_slice(&[params]));
+
+                // Render rectangle fills first (behind other elements)
+                self.drawing_pipeline.render_rect_fills(
+                    &mut render_pass,
+                    &self.renderer.camera_bind_group,
+                    &self.drawing_bind_group,
+                    render_data.rects.len() as u32,
+                );
+
+                // Render rectangle borders
+                self.drawing_pipeline.render_rect_borders(
+                    &mut render_pass,
+                    &self.renderer.camera_bind_group,
+                    &self.drawing_bind_group,
+                    render_data.rects.len() as u32,
+                );
+
+                // Render horizontal rays
+                self.drawing_pipeline.render_hrays(
+                    &mut render_pass,
+                    &self.renderer.camera_bind_group,
+                    &self.drawing_bind_group,
+                    render_data.hrays.len() as u32,
+                );
+
+                // Render rays/trendlines
+                self.drawing_pipeline.render_rays(
+                    &mut render_pass,
+                    &self.renderer.camera_bind_group,
+                    &self.drawing_bind_group,
+                    render_data.rays.len() as u32,
+                );
+
+                // Render anchor handles (on top)
+                self.drawing_pipeline.render_anchors(
+                    &mut render_pass,
+                    &self.renderer.camera_bind_group,
+                    &self.drawing_bind_group,
+                    render_data.anchors.len() as u32,
+                );
             }
 
             // Render MACD indicators if any are enabled

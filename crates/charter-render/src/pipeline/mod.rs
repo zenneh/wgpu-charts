@@ -2,6 +2,7 @@
 
 pub mod candle;
 pub mod current_price;
+pub mod drawing;
 pub mod guideline;
 pub mod indicator;
 pub mod ta;
@@ -10,6 +11,7 @@ pub mod volume;
 
 pub use candle::CandlePipeline;
 pub use current_price::CurrentPricePipeline;
+pub use drawing::{DrawingCounts, DrawingPipeline, DrawingRenderData};
 pub use guideline::GuidelinePipeline;
 pub use indicator::IndicatorPipeline;
 pub use ta::{TaPipeline, TaLevelPipeline, TaRangePipeline, TaTrendPipeline};

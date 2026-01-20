@@ -1,10 +1,15 @@
 //! Charter - GPU-accelerated candlestick chart viewer.
 
 mod app;
+mod coords;
+mod drawing;
+mod events;
 mod indicators;
 mod input;
+mod input_mode;
 mod replay;
 mod state;
+mod state_legacy;
 mod ui;
 
 use anyhow::Result;

@@ -4,7 +4,7 @@
 //! which TA elements (ranges, levels, trends) are displayed on the chart.
 
 use crate::replay::TimeframeTaData;
-use crate::state::TaDisplaySettings;
+use crate::state_legacy::TaDisplaySettings;
 use charter_render::STATS_PANEL_WIDTH;
 use charter_ta::{CandleDirection, LevelState, LevelType, TrendState};
 
