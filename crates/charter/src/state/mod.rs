@@ -572,6 +572,61 @@ impl AppState {
                     ranges,
                     levels,
                 } => {
+                    // Debug: Print TA analysis summary
+                    if self.document.ta_settings.show_ta {
+                        use charter_ta::LevelState;
+                        let active_count = levels.iter().filter(|l| l.state == LevelState::Active).count();
+                        let inactive_count = levels.iter().filter(|l| l.state == LevelState::Inactive).count();
+                        let broken_count = levels.iter().filter(|l| l.state == LevelState::Broken).count();
+                        let total_hits: usize = levels.iter().map(|l| l.hits.len()).sum();
+
+                        println!("\n=== TA Analysis Complete (Timeframe {}) ===", timeframe);
+                        println!("Ranges: {}", ranges.len());
+                        println!("Levels: {} total ({} active, {} inactive, {} broken)",
+                            levels.len(), active_count, inactive_count, broken_count);
+                        println!("Total hits across all levels: {}", total_hits);
+
+                        // Show details for first few levels
+                        if !levels.is_empty() {
+                            println!("\nSample levels (first 5):");
+                            for (i, level) in levels.iter().take(5).enumerate() {
+                                println!("  [{}] price={:.2}, type={:?}, dir={:?}, state={:?}, hits={}, created_at={}",
+                                    i, level.price, level.level_type, level.level_direction,
+                                    level.state, level.hits.len(), level.created_at_index);
+                            }
+                        }
+
+                        // Check if any levels should have been activated
+                        if let Some(candles) = self.document.timeframes.get(timeframe).map(|tf| &tf.candles) {
+                            if !candles.is_empty() && inactive_count > 0 {
+                                println!("\nDiagnostic: Checking why levels are inactive...");
+                                for level in levels.iter().filter(|l| l.state == LevelState::Inactive).take(3) {
+                                    let candles_after = candles.iter().skip(level.created_at_index + 1).take(10);
+                                    let mut could_activate = false;
+                                    for (offset, c) in candles_after.enumerate() {
+                                        let body_top = c.open.max(c.close);
+                                        let body_bottom = c.open.min(c.close);
+                                        let would_activate = match level.level_direction {
+                                            charter_ta::LevelDirection::Resistance => body_bottom > level.price,
+                                            charter_ta::LevelDirection::Support => body_top < level.price,
+                                        };
+                                        if would_activate {
+                                            println!("  Level at {:.2} ({:?}): candle {} after creation SHOULD activate (body={:.2}-{:.2})",
+                                                level.price, level.level_direction, offset + 1, body_bottom, body_top);
+                                            could_activate = true;
+                                            break;
+                                        }
+                                    }
+                                    if !could_activate {
+                                        println!("  Level at {:.2} ({:?}): no activating candle in first 10 candles after creation (created_at={})",
+                                            level.price, level.level_direction, level.created_at_index);
+                                    }
+                                }
+                            }
+                        }
+                        println!("==========================================\n");
+                    }
+
                     if let Some(ta) = self.document.ta_data.get_mut(timeframe) {
                         ta.ranges = ranges;
                         ta.levels = levels;
@@ -2030,7 +2085,13 @@ impl AppState {
         }
 
         let (world_x, world_y) = self.get_cursor_world_pos()?;
-        let ta = self.document.ta_data.get(self.document.current_timeframe)?;
+
+        // Use replay TA data if in replay mode, otherwise use document TA data
+        let ta = if self.interaction.replay.is_locked() {
+            self.interaction.replay.ta_data.as_ref()?
+        } else {
+            self.document.ta_data.get(self.document.current_timeframe)?
+        };
 
         let chart_height = self.graphics.config.height as f32 * (1.0 - VOLUME_HEIGHT_RATIO);
         let chart_width = self.graphics.config.width as f32 - STATS_PANEL_WIDTH;
@@ -2062,7 +2123,13 @@ impl AppState {
         }
 
         let (world_x, world_y) = self.get_cursor_world_pos()?;
-        let ta = self.document.ta_data.get(self.document.current_timeframe)?;
+
+        // Use replay TA data if in replay mode, otherwise use document TA data
+        let ta = if self.interaction.replay.is_locked() {
+            self.interaction.replay.ta_data.as_ref()?
+        } else {
+            self.document.ta_data.get(self.document.current_timeframe)?
+        };
 
         let chart_height = self.graphics.config.height as f32 * (1.0 - VOLUME_HEIGHT_RATIO);
         let chart_width = self.graphics.config.width as f32 - STATS_PANEL_WIDTH;
@@ -2137,14 +2204,21 @@ impl AppState {
         let candle_count = self.document.current_candles().len();
 
         // Build hovered info for TA panel
+        // Use replay TA data if in replay mode, otherwise use document TA data
+        let ta_for_hover: Option<&TimeframeTaData> = if self.interaction.replay.is_locked() {
+            self.interaction.replay.ta_data.as_ref()
+        } else {
+            self.document.ta_data.get(self.document.current_timeframe)
+        };
+
         let ta_hovered = TaHoveredInfo {
             range: self.document.hovered_range.and_then(|idx| {
-                self.document.ta_data.get(self.document.current_timeframe).and_then(|ta| {
+                ta_for_hover.and_then(|ta| {
                     ta.ranges.get(idx).map(|r| (r.direction, r.candle_count, r.high, r.low, r.start_index, r.end_index))
                 })
             }),
             level: self.document.hovered_level.and_then(|idx| {
-                self.document.ta_data.get(self.document.current_timeframe).and_then(|ta| {
+                ta_for_hover.and_then(|ta| {
                     ta.levels.get(idx).map(|l| (l.price, l.level_type, l.source_direction, l.state, l.hits.len()))
                 })
             }),

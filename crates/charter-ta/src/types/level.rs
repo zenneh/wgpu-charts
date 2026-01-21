@@ -15,17 +15,43 @@ use charter_core::Candle;
 pub struct LevelId(pub u64);
 
 impl LevelId {
-    /// Create a new LevelId from raw components.
+    /// Create a new LevelId from raw components (legacy, for tests).
     #[inline]
     pub fn new(timeframe_idx: u8, sequence: u32) -> Self {
         let id = ((timeframe_idx as u64) << 32) | (sequence as u64);
         Self(id)
     }
 
+    /// Create a stable LevelId from range properties and level type.
+    ///
+    /// This ensures the same range always produces the same level ID,
+    /// regardless of when it's discovered. The ID encodes:
+    /// - timeframe_idx (8 bits)
+    /// - level_type (1 bit: 0=Hold, 1=GreedyHold)
+    /// - start_index (27 bits, max ~134M candles)
+    /// - end_index (28 bits, max ~268M candles)
+    #[inline]
+    pub fn from_range(
+        timeframe_idx: u8,
+        start_index: usize,
+        end_index: usize,
+        level_type: LevelType,
+    ) -> Self {
+        let type_bit: u64 = match level_type {
+            LevelType::Hold => 0,
+            LevelType::GreedyHold => 1,
+        };
+        let id = ((timeframe_idx as u64) << 56)
+            | (type_bit << 55)
+            | ((start_index as u64 & 0x7FF_FFFF) << 28)
+            | (end_index as u64 & 0xFFF_FFFF);
+        Self(id)
+    }
+
     /// Extract the timeframe index from the ID.
     #[inline]
     pub fn timeframe_idx(self) -> u8 {
-        (self.0 >> 32) as u8
+        (self.0 >> 56) as u8
     }
 }
 
@@ -225,7 +251,8 @@ impl Level {
         body_top: f32,
         body_bottom: f32,
     ) -> LevelInteraction {
-        // Activation: full body closes ABOVE level
+        // Activation: full body closes ABOVE level (same timeframe candle)
+        // A resistance from a bearish range activates when price trades above it
         if self.state == LevelState::Inactive {
             if body_bottom > self.price {
                 self.state = LevelState::Active;
@@ -285,7 +312,8 @@ impl Level {
         body_top: f32,
         body_bottom: f32,
     ) -> LevelInteraction {
-        // Activation: full body closes BELOW level
+        // Activation: full body closes BELOW level (same timeframe candle)
+        // A support from a bullish range activates when price trades below it
         if self.state == LevelState::Inactive {
             if body_top < self.price {
                 self.state = LevelState::Active;
@@ -437,6 +465,12 @@ impl LevelIndex {
         }
 
         self.by_id.insert(id, level);
+    }
+
+    /// Check if a level with the given ID already exists.
+    #[inline]
+    pub fn contains(&self, id: LevelId) -> bool {
+        self.by_id.contains_key(&id)
     }
 
     /// Get a level by ID.

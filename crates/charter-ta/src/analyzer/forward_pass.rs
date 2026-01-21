@@ -54,6 +54,12 @@ pub fn forward_pass(
 
         for level_id in level_ids {
             if let Some(level) = level_index.get_mut(level_id) {
+                // Only check candles that occur AFTER the level was created
+                // A level at index 70 shouldn't be checked against candles 0-70
+                if i <= level.created_at_index {
+                    continue;
+                }
+
                 let interaction =
                     level.check_interaction(candle, meta.direction, i, timeframe_idx);
 
@@ -105,6 +111,11 @@ pub fn check_candle_interactions(
 
     for level_id in level_ids {
         if let Some(level) = level_index.get_mut(level_id) {
+            // Only check candles that occur AFTER the level was created
+            if candle_index <= level.created_at_index {
+                continue;
+            }
+
             let interaction =
                 level.check_interaction(candle, meta.direction, candle_index, timeframe_idx);
 
@@ -211,8 +222,10 @@ mod tests {
         let mut index = create_test_level_index();
 
         // Candle that activates resistance (body fully above 110)
+        // Index 0 is skipped (level was created at index 0), so we need index 1+
         let candles = vec![
-            make_candle(111.0, 115.0, 110.5, 114.0), // Body: 111-114, above 110
+            make_candle(100.0, 105.0, 95.0, 102.0),  // Index 0: placeholder (skipped)
+            make_candle(111.0, 115.0, 110.5, 114.0), // Index 1: Body 111-114, above 110
         ];
 
         let result = forward_pass(&candles, &mut index, 0, 0.1, 0);
@@ -225,14 +238,14 @@ mod tests {
     fn test_forward_pass_hit() {
         let mut index = create_test_level_index();
 
-        // First activate the resistance
+        // First activate the resistance at candle index 1 (index 0 is level creation)
         let activation_candle = make_candle(111.0, 115.0, 110.5, 114.0);
-        check_candle_interactions(&activation_candle, 0, &mut index, 0, 0.1);
+        check_candle_interactions(&activation_candle, 1, &mut index, 0, 0.1);
 
-        // Now hit the resistance (wick touches 110, body stays above)
+        // Now hit the resistance (wick touches 110, body stays above) at index 2
         let hit_candle = make_candle(112.0, 115.0, 109.0, 113.0); // Low=109, body: 112-113
 
-        let events = check_candle_interactions(&hit_candle, 1, &mut index, 0, 0.1);
+        let events = check_candle_interactions(&hit_candle, 2, &mut index, 0, 0.1);
 
         let hit_events: Vec<_> = events
             .iter()
@@ -245,14 +258,14 @@ mod tests {
     fn test_forward_pass_break() {
         let mut index = create_test_level_index();
 
-        // First activate the resistance
+        // First activate the resistance at candle index 1
         let activation_candle = make_candle(111.0, 115.0, 110.5, 114.0);
-        check_candle_interactions(&activation_candle, 0, &mut index, 0, 0.1);
+        check_candle_interactions(&activation_candle, 1, &mut index, 0, 0.1);
 
-        // Break the resistance (bearish candle with body fully below 110)
+        // Break the resistance (bearish candle with body fully below 110) at index 2
         let break_candle = make_candle(109.0, 110.0, 105.0, 106.0); // Bearish, body: 106-109
 
-        let events = check_candle_interactions(&break_candle, 1, &mut index, 0, 0.1);
+        let events = check_candle_interactions(&break_candle, 2, &mut index, 0, 0.1);
 
         let break_events: Vec<_> = events
             .iter()
@@ -269,10 +282,12 @@ mod tests {
     fn test_batch_check_interactions() {
         let mut index = create_test_level_index();
 
+        // Start from index 1 since level was created at index 0
         let candles = vec![
-            make_candle(111.0, 115.0, 110.5, 114.0), // Activates resistance
-            make_candle(112.0, 115.0, 109.0, 113.0), // Hits resistance
-            make_candle(109.0, 110.0, 105.0, 106.0), // Breaks resistance
+            make_candle(100.0, 105.0, 95.0, 102.0),  // Index 0: placeholder (skipped)
+            make_candle(111.0, 115.0, 110.5, 114.0), // Index 1: Activates resistance
+            make_candle(112.0, 115.0, 109.0, 113.0), // Index 2: Hits resistance
+            make_candle(109.0, 110.0, 105.0, 106.0), // Index 3: Breaks resistance
         ];
 
         let events = batch_check_interactions(&candles, 0, &mut index, 0, 0.1);

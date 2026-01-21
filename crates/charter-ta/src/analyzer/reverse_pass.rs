@@ -75,7 +75,6 @@ pub fn reverse_pass(
     let mut builder = RangeBuilder::new(timeframe_idx, doji_threshold);
     let mut ranges = Vec::new();
     let mut levels = Vec::new();
-    let mut level_sequence: u32 = 0;
 
     // Track closest unbroken levels
     let mut closest_resistance: Option<f32> = existing_resistance;
@@ -116,7 +115,6 @@ pub fn reverse_pass(
                     &range,
                     candles,
                     timeframe_idx,
-                    &mut level_sequence,
                     create_greedy_levels,
                     current_price,
                     &mut closest_resistance,
@@ -139,7 +137,6 @@ pub fn reverse_pass(
                 &range,
                 candles,
                 timeframe_idx,
-                &mut level_sequence,
                 create_greedy_levels,
                 current_price,
                 &mut closest_resistance,
@@ -218,7 +215,6 @@ fn create_levels_if_unbroken(
     range: &Range,
     candles: &[Candle],
     timeframe_idx: u8,
-    level_sequence: &mut u32,
     create_greedy: bool,
     current_price: f32,
     closest_resistance: &mut Option<f32>,
@@ -229,11 +225,15 @@ fn create_levels_if_unbroken(
 ) -> Vec<Level> {
     let mut levels = Vec::new();
 
-    // Create hold level
+    // Create hold level with stable ID derived from range properties
     let hold_price = range.hold_level_price();
     if is_level_unbroken(range, candles, hold_price, doji_threshold) {
-        let id = LevelId::new(timeframe_idx, *level_sequence);
-        *level_sequence += 1;
+        let id = LevelId::from_range(
+            timeframe_idx,
+            range.start_index,
+            range.end_index,
+            LevelType::Hold,
+        );
 
         let level = Level::from_range(range, LevelType::Hold, id, range.end_index);
 
@@ -264,8 +264,12 @@ fn create_levels_if_unbroken(
     if create_greedy {
         let greedy_price = range.greedy_hold_level_price();
         if is_level_unbroken(range, candles, greedy_price, doji_threshold) {
-            let id = LevelId::new(timeframe_idx, *level_sequence);
-            *level_sequence += 1;
+            let id = LevelId::from_range(
+                timeframe_idx,
+                range.start_index,
+                range.end_index,
+                LevelType::GreedyHold,
+            );
 
             let level = Level::from_range(range, LevelType::GreedyHold, id, range.end_index);
 

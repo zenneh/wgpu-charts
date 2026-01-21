@@ -102,14 +102,59 @@ impl DefaultAnalyzer {
         // Insert levels into the index and run forward pass
         {
             let tf_state = self.state.get_or_create_timeframe(timeframe_idx);
+
+            // Track newly inserted levels that need catch-up forward pass
+            let mut new_levels: Vec<(crate::types::LevelId, usize)> = Vec::new();
+
             for level in reverse_result.levels {
                 let id = level.id;
-                result.level_events.push(LevelEvent::Created { level_id: id });
-                result.levels.push(level.clone());
-                tf_state.level_index.insert(level);
+                let created_at = level.created_at_index;
+
+                // Only insert if level doesn't already exist (preserves activation state)
+                if !tf_state.level_index.contains(id) {
+                    result.level_events.push(LevelEvent::Created { level_id: id });
+                    // Don't push to result.levels here - we'll clone from index AFTER forward pass
+                    tf_state.level_index.insert(level);
+                    new_levels.push((id, created_at));
+                }
             }
 
-            // Run forward pass to check level interactions
+            // Run catch-up forward pass for newly inserted levels only
+            // This processes candles from created_at_index to last_processed_index
+            // to properly activate new levels and register historical hits
+            for (level_id, created_at) in new_levels {
+                if created_at < tf_state.last_processed_index {
+                    // Process historical candles for this specific level
+                    let catch_up_end = tf_state.last_processed_index.min(candles.len());
+                    for (i, candle) in candles.iter().enumerate().skip(created_at + 1).take(catch_up_end.saturating_sub(created_at + 1)) {
+                        if let Some(level) = tf_state.level_index.get_mut(level_id) {
+                            let meta = crate::types::CandleMetadata::from_candle(candle, tf_config.doji_threshold);
+                            let interaction = level.check_interaction(candle, meta.direction, i, timeframe_idx);
+
+                            match interaction {
+                                crate::types::LevelInteraction::Activated => {
+                                    result.level_events.push(LevelEvent::Activated { level_id });
+                                }
+                                crate::types::LevelInteraction::Hit(hit) => {
+                                    result.level_events.push(LevelEvent::Hit { level_id, hit });
+                                }
+                                crate::types::LevelInteraction::Broken => {
+                                    if let Some(break_event) = level.break_event {
+                                        result.level_events.push(LevelEvent::Broken {
+                                            level_id,
+                                            break_event,
+                                        });
+                                        tf_state.level_index.mark_broken(level_id);
+                                    }
+                                }
+                                crate::types::LevelInteraction::None => {}
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Run forward pass for all levels on new candles (from last_processed_index onwards)
             let forward_result = forward_pass(
                 candles,
                 &mut tf_state.level_index,
@@ -123,6 +168,9 @@ impl DefaultAnalyzer {
 
             // Add forward pass events to result
             result.level_events.extend(forward_result.events);
+
+            // Clone levels from index AFTER forward pass so they have updated states
+            result.levels = tf_state.level_index.iter().cloned().collect();
         }
 
         // Update global closest levels (separate borrow scope)
@@ -279,6 +327,96 @@ mod tests {
         assert!(
             state.closest_unbroken_support.is_some()
                 || state.closest_unbroken_resistance.is_some()
+        );
+    }
+
+    #[test]
+    fn test_incremental_update_preserves_activation() {
+        use crate::types::LevelState;
+
+        let config = AnalyzerConfig::new(vec![TimeframeConfig::new(Timeframe::Hour1, 2, 0.1)]);
+        let mut analyzer = DefaultAnalyzer::new(config);
+
+        // First update: Create a bearish range that produces a resistance level
+        // Then add candles that would activate it (body fully above the level)
+        let candles_v1 = vec![
+            bearish_candle(110.0, 5.0), // Bearish range starts
+            bearish_candle(105.0, 5.0), // Bearish range continues - creates resistance ~115
+            bullish_candle(100.0, 5.0), // Direction change
+            // Now candles with body fully above 115 to activate the resistance
+            make_candle(116.0, 120.0, 115.5, 118.0), // Body: 116-118, above 115
+            make_candle(117.0, 121.0, 116.0, 119.0), // Body: 117-119, above 115
+        ];
+
+        let _result1 = analyzer.update(0, &candles_v1, 118.0);
+
+        // Check that we have levels and some were activated
+        let tf_state = analyzer.state().get_timeframe(0).unwrap();
+        let active_before: Vec<_> = tf_state
+            .level_index
+            .iter()
+            .filter(|l| l.state == LevelState::Active)
+            .collect();
+
+        // Should have at least one active level
+        assert!(
+            !active_before.is_empty(),
+            "Expected at least one active level after first update"
+        );
+
+        let active_count_before = active_before.len();
+
+        // Second update: Same candles plus a few more (simulating incremental update)
+        let mut candles_v2 = candles_v1.clone();
+        candles_v2.push(make_candle(118.0, 122.0, 117.0, 120.0));
+        candles_v2.push(make_candle(119.0, 123.0, 118.0, 121.0));
+
+        let _result2 = analyzer.update(0, &candles_v2, 120.0);
+
+        // Check that activation state is preserved
+        let tf_state = analyzer.state().get_timeframe(0).unwrap();
+        let active_after: Vec<_> = tf_state
+            .level_index
+            .iter()
+            .filter(|l| l.state == LevelState::Active)
+            .collect();
+
+        // Should still have the same active levels (not reset to Inactive)
+        assert!(
+            active_after.len() >= active_count_before,
+            "Expected active levels to be preserved after incremental update. \
+             Before: {}, After: {}",
+            active_count_before,
+            active_after.len()
+        );
+    }
+
+    #[test]
+    fn test_stable_level_ids() {
+        use crate::types::LevelId;
+
+        let config = AnalyzerConfig::new(vec![TimeframeConfig::new(Timeframe::Hour1, 2, 0.1)]);
+        let mut analyzer = DefaultAnalyzer::new(config);
+
+        let candles = vec![
+            bearish_candle(110.0, 5.0),
+            bearish_candle(105.0, 5.0),
+            bullish_candle(100.0, 5.0),
+        ];
+
+        // First update
+        let result1 = analyzer.update(0, &candles, 102.0);
+        let level_ids_v1: Vec<LevelId> = result1.levels.iter().map(|l| l.id).collect();
+
+        // Reset and update again with same data
+        analyzer.reset();
+        let result2 = analyzer.update(0, &candles, 102.0);
+        let level_ids_v2: Vec<LevelId> = result2.levels.iter().map(|l| l.id).collect();
+
+        // Level IDs should be identical (stable)
+        assert_eq!(
+            level_ids_v1, level_ids_v2,
+            "Level IDs should be stable across resets with same data"
         );
     }
 }
