@@ -1,8 +1,6 @@
 //! Trend types - trendlines derived from consecutive ranges with interaction tracking.
 
-use rayon::prelude::*;
-
-use super::direction::CandleDirection;
+use super::candle::CandleDirection;
 use super::range::Range;
 use charter_core::Candle;
 
@@ -106,18 +104,19 @@ impl Trend {
             return None;
         }
 
+        // Access via tuples: first_candle_hl = (high, low), last_candle_hl = (high, low)
         let (start, end) = match first_range.direction {
             CandleDirection::Bearish => {
-                // Bearish trend: connect lowest wicks
-                let first_low = first_range.first_low.min(first_range.last_low);
-                let first_idx = if first_range.first_low <= first_range.last_low {
+                // Bearish trend: connect lowest wicks (the lows)
+                let first_low = first_range.first_candle_hl.1.min(first_range.last_candle_hl.1);
+                let first_idx = if first_range.first_candle_hl.1 <= first_range.last_candle_hl.1 {
                     first_range.start_index
                 } else {
                     first_range.end_index
                 };
 
-                let second_low = second_range.first_low.min(second_range.last_low);
-                let second_idx = if second_range.first_low <= second_range.last_low {
+                let second_low = second_range.first_candle_hl.1.min(second_range.last_candle_hl.1);
+                let second_idx = if second_range.first_candle_hl.1 <= second_range.last_candle_hl.1 {
                     second_range.start_index
                 } else {
                     second_range.end_index
@@ -129,16 +128,16 @@ impl Trend {
                 )
             }
             CandleDirection::Bullish => {
-                // Bullish trend: connect highest wicks
-                let first_high = first_range.first_high.max(first_range.last_high);
-                let first_idx = if first_range.first_high >= first_range.last_high {
+                // Bullish trend: connect highest wicks (the highs)
+                let first_high = first_range.first_candle_hl.0.max(first_range.last_candle_hl.0);
+                let first_idx = if first_range.first_candle_hl.0 >= first_range.last_candle_hl.0 {
                     first_range.start_index
                 } else {
                     first_range.end_index
                 };
 
-                let second_high = second_range.first_high.max(second_range.last_high);
-                let second_idx = if second_range.first_high >= second_range.last_high {
+                let second_high = second_range.first_candle_hl.0.max(second_range.last_candle_hl.0);
+                let second_idx = if second_range.first_candle_hl.0 >= second_range.last_candle_hl.0 {
                     second_range.start_index
                 } else {
                     second_range.end_index
@@ -438,35 +437,37 @@ impl TrendTracker {
     /// Check all active trends for interactions with a candle.
     ///
     /// Returns a list of events that occurred.
-    /// Uses parallel processing for improved performance with many trends.
     pub fn check_interactions(&mut self, candle_index: usize, candle: &Candle) -> Vec<TrendEvent> {
-        // Parallel phase: check all trends concurrently
-        // Each trend check is independent, making this embarrassingly parallel
-        self.trends
-            .par_iter_mut()
-            .filter_map(|trend| {
-                // Skip if trend was created on or after this candle (not yet active)
-                if trend.created_at_index >= candle_index {
-                    return None;
-                }
-                // Skip already broken trends
-                if trend.state == TrendState::Broken {
-                    return None;
-                }
+        let mut events = Vec::new();
 
-                match trend.check_interaction(candle_index, candle) {
-                    TrendInteraction::Hit(hit) => Some(TrendEvent::Hit {
+        for trend in self.trends.iter_mut() {
+            // Skip if trend was created on or after this candle (not yet active)
+            if trend.created_at_index >= candle_index {
+                continue;
+            }
+            // Skip already broken trends
+            if trend.state == TrendState::Broken {
+                continue;
+            }
+
+            match trend.check_interaction(candle_index, candle) {
+                TrendInteraction::Hit(hit) => {
+                    events.push(TrendEvent::Hit {
                         trend_id: trend.id,
                         hit,
-                    }),
-                    TrendInteraction::Broken => Some(TrendEvent::Broken {
+                    });
+                }
+                TrendInteraction::Broken => {
+                    events.push(TrendEvent::Broken {
                         trend_id: trend.id,
                         break_event: trend.break_event.unwrap(),
-                    }),
-                    TrendInteraction::None => None,
+                    });
                 }
-            })
-            .collect()
+                TrendInteraction::None => {}
+            }
+        }
+
+        events
     }
 
     /// Get all active (non-broken) trends.
@@ -502,7 +503,7 @@ mod tests {
 
     fn make_bearish_range(id: u64, start: usize, end: usize, first_low: f32, last_low: f32) -> Range {
         Range {
-            id: super::super::range::RangeId::new(id),
+            id: super::super::range::RangeId::new(0, id as u32),
             direction: CandleDirection::Bearish,
             start_index: start,
             end_index: end,
@@ -512,17 +513,15 @@ mod tests {
             open: 120.0,
             close: 110.0,
             total_volume: 1000.0,
-            first_high: 125.0,
-            first_low,
-            last_high: 115.0,
-            last_low,
+            first_candle_hl: (125.0, first_low),
+            last_candle_hl: (115.0, last_low),
         }
     }
 
     #[allow(dead_code)]
     fn make_bullish_range(id: u64, start: usize, end: usize, first_high: f32, last_high: f32) -> Range {
         Range {
-            id: super::super::range::RangeId::new(id),
+            id: super::super::range::RangeId::new(0, id as u32),
             direction: CandleDirection::Bullish,
             start_index: start,
             end_index: end,
@@ -532,10 +531,8 @@ mod tests {
             open: 100.0,
             close: 110.0,
             total_volume: 1000.0,
-            first_high,
-            first_low: 95.0,
-            last_high,
-            last_low: 105.0,
+            first_candle_hl: (first_high, 95.0),
+            last_candle_hl: (last_high, 105.0),
         }
     }
 

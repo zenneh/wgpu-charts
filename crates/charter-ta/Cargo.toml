@@ -24,7 +24,17 @@ ml-inference = []
 
 [dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports"] }
+tempfile = "3.10"
+charter-data = { path = "../charter-data" }
 
 [[bench]]
 name = "analyzer_bench"
 harness = false
+
+[[example]]
+name = "export_features"
+path = "examples/export_features.rs"
+
+[[example]]
+name = "export_level_events"
+path = "examples/export_level_events.rs"

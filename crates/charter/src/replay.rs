@@ -5,13 +5,14 @@
 
 use charter_core::{aggregate_candles, Candle, Timeframe};
 use charter_render::TimeframeData;
-use charter_ta::{Level, Range};
+use charter_ta::{Level, Range, Trend};
 
 /// TA data computed for a single timeframe.
 #[derive(Debug, Clone)]
 pub struct TimeframeTaData {
     pub ranges: Vec<Range>,
     pub levels: Vec<Level>,
+    pub trends: Vec<Trend>,
     pub computed: bool,
 }
 
@@ -21,15 +22,17 @@ impl TimeframeTaData {
         Self {
             ranges: Vec::new(),
             levels: Vec::new(),
+            trends: Vec::new(),
             computed: false,
         }
     }
 
     /// Creates a new computed TimeframeTaData with the given data.
-    pub fn with_data(ranges: Vec<Range>, levels: Vec<Level>) -> Self {
+    pub fn with_data(ranges: Vec<Range>, levels: Vec<Level>, trends: Vec<Trend>) -> Self {
         Self {
             ranges,
             levels,
+            trends,
             computed: true,
         }
     }
@@ -110,22 +113,37 @@ impl ReplayManager {
     /// Returns true if the step was successful and data needs to be recomputed.
     pub fn step_forward(&mut self, base_candles: &[Candle]) -> bool {
         if !self.enabled || self.timestamp.is_none() {
+            eprintln!("[step_forward] not enabled or no timestamp");
             return false;
         }
 
         if base_candles.is_empty() {
+            eprintln!("[step_forward] base_candles is empty");
             return false;
         }
 
         let max_timestamp = base_candles.last().map(|c| c.timestamp).unwrap_or(0.0);
         let step_seconds = self.step_timeframe.seconds();
 
+        // Debug: show first and last few candle timestamps
+        eprintln!("[step_forward] base_candles.len={}", base_candles.len());
+        if base_candles.len() >= 3 {
+            eprintln!("[step_forward] first 3 candles: ts={}, {}, {}",
+                base_candles[0].timestamp, base_candles[1].timestamp, base_candles[2].timestamp);
+            let len = base_candles.len();
+            eprintln!("[step_forward] last 3 candles: ts={}, {}, {}",
+                base_candles[len-3].timestamp, base_candles[len-2].timestamp, base_candles[len-1].timestamp);
+        }
+
         if let Some(ts) = self.timestamp {
             let new_ts = (ts + step_seconds).min(max_timestamp);
+            eprintln!("[step_forward] ts={}, step_seconds={}, max_timestamp={}, new_ts={}",
+                ts, step_seconds, max_timestamp, new_ts);
             if new_ts > ts {
                 self.timestamp = Some(new_ts);
                 return true;
             }
+            eprintln!("[step_forward] FAILED: new_ts ({}) <= ts ({})", new_ts, ts);
         }
         false
     }
@@ -135,10 +153,12 @@ impl ReplayManager {
     /// Returns true if the step was successful and data needs to be recomputed.
     pub fn step_backward(&mut self, base_candles: &[Candle]) -> bool {
         if !self.enabled || self.timestamp.is_none() {
+            eprintln!("[step_backward] not enabled or no timestamp");
             return false;
         }
 
         if base_candles.is_empty() {
+            eprintln!("[step_backward] base_candles is empty");
             return false;
         }
 
@@ -147,10 +167,13 @@ impl ReplayManager {
 
         if let Some(ts) = self.timestamp {
             let new_ts = (ts - step_seconds).max(min_timestamp);
+            eprintln!("[step_backward] ts={}, step_seconds={}, min_timestamp={}, new_ts={}",
+                ts, step_seconds, min_timestamp, new_ts);
             if new_ts < ts {
                 self.timestamp = Some(new_ts);
                 return true;
             }
+            eprintln!("[step_backward] FAILED: new_ts ({}) >= ts ({})", new_ts, ts);
         }
         false
     }
@@ -207,11 +230,15 @@ impl ReplayManager {
     /// Converts the candle index to a timestamp and stores both.
     pub fn set_index(&mut self, index: usize, candles: &[Candle]) {
         if candles.is_empty() {
+            eprintln!("[set_index] candles is empty");
             return;
         }
 
         let clamped_idx = index.min(candles.len().saturating_sub(1));
         let timestamp = candles[clamped_idx].timestamp;
+
+        eprintln!("[set_index] index={}, clamped_idx={}, candles.len={}, timestamp={}",
+            index, clamped_idx, candles.len(), timestamp);
 
         self.index = Some(clamped_idx);
         self.timestamp = Some(timestamp);
@@ -502,6 +529,7 @@ mod tests {
         let ta = TimeframeTaData::default();
         assert!(ta.ranges.is_empty());
         assert!(ta.levels.is_empty());
+        assert!(ta.trends.is_empty());
         assert!(!ta.computed);
     }
 }

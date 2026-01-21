@@ -3,7 +3,7 @@
 use crate::candle::Candle;
 
 /// Timeframe enumeration for different chart periods.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Timeframe {
     Min1,    // 1 minute (base data)
     Min3,    // 3 minutes

@@ -2,6 +2,8 @@
 
 use std::collections::HashMap;
 
+use charter_core::Candle;
+
 use crate::analyzer::AnalyzerState;
 use crate::types::LevelState;
 
@@ -212,6 +214,29 @@ pub struct MlFeatures {
 
     /// Distance to closest support (normalized).
     pub closest_support_distance: Option<f32>,
+
+    // === Price Action Features ===
+    /// Candle body ratio: |close - open| / (high - low), 0 if doji/no range.
+    pub body_ratio: f32,
+
+    /// Upper wick ratio: (high - max(open, close)) / (high - low).
+    pub upper_wick_ratio: f32,
+
+    /// Lower wick ratio: (min(open, close) - low) / (high - low).
+    pub lower_wick_ratio: f32,
+
+    /// 1.0 if close > open (bullish), 0.0 otherwise.
+    pub is_bullish: f32,
+
+    // === Momentum Features ===
+    /// Price change over 1 candle: (close - prev_close) / prev_close.
+    pub price_change_1: f32,
+
+    /// Price change over 3 candles: (close - close_3_ago) / close_3_ago.
+    pub price_change_3: f32,
+
+    /// Price change over 5 candles: (close - close_5_ago) / close_5_ago.
+    pub price_change_5: f32,
 }
 
 impl MlFeatures {
@@ -222,14 +247,19 @@ impl MlFeatures {
 
     /// Flatten features into a fixed-size f32 vector for ML input.
     ///
-    /// The output format is:
+    /// The output format matches the CSV export format:
     /// [current_price, reference_price, total_active_levels, total_levels,
     ///  has_resistance, has_support, closest_resistance_dist, closest_support_dist,
+    ///  body_ratio, upper_wick_ratio, lower_wick_ratio, is_bullish,
+    ///  price_change_1, price_change_3, price_change_5,
     ///  ...per-timeframe features...]
+    ///
+    /// Note: timeframe_index is NOT included (it's redundant since ordering is fixed).
     pub fn flatten(&self) -> Vec<f32> {
         let mut output = Vec::new();
 
-        // Global features
+        // Global features (15 total)
+        // Original 8 features
         output.push(self.current_price);
         output.push(self.reference_price);
         output.push(self.total_active_levels as f32);
@@ -239,14 +269,25 @@ impl MlFeatures {
         output.push(self.closest_resistance_distance.unwrap_or(0.0));
         output.push(self.closest_support_distance.unwrap_or(0.0));
 
-        // Per-timeframe features
+        // Price action features (4)
+        output.push(self.body_ratio);
+        output.push(self.upper_wick_ratio);
+        output.push(self.lower_wick_ratio);
+        output.push(self.is_bullish);
+
+        // Momentum features (3)
+        output.push(self.price_change_1);
+        output.push(self.price_change_3);
+        output.push(self.price_change_5);
+
+        // Per-timeframe features (39 each: 3 base + 18 support + 18 resistance)
         for tf in &self.timeframes {
-            output.push(tf.timeframe_index as f32);
+            // Base features (3) - NOT including timeframe_index
             output.push(tf.active_level_count as f32);
             output.push(tf.total_level_count as f32);
             output.push(tf.range_count as f32);
 
-            // Support levels
+            // Support levels (6 features × N_LEVELS)
             for level in &tf.support_levels {
                 output.push(level.exists);
                 output.push(level.price_distance);
@@ -256,7 +297,7 @@ impl MlFeatures {
                 output.push(level.age_normalized);
             }
 
-            // Resistance levels
+            // Resistance levels (6 features × N_LEVELS)
             for level in &tf.resistance_levels {
                 output.push(level.exists);
                 output.push(level.price_distance);
@@ -272,11 +313,32 @@ impl MlFeatures {
 
     /// Get the expected size of flattened features for a given number of timeframes.
     pub fn flattened_size(num_timeframes: usize) -> usize {
-        // Global features: 8
-        // Per-timeframe: 4 + (N_LEVELS * 6) * 2
-        let per_timeframe = 4 + (N_LEVELS * 6) * 2;
-        8 + num_timeframes * per_timeframe
+        // Global features: 15 (8 original + 4 price action + 3 momentum)
+        // Per-timeframe: 3 + (N_LEVELS * 6) * 2 = 3 + 36 = 39
+        let per_timeframe = 3 + (N_LEVELS * 6) * 2;
+        15 + num_timeframes * per_timeframe
     }
+
+    /// Convert features to a vector (alias for flatten()).
+    pub fn to_vec(&self) -> Vec<f32> {
+        self.flatten()
+    }
+
+    /// Get the number of features.
+    pub fn feature_count(&self) -> usize {
+        Self::flattened_size(self.timeframes.len())
+    }
+}
+
+/// ML model prediction result.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct MlPrediction {
+    /// Probability that a level will break.
+    pub level_break_prob: f32,
+    /// Probability that price will go up.
+    pub direction_up_prob: f32,
+    /// Confidence in the prediction (0.0 - 1.0).
+    pub confidence: f32,
 }
 
 /// Extract features from analyzer state.
@@ -300,8 +362,10 @@ pub fn extract_features_from_state(
 
     if let Some((price, _)) = state.closest_unbroken_support {
         features.has_support_below = true;
+        // Use consistent formula: (level_price - current_price) / current_price
+        // Support below = negative distance, Resistance above = positive distance
         features.closest_support_distance =
-            Some((state.current_price - price) / state.current_price);
+            Some((price - state.current_price) / state.current_price);
     }
 
     // Per-timeframe features
@@ -357,6 +421,122 @@ pub fn extract_features_from_state(
     features
 }
 
+/// Extract features from analyzer state with price action and momentum from candles.
+///
+/// This is the preferred extraction function as it includes all feature types:
+/// - Level-based features from analyzer state
+/// - Price action features from current candle
+/// - Momentum features from candle history
+///
+/// # Arguments
+/// * `state` - The analyzer state containing level information
+/// * `candles` - Slice of candles for momentum calculation (most recent at end)
+/// * `current_index` - Index of the current candle in the analysis
+/// * `age_normalization` - Factor for normalizing level ages
+pub fn extract_features_with_candles(
+    state: &AnalyzerState,
+    candles: &[Candle],
+    current_index: usize,
+    age_normalization: f32,
+) -> MlFeatures {
+    // Start with basic state-based features
+    let mut features = extract_features_from_state(state, current_index, age_normalization);
+
+    // Add price action and momentum if we have candle data
+    if let Some(current_candle) = candles.last() {
+        // Price action features from current candle
+        let range = current_candle.high - current_candle.low;
+        if range > f32::EPSILON {
+            let body = (current_candle.close - current_candle.open).abs();
+            let upper_wick = current_candle.high - current_candle.open.max(current_candle.close);
+            let lower_wick = current_candle.open.min(current_candle.close) - current_candle.low;
+
+            features.body_ratio = body / range;
+            features.upper_wick_ratio = upper_wick / range;
+            features.lower_wick_ratio = lower_wick / range;
+        }
+        features.is_bullish = if current_candle.close > current_candle.open {
+            1.0
+        } else {
+            0.0
+        };
+
+        // Momentum features from candle history
+        let n = candles.len();
+        if n > 1 {
+            let prev_close = candles[n - 2].close;
+            if prev_close > f32::EPSILON {
+                features.price_change_1 = (current_candle.close - prev_close) / prev_close;
+            }
+        }
+        if n > 3 {
+            let close_3_ago = candles[n - 4].close;
+            if close_3_ago > f32::EPSILON {
+                features.price_change_3 = (current_candle.close - close_3_ago) / close_3_ago;
+            }
+        }
+        if n > 5 {
+            let close_5_ago = candles[n - 6].close;
+            if close_5_ago > f32::EPSILON {
+                features.price_change_5 = (current_candle.close - close_5_ago) / close_5_ago;
+            }
+        }
+    }
+
+    features
+}
+
+/// Compute price action features from a single candle.
+/// Returns (body_ratio, upper_wick_ratio, lower_wick_ratio, is_bullish).
+pub fn compute_price_action(candle: &Candle) -> (f32, f32, f32, f32) {
+    let range = candle.high - candle.low;
+    if range <= f32::EPSILON {
+        return (0.0, 0.0, 0.0, 0.0);
+    }
+
+    let body = (candle.close - candle.open).abs();
+    let upper_wick = candle.high - candle.open.max(candle.close);
+    let lower_wick = candle.open.min(candle.close) - candle.low;
+    let is_bullish = if candle.close > candle.open { 1.0 } else { 0.0 };
+
+    (body / range, upper_wick / range, lower_wick / range, is_bullish)
+}
+
+/// Compute momentum features from candle history.
+/// Returns (price_change_1, price_change_3, price_change_5).
+pub fn compute_momentum(candles: &[Candle]) -> (f32, f32, f32) {
+    let n = candles.len();
+    if n == 0 {
+        return (0.0, 0.0, 0.0);
+    }
+
+    let current_close = candles[n - 1].close;
+    let mut pc1 = 0.0;
+    let mut pc3 = 0.0;
+    let mut pc5 = 0.0;
+
+    if n > 1 {
+        let prev_close = candles[n - 2].close;
+        if prev_close > f32::EPSILON {
+            pc1 = (current_close - prev_close) / prev_close;
+        }
+    }
+    if n > 3 {
+        let close_3_ago = candles[n - 4].close;
+        if close_3_ago > f32::EPSILON {
+            pc3 = (current_close - close_3_ago) / close_3_ago;
+        }
+    }
+    if n > 5 {
+        let close_5_ago = candles[n - 6].close;
+        if close_5_ago > f32::EPSILON {
+            pc5 = (current_close - close_5_ago) / close_5_ago;
+        }
+    }
+
+    (pc1, pc3, pc5)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -391,8 +571,10 @@ mod tests {
 
     #[test]
     fn test_ml_features_flatten_size() {
-        assert_eq!(MlFeatures::flattened_size(1), 8 + (4 + 36));
-        assert_eq!(MlFeatures::flattened_size(2), 8 + 2 * (4 + 36));
+        // 15 global + (3 + 36) per timeframe
+        assert_eq!(MlFeatures::flattened_size(1), 15 + (3 + 36));  // = 54
+        assert_eq!(MlFeatures::flattened_size(2), 15 + 2 * (3 + 36));  // = 93
+        assert_eq!(MlFeatures::flattened_size(7), 15 + 7 * 39);  // = 288
     }
 
     #[test]
@@ -405,11 +587,20 @@ mod tests {
         features.has_resistance_above = true;
         features.has_support_below = true;
         features.closest_resistance_distance = Some(0.05);
-        features.closest_support_distance = Some(0.03);
+        features.closest_support_distance = Some(-0.03); // Negative for support below
+        // Price action features
+        features.body_ratio = 0.6;
+        features.upper_wick_ratio = 0.2;
+        features.lower_wick_ratio = 0.2;
+        features.is_bullish = 1.0;
+        // Momentum features
+        features.price_change_1 = 0.01;
+        features.price_change_3 = 0.02;
+        features.price_change_5 = 0.03;
 
         let flattened = features.flatten();
 
-        // Check first few values
+        // Check first 15 values (global features)
         assert_eq!(flattened[0], 100.0); // current_price
         assert_eq!(flattened[1], 95.0);  // reference_price
         assert_eq!(flattened[2], 5.0);   // total_active_levels
@@ -417,7 +608,16 @@ mod tests {
         assert_eq!(flattened[4], 1.0);   // has_resistance_above
         assert_eq!(flattened[5], 1.0);   // has_support_below
         assert!((flattened[6] - 0.05).abs() < 0.001); // closest_resistance_distance
-        assert!((flattened[7] - 0.03).abs() < 0.001); // closest_support_distance
+        assert!((flattened[7] - -0.03).abs() < 0.001); // closest_support_distance
+        // Price action
+        assert!((flattened[8] - 0.6).abs() < 0.001);  // body_ratio
+        assert!((flattened[9] - 0.2).abs() < 0.001);  // upper_wick_ratio
+        assert!((flattened[10] - 0.2).abs() < 0.001); // lower_wick_ratio
+        assert_eq!(flattened[11], 1.0);               // is_bullish
+        // Momentum
+        assert!((flattened[12] - 0.01).abs() < 0.001); // price_change_1
+        assert!((flattened[13] - 0.02).abs() < 0.001); // price_change_3
+        assert!((flattened[14] - 0.03).abs() < 0.001); // price_change_5
     }
 
     #[test]

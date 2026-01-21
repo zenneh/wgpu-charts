@@ -15,49 +15,59 @@ use anyhow::Result;
 use charter_core::Candle;
 use charter_data::load_candles_from_csv;
 use charter_ta::{
-    AnalyzerConfig, MlFeatures, MlInferenceHandle, MultiTimeframeAnalyzer, TimeframeFeatures,
+    AnalyzerConfig, MlFeatures, MlInferenceHandle, MultiTimeframeAnalyzer,
     ml_export_timeframes,
 };
 
 // ============================================================================
-// Configuration
+// Configuration - Scalping Strategy
 // ============================================================================
 
-/// Minimum confidence threshold to enter a trade (0.0 - 1.0).
-/// Note: Model typically outputs very low confidence (~0.03 avg), so this should be low.
-const MIN_CONFIDENCE: f32 = 0.02;
-
-/// Risk per trade as fraction of bankroll.
-const RISK_PER_TRADE: f32 = 0.01; // 1% risk per trade
+/// Take profit as percentage of entry price.
+const SCALP_TP_PCT: f32 = 0.008; // 0.8% take profit
 
 /// Stop loss as percentage of entry price.
-const STOP_LOSS_PCT: f32 = 0.008; // 0.8% (wider to avoid noise)
+const SCALP_SL_PCT: f32 = 0.005; // 0.5% stop loss (1.6:1 R:R)
 
-/// Take profit as percentage of entry price.
-const TAKE_PROFIT_PCT: f32 = 0.012; // 1.2% (1.5:1 R:R ratio)
+/// Proximity threshold to consider price "near" a level.
+const LEVEL_PROXIMITY_PCT: f32 = 0.02; // 2% proximity to level
+
+/// Maximum candles to hold a trade before timeout exit.
+const MAX_HOLD_CANDLES: usize = 30; // 30 minutes to reach target
+
+/// Profit threshold to move stop loss to breakeven.
+const BREAKEVEN_TRIGGER_PCT: f32 = 0.004; // 0.4% (move to BE after 50% of TP target)
+
+/// Minimum body ratio for breakout signals (body / range).
+const MIN_BODY_RATIO: f32 = 0.6; // 60% body for breakouts
+
+/// Minimum body ratio for bounce signals (more lenient).
+const MIN_BOUNCE_BODY_RATIO: f32 = 0.4; // 40% body for bounces
 
 /// Trading fee per trade (taker fee).
 const FEE_PCT: f32 = 0.0001; // 0.01%
 
-/// Leverage multiplier (1x = no leverage, 100x = max).
-const LEVERAGE: f32 = 50.0; // Moderate leverage
+/// Leverage multiplier for scalping.
+const LEVERAGE: f32 = 50.0; // Moderate leverage (reduced from 100x to survive volatility)
 
-/// RSI threshold for longs - only enter long when RSI is below this (oversold zone)
-const RSI_LONG_MAX: f32 = 0.42; // RSI < 42 for longs
+/// Risk per trade as fraction of bankroll.
+const RISK_PER_TRADE: f32 = 0.01; // 1% risk per trade
 
-/// RSI threshold for shorts - only enter short when RSI is above this (overbought zone)
-const RSI_SHORT_MIN: f32 = 0.58; // RSI > 58 for shorts
+/// ML threshold for taking long positions (hybrid approach).
+const ML_LONG_THRESHOLD: f32 = 0.48; // Take longs if direction_up_prob > 0.48
 
-/// Minimum volume ratio to take a trade (vs 100-candle average)
-const MIN_VOLUME_RATIO: f32 = 0.3; // Lower threshold
+/// ML threshold for taking short positions (hybrid approach).
+const ML_SHORT_THRESHOLD: f32 = 0.52; // Take shorts if direction_up_prob < 0.52
+
+/// Cooldown candles after a trade closes before entering a new one.
+const TRADE_COOLDOWN_CANDLES: usize = 5;
+
+/// Maximum drawdown before stopping (20% below initial balance).
+const MAX_DRAWDOWN_PCT: f32 = 0.20; // Stop if balance drops 20% below initial
 
 /// Minimum candles for TA warmup.
 #[allow(dead_code)]
 const MIN_CANDLES: usize = 100;
-
-/// Timeframe indices for ML features: 1m(0), 5m(2), 30m(3), 1h(4), 1d(8)
-#[allow(dead_code)]
-const ML_TIMEFRAME_INDICES: [usize; 5] = [0, 2, 3, 4, 8];
 
 // ============================================================================
 // Trading Types
@@ -69,17 +79,39 @@ enum Direction {
     Short,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize)]
+enum ScalpSignal {
+    SupportBounce,    // Long near support
+    ResistanceBounce, // Short near resistance
+    ResistanceBreak,  // Long breakout above resistance
+    SupportBreak,     // Short breakdown below support
+}
+
+impl std::fmt::Display for ScalpSignal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ScalpSignal::SupportBounce => write!(f, "SupportBounce"),
+            ScalpSignal::ResistanceBounce => write!(f, "ResistanceBounce"),
+            ScalpSignal::ResistanceBreak => write!(f, "ResistanceBreak"),
+            ScalpSignal::SupportBreak => write!(f, "SupportBreak"),
+        }
+    }
+}
+
 #[derive(Debug, Clone, serde::Serialize)]
 struct Trade {
     direction: Direction,
+    signal_type: ScalpSignal,
     entry_price: f32,
     entry_time: f64,
+    entry_candle_index: usize,
     margin: f32, // Margin (collateral) in USD
     size: f32,   // Position size in USD (margin * leverage)
     leverage: f32,
     stop_loss: f32,
     take_profit: f32,
     liquidation_price: f32,
+    is_breakeven: bool,
     exit_price: Option<f32>,
     exit_time: Option<f64>,
     pnl: Option<f32>,
@@ -89,23 +121,24 @@ struct Trade {
 impl Trade {
     fn new(
         direction: Direction,
+        signal_type: ScalpSignal,
         entry_price: f32,
         entry_time: f64,
+        entry_candle_index: usize,
         margin: f32,
         leverage: f32,
     ) -> Self {
         let size = margin * leverage;
 
-        // Stop loss and take profit are tighter with leverage
-        // At high leverage, we need to be more conservative
-        let sl_pct = STOP_LOSS_PCT;
-        let tp_pct = TAKE_PROFIT_PCT;
+        // Scalping uses tight stops
+        let sl_pct = SCALP_SL_PCT;
+        let tp_pct = SCALP_TP_PCT;
 
         let (stop_loss, take_profit, liquidation_price) = match direction {
             Direction::Long => (
                 entry_price * (1.0 - sl_pct),
                 entry_price * (1.0 + tp_pct),
-                // Liquidation when loss >= margin (e.g., at 10x, 10% drop = liquidation)
+                // Liquidation when loss >= margin (e.g., at 100x, 1% drop = liquidation)
                 entry_price * (1.0 - 0.99 / leverage),
             ),
             Direction::Short => (
@@ -117,14 +150,17 @@ impl Trade {
 
         Self {
             direction,
+            signal_type,
             entry_price,
             entry_time,
+            entry_candle_index,
             margin,
             size,
             leverage,
             stop_loss,
             take_profit,
             liquidation_price,
+            is_breakeven: false,
             exit_price: None,
             exit_time: None,
             pnl: None,
@@ -132,7 +168,10 @@ impl Trade {
         }
     }
 
-    fn check_exit(&mut self, candle: &Candle) -> bool {
+    fn check_exit(&mut self, candle: &Candle, current_index: usize) -> bool {
+        // First update breakeven stop if applicable
+        self.update_breakeven(candle.close);
+
         let (hit_sl, hit_tp, hit_liq) = match self.direction {
             Direction::Long => (
                 candle.low <= self.stop_loss,
@@ -153,7 +192,8 @@ impl Trade {
         }
 
         if hit_sl {
-            self.close(self.stop_loss, candle.timestamp, "stop_loss");
+            let reason = if self.is_breakeven { "breakeven" } else { "stop_loss" };
+            self.close(self.stop_loss, candle.timestamp, reason);
             return true;
         }
 
@@ -162,7 +202,29 @@ impl Trade {
             return true;
         }
 
+        // Time-based exit: close trade if held too long
+        if current_index - self.entry_candle_index >= MAX_HOLD_CANDLES {
+            self.close(candle.close, candle.timestamp, "timeout");
+            return true;
+        }
+
         false
+    }
+
+    fn update_breakeven(&mut self, current_price: f32) {
+        if self.is_breakeven {
+            return;
+        }
+
+        let profit_pct = match self.direction {
+            Direction::Long => (current_price - self.entry_price) / self.entry_price,
+            Direction::Short => (self.entry_price - current_price) / self.entry_price,
+        };
+
+        if profit_pct >= BREAKEVEN_TRIGGER_PCT {
+            self.stop_loss = self.entry_price;
+            self.is_breakeven = true;
+        }
     }
 
     fn close(&mut self, exit_price: f32, exit_time: f64, reason: &str) {
@@ -205,7 +267,13 @@ struct BacktestEngine {
     total_predictions: usize,
     #[allow(dead_code)]
     correct_predictions: usize,
+    debug_trade_count: usize,
+
+    // Cooldown tracking
+    last_trade_exit_index: Option<usize>,
 }
+
+const DEBUG_TRADES_TO_PRINT: usize = 10;
 
 impl BacktestEngine {
     fn new(initial_balance: f32, ml_inference: MlInferenceHandle) -> Self {
@@ -217,6 +285,8 @@ impl BacktestEngine {
             ml_inference,
             total_predictions: 0,
             correct_predictions: 0,
+            debug_trade_count: 0,
+            last_trade_exit_index: None,
         }
     }
 
@@ -225,76 +295,64 @@ impl BacktestEngine {
         candle: &Candle,
         features: Option<&MlFeatures>,
         leverage: f32,
-        volume_ratio: f32,
+        current_index: usize,
     ) -> Result<()> {
         // Check if current trade should be closed
         if let Some(ref mut trade) = self.current_trade {
-            if trade.check_exit(candle) {
+            if trade.check_exit(candle, current_index) {
                 let pnl = trade.pnl.unwrap_or(0.0);
                 self.balance += pnl;
                 self.trades.push(trade.clone());
                 self.current_trade = None;
+                self.last_trade_exit_index = Some(current_index);
             }
         }
 
-        // Try to open new trade if no position
-        if self.current_trade.is_none() {
+        // Check cooldown period
+        let in_cooldown = self.last_trade_exit_index
+            .map(|exit_idx| current_index < exit_idx + TRADE_COOLDOWN_CANDLES)
+            .unwrap_or(false);
+
+        // Try to open new scalp trade if no position and not in cooldown
+        if self.current_trade.is_none() && !in_cooldown {
             if let Some(features) = features {
-                self.try_open_trade(candle, features, leverage, volume_ratio)?;
+                self.try_scalp_entry(candle, features, leverage, current_index)?;
             }
         }
 
         Ok(())
     }
 
-    fn try_open_trade(
+    fn try_scalp_entry(
         &mut self,
         candle: &Candle,
         features: &MlFeatures,
         leverage: f32,
-        volume_ratio: f32,
+        current_index: usize,
     ) -> Result<()> {
-        // Get ML prediction
+        // Get ML prediction for direction bias
         let prediction = match self.ml_inference.predict(features) {
             Ok(p) => p,
             Err(_) => return Ok(()),
         };
 
         self.total_predictions += 1;
+        let ml_direction_up_prob = prediction.direction_up_prob;
 
-        // Check confidence threshold
-        if prediction.confidence < MIN_CONFIDENCE {
-            return Ok(());
-        }
+        // Try to detect scalp entry signal using level proximity + ML direction
+        let signal = match Self::detect_scalp_signal(candle, features, ml_direction_up_prob) {
+            Some(s) => s,
+            None => return Ok(()),
+        };
 
-        // Volume filter: skip very low volume periods
-        if volume_ratio < MIN_VOLUME_RATIO {
-            return Ok(());
-        }
-
-        // Get RSI from features
-        let rsi = features.rsi_14;
-
-        // Determine direction based on ML prediction + RSI confluence
-        // Only take trades where RSI confirms the ML direction
-        let direction = if prediction.direction_up_prob > 0.5 {
-            // ML predicts UP - only take long if RSI is in lower half (potential bounce)
-            if rsi > RSI_LONG_MAX {
-                return Ok(()); // RSI too high for a long entry
-            }
-            Direction::Long
-        } else {
-            // ML predicts DOWN - only take short if RSI is in upper half (potential reversal)
-            if rsi < RSI_SHORT_MIN {
-                return Ok(()); // RSI too low for a short entry
-            }
-            Direction::Short
+        let direction = match signal {
+            ScalpSignal::SupportBounce | ScalpSignal::ResistanceBreak => Direction::Long,
+            ScalpSignal::ResistanceBounce | ScalpSignal::SupportBreak => Direction::Short,
         };
 
         // Calculate margin (collateral) based on risk
-        // With leverage, we risk more per unit of margin
         // Margin = (Balance * Risk%) / (StopLoss% * Leverage)
-        let margin = (self.balance * RISK_PER_TRADE) / (STOP_LOSS_PCT * leverage);
+        let margin = (self.balance * RISK_PER_TRADE) / (SCALP_SL_PCT * leverage);
         let margin = margin.min(self.balance * 0.5); // Max 50% of balance as margin
 
         // Minimum margin: 0.1% of balance (allows small starting balances)
@@ -303,11 +361,129 @@ impl BacktestEngine {
             return Ok(()); // Skip if margin is too small
         }
 
-        // Open trade with leverage
-        let trade = Trade::new(direction, candle.close, candle.timestamp, margin, leverage);
+        // Debug output for first few trades
+        if self.debug_trade_count < DEBUG_TRADES_TO_PRINT {
+            // Calculate actual support/resistance distances (corrected interpretation)
+            let actual_support_dist = features.closest_resistance_distance
+                .filter(|&d| d < 0.0).map(|d| d.abs())
+                .or_else(|| features.closest_support_distance.filter(|&d| d > 0.0));
+            let actual_resistance_dist = features.closest_support_distance
+                .filter(|&d| d < 0.0).map(|d| d.abs())
+                .or_else(|| features.closest_resistance_distance.filter(|&d| d > 0.0));
+
+            println!("\n📈 Trade #{} Entry Debug:", self.debug_trade_count + 1);
+            println!("   Signal: {:?} -> {:?}", signal, direction);
+            println!("   Price: ${:.2}", candle.close);
+            println!("   ML up_prob: {:.3}", ml_direction_up_prob);
+            println!("   Support (below): {:?}", actual_support_dist.map(|d| format!("{:.2}%", d * 100.0)));
+            println!("   Resistance (above): {:?}", actual_resistance_dist.map(|d| format!("{:.2}%", d * 100.0)));
+            println!("   Body ratio: {:.2}, Bullish: {}",
+                (candle.close - candle.open).abs() / (candle.high - candle.low),
+                candle.close > candle.open);
+            self.debug_trade_count += 1;
+        }
+
+        // Open scalp trade
+        let trade = Trade::new(
+            direction,
+            signal,
+            candle.close,
+            candle.timestamp,
+            current_index,
+            margin,
+            leverage,
+        );
         self.current_trade = Some(trade);
 
         Ok(())
+    }
+
+    fn detect_scalp_signal(
+        candle: &Candle,
+        features: &MlFeatures,
+        ml_direction_up_prob: f32,
+    ) -> Option<ScalpSignal> {
+        let range = candle.high - candle.low;
+        if range < f32::EPSILON {
+            return None;
+        }
+
+        let body_ratio = (candle.close - candle.open).abs() / range;
+        let is_bullish = candle.close > candle.open;
+
+        // IMPORTANT: The level distances from charter-ta are INVERTED!
+        // - closest_resistance_distance < 0 means the level is BELOW price (acts as SUPPORT)
+        // - closest_support_distance < 0 means the level is ABOVE price (acts as RESISTANCE)
+        //
+        // Correct interpretation:
+        // - Level BELOW price (dist < 0 for resistance, dist > 0 for support) = Support zone
+        // - Level ABOVE price (dist > 0 for resistance, dist < 0 for support) = Resistance zone
+
+        // Find actual support (level below current price)
+        let support_level_dist = features.closest_resistance_distance
+            .filter(|&d| d < 0.0)  // resistance_dist < 0 means level is below
+            .map(|d| d.abs())
+            .or_else(|| features.closest_support_distance
+                .filter(|&d| d > 0.0)  // support_dist > 0 means level is below
+            );
+
+        // Find actual resistance (level above current price)
+        let resistance_level_dist = features.closest_support_distance
+            .filter(|&d| d < 0.0)  // support_dist < 0 means level is above
+            .map(|d| d.abs())
+            .or_else(|| features.closest_resistance_distance
+                .filter(|&d| d > 0.0)  // resistance_dist > 0 means level is above
+            );
+
+        // BOUNCE SIGNALS: Enter near level with ML confirmation
+
+        // Support bounce (long) - price near support (below) + ML bullish + bullish candle
+        if let Some(dist) = support_level_dist {
+            if dist < LEVEL_PROXIMITY_PCT
+                && ml_direction_up_prob > ML_LONG_THRESHOLD
+                && is_bullish
+                && body_ratio > MIN_BOUNCE_BODY_RATIO
+            {
+                return Some(ScalpSignal::SupportBounce);
+            }
+        }
+
+        // Resistance bounce (short) - price near resistance (above) + ML bearish + bearish candle
+        if let Some(dist) = resistance_level_dist {
+            if dist < LEVEL_PROXIMITY_PCT
+                && ml_direction_up_prob < ML_SHORT_THRESHOLD
+                && !is_bullish
+                && body_ratio > MIN_BOUNCE_BODY_RATIO
+            {
+                return Some(ScalpSignal::ResistanceBounce);
+            }
+        }
+
+        // BREAK SIGNALS: Strong momentum through level with ML confirmation
+
+        // Resistance break (long) - strong bullish candle breaking through resistance above
+        if let Some(dist) = resistance_level_dist {
+            if dist < LEVEL_PROXIMITY_PCT * 2.0
+                && is_bullish
+                && body_ratio > MIN_BODY_RATIO
+                && ml_direction_up_prob > 0.5
+            {
+                return Some(ScalpSignal::ResistanceBreak);
+            }
+        }
+
+        // Support break (short) - strong bearish candle breaking through support below
+        if let Some(dist) = support_level_dist {
+            if dist < LEVEL_PROXIMITY_PCT * 2.0
+                && !is_bullish
+                && body_ratio > MIN_BODY_RATIO
+                && ml_direction_up_prob < 0.5
+            {
+                return Some(ScalpSignal::SupportBreak);
+            }
+        }
+
+        None
     }
 
     fn close_open_trade(&mut self, candle: &Candle) {
@@ -414,6 +590,18 @@ impl BacktestEngine {
         println!("   Avg Loss:           ${:>12.2}", avg_loss);
         println!();
 
+        // Additional scalping exit reasons
+        let timeout_exits = self
+            .trades
+            .iter()
+            .filter(|t| t.exit_reason.as_deref() == Some("timeout"))
+            .count();
+        let breakeven_exits = self
+            .trades
+            .iter()
+            .filter(|t| t.exit_reason.as_deref() == Some("breakeven"))
+            .count();
+
         println!("🎯 EXIT ANALYSIS");
         println!("   ─────────────────────────────────────");
         println!(
@@ -425,6 +613,74 @@ impl BacktestEngine {
             "   Take Profit Exits:  {:>12} ({:.1}%)",
             tp_exits,
             tp_exits as f32 / total_trades.max(1) as f32 * 100.0
+        );
+        println!(
+            "   Timeout Exits:      {:>12} ({:.1}%)",
+            timeout_exits,
+            timeout_exits as f32 / total_trades.max(1) as f32 * 100.0
+        );
+        println!(
+            "   Breakeven Exits:    {:>12} ({:.1}%)",
+            breakeven_exits,
+            breakeven_exits as f32 / total_trades.max(1) as f32 * 100.0
+        );
+        let max_dd_exits = self
+            .trades
+            .iter()
+            .filter(|t| t.exit_reason.as_deref() == Some("max_drawdown"))
+            .count();
+        if max_dd_exits > 0 {
+            println!(
+                "   Max Drawdown Exit:  {:>12} ({:.1}%)",
+                max_dd_exits,
+                max_dd_exits as f32 / total_trades.max(1) as f32 * 100.0
+            );
+        }
+        println!();
+
+        // Signal type breakdown
+        let support_bounce = self
+            .trades
+            .iter()
+            .filter(|t| t.signal_type == ScalpSignal::SupportBounce)
+            .count();
+        let resistance_bounce = self
+            .trades
+            .iter()
+            .filter(|t| t.signal_type == ScalpSignal::ResistanceBounce)
+            .count();
+        let resistance_break = self
+            .trades
+            .iter()
+            .filter(|t| t.signal_type == ScalpSignal::ResistanceBreak)
+            .count();
+        let support_break = self
+            .trades
+            .iter()
+            .filter(|t| t.signal_type == ScalpSignal::SupportBreak)
+            .count();
+
+        println!("📍 SIGNAL BREAKDOWN");
+        println!("   ─────────────────────────────────────");
+        println!(
+            "   Support Bounce:     {:>12} ({:.1}%)",
+            support_bounce,
+            support_bounce as f32 / total_trades.max(1) as f32 * 100.0
+        );
+        println!(
+            "   Resistance Bounce:  {:>12} ({:.1}%)",
+            resistance_bounce,
+            resistance_bounce as f32 / total_trades.max(1) as f32 * 100.0
+        );
+        println!(
+            "   Resistance Break:   {:>12} ({:.1}%)",
+            resistance_break,
+            resistance_break as f32 / total_trades.max(1) as f32 * 100.0
+        );
+        println!(
+            "   Support Break:      {:>12} ({:.1}%)",
+            support_break,
+            support_break as f32 / total_trades.max(1) as f32 * 100.0
         );
         println!();
 
@@ -469,14 +725,19 @@ impl BacktestEngine {
         // Get leverage from first trade (all trades use same leverage)
         let leverage = self.trades.first().map(|t| t.leverage).unwrap_or(1.0);
 
-        println!("⚙️  STRATEGY SETTINGS");
+        println!("⚙️  SCALPING SETTINGS");
         println!("   ─────────────────────────────────────");
-        println!("   Min Confidence:     {:>12.1}%", MIN_CONFIDENCE * 100.0);
         println!("   Risk per Trade:     {:>12.1}%", RISK_PER_TRADE * 100.0);
-        println!("   Stop Loss:          {:>12.2}%", STOP_LOSS_PCT * 100.0);
-        println!("   Take Profit:        {:>12.2}%", TAKE_PROFIT_PCT * 100.0);
-        println!("   Trading Fee:        {:>12.3}%", FEE_PCT * 100.0);
+        println!("   Stop Loss:          {:>12.3}%", SCALP_SL_PCT * 100.0);
+        println!("   Take Profit:        {:>12.3}%", SCALP_TP_PCT * 100.0);
+        println!("   Level Proximity:    {:>12.3}%", LEVEL_PROXIMITY_PCT * 100.0);
+        println!("   Breakeven Trigger:  {:>12.3}%", BREAKEVEN_TRIGGER_PCT * 100.0);
+        println!("   Max Hold Candles:   {:>12}", MAX_HOLD_CANDLES);
+        println!("   Trading Fee:        {:>12.4}%", FEE_PCT * 100.0);
         println!("   Leverage:           {:>12.1}x", leverage);
+        println!("   Max Drawdown Stop:  {:>12.1}%", MAX_DRAWDOWN_PCT * 100.0);
+        println!("   ML Long Threshold:  {:>12.2}", ML_LONG_THRESHOLD);
+        println!("   ML Short Threshold: {:>12.2}", ML_SHORT_THRESHOLD);
         println!();
 
         // Count liquidations
@@ -565,7 +826,7 @@ fn main() -> Result<()> {
     print!("📊 Setting up incremental TA... ");
     let timeframes = ml_export_timeframes(); // 1m, 5m, 30m, 1h, 1d
     let config = AnalyzerConfig::default();
-    let mut mta = MultiTimeframeAnalyzer::new(timeframes.clone(), config);
+    let mut mta = MultiTimeframeAnalyzer::with_timeframes(timeframes.clone(), config);
     println!(
         "✓ ({} timeframes: {:?})",
         timeframes.len(),
@@ -575,20 +836,21 @@ fn main() -> Result<()> {
     // Initialize backtest engine
     let mut engine = BacktestEngine::new(initial_balance, ml_inference);
 
-    // RSI calculator
-    let mut rsi_calc = RsiState::new(14);
-    let mut vol_avg = VolumeAverage::new(100);
+    // Debug: check first feature extraction
+    let mut first_feature_debug = true;
 
-    // We trade on 5-minute boundaries (every 5 1m candles)
-    let trade_interval_1m = 5; // Trade every 5 1m candles = 5 minutes
+    // Scalping: trade on every candle (no interval)
     let warmup_1m = 2000; // Warmup in 1m candles
 
     println!();
     println!(
-        "🚀 Running backtest on {} 1m candles (~{} days)...",
+        "🚀 Running scalping backtest on {} 1m candles (~{} days)...",
         candles_1m.len(),
         candles_1m.len() / 1440
     );
+    println!("   Strategy: Level proximity + ML direction hybrid");
+    println!("   TP: {:.2}% | SL: {:.2}% | Max hold: {} candles",
+        SCALP_TP_PCT * 100.0, SCALP_SL_PCT * 100.0, MAX_HOLD_CANDLES);
     println!();
 
     // Progress tracking
@@ -596,46 +858,66 @@ fn main() -> Result<()> {
     let mut last_pct = 0;
     let mut features_extracted = 0;
     let mut features_failed = 0;
-    let mut prev_close = candles_1m.first().map(|c| c.close).unwrap_or(0.0);
 
     // Process 1m candles incrementally
     for (idx, candle) in candles_1m.iter().enumerate() {
         // Update TA incrementally (FAST)
         mta.process_1m_candle(candle);
 
-        // Update indicators
-        rsi_calc.update(candle.close);
-        vol_avg.update(candle.volume);
-
         // Skip warmup
         if idx < warmup_1m {
-            prev_close = candle.close;
             continue;
         }
 
-        // Calculate volume ratio for filters
-        let volume_ratio = vol_avg.normalized(candle.volume);
+        // Check for max drawdown - stop trading if balance drops 20% below initial
+        let drawdown = (initial_balance - engine.balance) / initial_balance;
+        if drawdown >= MAX_DRAWDOWN_PCT {
+            println!("\n\n🛑 MAX DRAWDOWN REACHED: {:.1}% loss - stopping backtest", drawdown * 100.0);
+            // Close any open trade at current price
+            if let Some(ref mut trade) = engine.current_trade {
+                trade.close(candle.close, candle.timestamp, "max_drawdown");
+                let pnl = trade.pnl.unwrap_or(0.0);
+                engine.balance += pnl;
+                engine.trades.push(trade.clone());
+                engine.current_trade = None;
+            }
+            break;
+        }
 
         // Always check for exits on open trades
         if engine.current_trade.is_some() {
-            engine.process_candle(candle, None, leverage, volume_ratio)?;
+            engine.process_candle(candle, None, leverage, idx)?;
         }
 
-        // Only try to open new trades every N 1m candles
-        if idx % trade_interval_1m == 0 && engine.current_trade.is_none() {
+        // Try to open new scalp trades on every candle (no interval for scalping)
+        if engine.current_trade.is_none() {
             // Extract features from current MTA state
-            let features = extract_features_incremental(
-                candle,
-                &mta,
-                rsi_calc.value(),
-                volume_ratio,
-                prev_close,
-            );
+            let features = extract_features_incremental(candle, &mta);
 
             if let Some(ref f) = features {
-                if f.timeframes.len() == 5 {
+                // Debug first extraction
+                if first_feature_debug {
+                    let feature_vec = f.to_vec();
+                    println!("\n📊 Feature Debug:");
+                    println!("   Timeframes: {}", f.timeframes.len());
+                    println!("   Feature vector size: {}", feature_vec.len());
+                    println!("   Total active levels: {}", f.total_active_levels);
+                    println!("   Has resistance: {}, Has support: {}", f.has_resistance_above, f.has_support_below);
+                    println!("   Closest support dist: {:?}", f.closest_support_distance);
+                    println!("   Closest resistance dist: {:?}", f.closest_resistance_distance);
+
+                    // Try prediction to see error
+                    match engine.ml_inference.predict(f) {
+                        Ok(pred) => println!("   Prediction: up_prob={:.3}, conf={:.3}", pred.direction_up_prob, pred.confidence),
+                        Err(e) => println!("   Prediction error: {}", e),
+                    }
+                    println!();
+                    first_feature_debug = false;
+                }
+
+                if f.timeframes.len() >= 5 {
                     features_extracted += 1;
-                    engine.process_candle(candle, features.as_ref(), leverage, volume_ratio)?;
+                    engine.process_candle(candle, features.as_ref(), leverage, idx)?;
                 } else {
                     features_failed += 1;
                 }
@@ -643,8 +925,6 @@ fn main() -> Result<()> {
                 features_failed += 1;
             }
         }
-
-        prev_close = candle.close;
 
         // Progress with bankroll
         let pct = idx * 100 / total;
@@ -682,8 +962,8 @@ fn main() -> Result<()> {
 
     // Print TA stats
     println!("📈 TA Statistics:");
-    for (tf, levels, trends) in mta.ta_counts() {
-        println!("   • {}: {} levels, {} trends", tf.label(), levels, trends);
+    for (tf, levels, ranges) in mta.ta_counts() {
+        println!("   • {}: {} levels, {} ranges", tf.label(), levels, ranges);
     }
 
     // Print results
@@ -704,6 +984,7 @@ fn main() -> Result<()> {
 // ============================================================================
 
 /// Incremental RSI calculator using Wilder's smoothing.
+#[allow(dead_code)]
 struct RsiState {
     period: usize,
     avg_gain: f32,
@@ -714,6 +995,7 @@ struct RsiState {
     losses: Vec<f32>,
 }
 
+#[allow(dead_code)]
 impl RsiState {
     fn new(period: usize) -> Self {
         Self {
@@ -771,6 +1053,7 @@ impl RsiState {
 }
 
 /// Rolling volume average calculator.
+#[allow(dead_code)]
 struct VolumeAverage {
     window: Vec<f32>,
     window_size: usize,
@@ -779,6 +1062,7 @@ struct VolumeAverage {
     filled: bool,
 }
 
+#[allow(dead_code)]
 impl VolumeAverage {
     fn new(window_size: usize) -> Self {
         Self {
@@ -815,39 +1099,62 @@ impl VolumeAverage {
 fn extract_features_incremental(
     candle: &Candle,
     mta: &MultiTimeframeAnalyzer,
-    rsi: f32,
-    volume_normalized: f32,
-    prev_close: f32,
 ) -> Option<MlFeatures> {
     let current_price = candle.close;
 
     // Extract features from each timeframe
     let tf_features = mta.extract_all_features(current_price);
 
-    // Need all 5 timeframes
-    if tf_features.len() != 5 {
+    // Need at least some timeframes
+    if tf_features.is_empty() {
         return None;
     }
 
-    // Calculate global features
-    let price_change = if prev_close > 0.0 {
-        (candle.close - prev_close) / prev_close
-    } else {
-        0.0
-    };
+    // Get state for global features
+    let state = mta.state();
 
-    let body = (candle.close - candle.open).abs();
+    // Find closest resistance and support distances
+    // Use consistent formula: (level_price - current_price) / current_price
+    // Support below = negative distance, Resistance above = positive distance
+    let closest_resistance_distance = state.closest_unbroken_resistance.map(|(price, _)| {
+        (price - current_price) / current_price
+    });
+    let closest_support_distance = state.closest_unbroken_support.map(|(price, _)| {
+        (price - current_price) / current_price // Fixed: was (current_price - price)
+    });
+
+    // Compute price action features from current candle
     let range = candle.high - candle.low;
-    let body_ratio = if range > 0.0 { body / range } else { 0.5 };
+    let (body_ratio, upper_wick_ratio, lower_wick_ratio) = if range > f32::EPSILON {
+        let body = (candle.close - candle.open).abs();
+        let upper_wick = candle.high - candle.open.max(candle.close);
+        let lower_wick = candle.open.min(candle.close) - candle.low;
+        (body / range, upper_wick / range, lower_wick / range)
+    } else {
+        (0.0, 0.0, 0.0)
+    };
+    let is_bullish = if candle.close > candle.open { 1.0 } else { 0.0 };
 
     Some(MlFeatures {
         timeframes: tf_features,
         current_price,
-        current_volume_normalized: volume_normalized,
-        price_change_normalized: price_change,
+        reference_price: current_price,
+        total_active_levels: state.total_active_levels() as u16,
+        total_levels: state.total_levels() as u16,
+        has_resistance_above: state.closest_unbroken_resistance.is_some(),
+        has_support_below: state.closest_unbroken_support.is_some(),
+        closest_resistance_distance,
+        closest_support_distance,
+        // Price action features
         body_ratio,
-        is_bullish: if candle.close > candle.open { 1.0 } else { 0.0 },
-        rsi_14: rsi,
+        upper_wick_ratio,
+        lower_wick_ratio,
+        is_bullish,
+        // Momentum features (not available in incremental mode without candle history)
+        // These default to 0.0 - the model should handle this gracefully
+        price_change_1: 0.0,
+        price_change_3: 0.0,
+        price_change_5: 0.0,
     })
 }
 
@@ -911,131 +1218,3 @@ fn calculate_rsi(candles: &[Candle], current_idx: usize, period: usize) -> f32 {
     rsi / 100.0
 }
 
-/// Extract ML features for a candle.
-#[allow(dead_code)]
-fn extract_features(
-    candle: &Candle,
-    candle_idx: usize,
-    timeframe_candles: &[Vec<Candle>],
-    ta_data: &[(Vec<charter_ta::Level>, Vec<charter_ta::Trend>)],
-    primary_candles: &[Candle],
-) -> Option<MlFeatures> {
-    let current_timestamp = candle.timestamp;
-    let current_price = candle.close;
-
-    let mut tf_features: Vec<TimeframeFeatures> = Vec::new();
-
-    for (feature_idx, &tf_idx) in ML_TIMEFRAME_INDICES.iter().enumerate() {
-        if tf_idx >= timeframe_candles.len() {
-            continue;
-        }
-
-        let candles = &timeframe_candles[tf_idx];
-        let (levels, trends) = &ta_data[tf_idx];
-
-        if candles.len() < MIN_CANDLES || levels.is_empty() {
-            continue;
-        }
-
-        // Find candle index for this timestamp
-        let tf_candle_idx = find_candle_index(candles, current_timestamp)?;
-
-        // Filter levels/trends created before this point
-        let active_levels: Vec<_> = levels
-            .iter()
-            .filter(|l| l.created_at_index <= tf_candle_idx)
-            .cloned()
-            .collect();
-        let active_trends: Vec<_> = trends
-            .iter()
-            .filter(|t| t.created_at_index <= tf_candle_idx)
-            .cloned()
-            .collect();
-
-        let features = TimeframeFeatures::extract(
-            feature_idx,
-            &active_levels,
-            &active_trends,
-            current_price,
-            tf_candle_idx,
-        );
-        tf_features.push(features);
-    }
-
-    // Need all 5 timeframes for the model (376 features = 5 × 74 + 6 with RSI)
-    if tf_features.len() != 5 {
-        return None;
-    }
-
-    // Calculate global features
-    let prev_close = if candle_idx > 0 {
-        primary_candles[candle_idx - 1].close
-    } else {
-        candle.open
-    };
-    let price_change = if prev_close > 0.0 {
-        (candle.close - prev_close) / prev_close
-    } else {
-        0.0
-    };
-
-    let body = (candle.close - candle.open).abs();
-    let range = candle.high - candle.low;
-    let body_ratio = if range > 0.0 { body / range } else { 0.5 };
-
-    let lookback = 100.min(candle_idx);
-    let avg_volume: f32 = if lookback > 0 {
-        primary_candles[candle_idx - lookback..candle_idx]
-            .iter()
-            .map(|c| c.volume)
-            .sum::<f32>()
-            / lookback as f32
-    } else {
-        candle.volume
-    };
-    let volume_normalized = if avg_volume > 0.0 {
-        candle.volume / avg_volume
-    } else {
-        1.0
-    };
-
-    // Calculate RSI (14-period)
-    let rsi_14 = calculate_rsi(primary_candles, candle_idx, 14);
-
-    Some(MlFeatures {
-        timeframes: tf_features,
-        current_price,
-        current_volume_normalized: volume_normalized,
-        price_change_normalized: price_change,
-        body_ratio,
-        is_bullish: if candle.close > candle.open { 1.0 } else { 0.0 },
-        rsi_14,
-    })
-}
-
-#[allow(dead_code)]
-fn find_candle_index(candles: &[Candle], timestamp: f64) -> Option<usize> {
-    if candles.is_empty() {
-        return None;
-    }
-
-    let mut lo = 0;
-    let mut hi = candles.len() - 1;
-
-    while lo < hi {
-        let mid = (lo + hi) / 2;
-        if candles[mid].timestamp < timestamp {
-            lo = mid + 1;
-        } else {
-            hi = mid;
-        }
-    }
-
-    if lo > 0
-        && (candles[lo].timestamp - timestamp).abs() > (candles[lo - 1].timestamp - timestamp).abs()
-    {
-        Some(lo - 1)
-    } else {
-        Some(lo)
-    }
-}

@@ -103,6 +103,7 @@ pub enum BackgroundMessage {
         timeframe: usize,
         ranges: Vec<charter_ta::Range>,
         levels: Vec<charter_ta::Level>,
+        trends: Vec<charter_ta::Trend>,
     },
     /// Loading state update.
     LoadingStateChanged(LoadingState),
@@ -571,6 +572,7 @@ impl AppState {
                     timeframe,
                     ranges,
                     levels,
+                    trends,
                 } => {
                     // Debug: Print TA analysis summary
                     if self.document.ta_settings.show_ta {
@@ -585,6 +587,18 @@ impl AppState {
                         println!("Levels: {} total ({} active, {} inactive, {} broken)",
                             levels.len(), active_count, inactive_count, broken_count);
                         println!("Total hits across all levels: {}", total_hits);
+                        println!("Trends: {}", trends.len());
+
+                        // Show details for first few trends
+                        if !trends.is_empty() {
+                            println!("\nSample trends (first 5):");
+                            for (i, trend) in trends.iter().take(5).enumerate() {
+                                println!("  [{}] dir={:?}, state={:?}, start=({}, {:.2}), end=({}, {:.2})",
+                                    i, trend.direction, trend.state,
+                                    trend.start.candle_index, trend.start.price,
+                                    trend.end.candle_index, trend.end.price);
+                            }
+                        }
 
                         // Show details for first few levels
                         if !levels.is_empty() {
@@ -630,6 +644,7 @@ impl AppState {
                     if let Some(ta) = self.document.ta_data.get_mut(timeframe) {
                         ta.ranges = ranges;
                         ta.levels = levels;
+                        ta.trends = trends;
                         ta.computed = true;
                     }
                     self.interaction.loading_state = LoadingState::Idle;
@@ -1238,7 +1253,7 @@ impl AppState {
         };
 
         if current_tf_candles.is_empty() {
-            self.interaction.replay.ta_data = Some(TimeframeTaData::with_data(Vec::new(), Vec::new()));
+            self.interaction.replay.ta_data = Some(TimeframeTaData::with_data(Vec::new(), Vec::new(), Vec::new()));
             self.update_ta_buffers();
             return;
         }
@@ -1248,7 +1263,7 @@ impl AppState {
 
         let ta_data = if let Some(ta) = self.document.ta_data.get(current_tf_idx) {
             if ta.computed {
-                // Filter ranges and levels to those visible at replay position
+                // Filter ranges, levels, and trends to those visible at replay position
                 let ranges: Vec<_> = ta.ranges.iter().filter(|r| r.end_index <= replay_candle_idx).cloned().collect();
                 let levels: Vec<_> = ta.levels.iter().filter(|l| {
                     if l.created_at_index > replay_candle_idx { return false; }
@@ -1259,17 +1274,20 @@ impl AppState {
                     }
                     true
                 }).cloned().collect();
-                TimeframeTaData::with_data(ranges, levels)
+                let trends: Vec<_> = ta.trends.iter().filter(|t| {
+                    t.created_at_index <= replay_candle_idx
+                }).cloned().collect();
+                TimeframeTaData::with_data(ranges, levels, trends)
             } else {
                 // Run analysis on current candles
                 let current_price = current_tf_candles.last().map(|c| c.close).unwrap_or(0.0);
                 let config = self.create_analyzer_config();
                 let mut analyzer = DefaultAnalyzer::new(config);
                 let result = analyzer.update(current_tf_idx as u8, &current_tf_candles, current_price);
-                TimeframeTaData::with_data(result.ranges, result.levels)
+                TimeframeTaData::with_data(result.ranges, result.levels, result.trends)
             }
         } else {
-            TimeframeTaData::with_data(Vec::new(), Vec::new())
+            TimeframeTaData::with_data(Vec::new(), Vec::new(), Vec::new())
         };
 
         self.interaction.replay.ta_data = Some(ta_data);
@@ -1544,6 +1562,7 @@ impl AppState {
                 timeframe,
                 ranges: result.ranges,
                 levels: result.levels,
+                trends: result.trends,
             });
         });
     }
@@ -1647,9 +1666,42 @@ impl AppState {
             level_gpus.push(LevelGpu { y_value: 0.0, x_start: 0.0, r: 0.0, g: 0.0, b: 0.0, a: 0.0, level_type: 0, hit_count: 0 });
         }
 
-        // Trends are no longer supported - use empty trend buffer
-        let trend_count = 0u32;
-        let mut trend_gpus: Vec<TrendGpu> = Vec::new();
+        // Convert trends to GPU format
+        use charter_ta::{TrendState, CandleDirection as TaDirection};
+        let filtered_trends: Vec<_> = ta.trends.iter()
+            .filter(|t| {
+                // Filter by state - show active and hit trends, optionally show broken
+                match t.state {
+                    TrendState::Active | TrendState::Hit => self.document.ta_settings.show_active_levels,
+                    TrendState::Broken => self.document.ta_settings.show_broken_levels,
+                }
+            })
+            .take(MAX_TA_TRENDS)
+            .collect();
+
+        let trend_count = filtered_trends.len() as u32;
+        let mut trend_gpus: Vec<TrendGpu> = filtered_trends.iter()
+            .map(|t| {
+                // Color based on direction and state
+                let (r, g, b, a) = match (t.direction, t.state) {
+                    (TaDirection::Bearish, TrendState::Active) => (0.8, 0.2, 0.2, 0.7),
+                    (TaDirection::Bearish, TrendState::Hit) => (0.9, 0.3, 0.3, 0.8),
+                    (TaDirection::Bearish, TrendState::Broken) => (0.3, 0.1, 0.1, 0.3),
+                    (TaDirection::Bullish, TrendState::Active) => (0.0, 0.8, 0.4, 0.7),
+                    (TaDirection::Bullish, TrendState::Hit) => (0.0, 0.9, 0.5, 0.8),
+                    (TaDirection::Bullish, TrendState::Broken) => (0.0, 0.3, 0.2, 0.3),
+                    (TaDirection::Doji, _) => (0.5, 0.5, 0.5, 0.5),
+                };
+                TrendGpu {
+                    x_start: t.start.candle_index as f32 * CANDLE_SPACING,
+                    y_start: t.start.price,
+                    x_end: t.end.candle_index as f32 * CANDLE_SPACING,
+                    y_end: t.end.price,
+                    r, g, b, a,
+                }
+            })
+            .collect();
+
         while trend_gpus.len() < MAX_TA_TRENDS {
             trend_gpus.push(TrendGpu { x_start: 0.0, y_start: 0.0, x_end: 0.0, y_end: 0.0, r: 0.0, g: 0.0, b: 0.0, a: 0.0 });
         }
@@ -2704,6 +2756,27 @@ impl AppState {
                     render_pass.set_bind_group(0, &self.graphics.renderer.camera_bind_group, &[]);
                     render_pass.set_bind_group(1, &tf.ta_bind_group, &[]);
                     render_pass.draw(0..6, 0..filtered_level_count);
+                }
+
+                // Render trends (6 vertices per quad, one per trend)
+                if self.document.ta_settings.show_trends && !ta.trends.is_empty() {
+                    use charter_ta::TrendState;
+                    let filtered_trend_count = ta.trends.iter()
+                        .filter(|t| {
+                            match t.state {
+                                TrendState::Active | TrendState::Hit => self.document.ta_settings.show_active_trends,
+                                TrendState::Broken => self.document.ta_settings.show_broken_levels,
+                            }
+                        })
+                        .take(MAX_TA_TRENDS)
+                        .count() as u32;
+
+                    if filtered_trend_count > 0 {
+                        render_pass.set_pipeline(&self.graphics.renderer.ta_pipeline.trend_pipeline);
+                        render_pass.set_bind_group(0, &self.graphics.renderer.camera_bind_group, &[]);
+                        render_pass.set_bind_group(1, &tf.ta_bind_group, &[]);
+                        render_pass.draw(0..6, 0..filtered_trend_count);
+                    }
                 }
             }
 

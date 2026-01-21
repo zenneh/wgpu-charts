@@ -23,6 +23,7 @@
       buildInputs = with pkgs; [
         duckdb
         pkg-config
+        llvmPackages.openmp  # libomp for XGBoost
       ];
     in {
 
@@ -55,6 +56,9 @@
           echo "🦀 Rust development environment loaded"
           echo "Rust version: $(rustc --version)"
           echo "Cargo version: $(cargo --version)"
+
+          # Set library path for XGBoost/libomp
+          export DYLD_LIBRARY_PATH="${pkgs.llvmPackages.openmp}/lib:$DYLD_LIBRARY_PATH"
         '';
       };
 

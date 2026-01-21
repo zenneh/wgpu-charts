@@ -2,7 +2,7 @@
 
 use std::collections::HashMap;
 
-use crate::types::{LevelId, LevelIndex, Range};
+use crate::types::{LevelId, LevelIndex, Range, TrendTracker};
 
 /// State for a specific timeframe within the analyzer.
 #[derive(Debug)]
@@ -11,8 +11,14 @@ pub struct TimeframeState {
     pub ranges: Vec<Range>,
     /// Level index for efficient lookups.
     pub level_index: LevelIndex,
-    /// Last processed candle index.
+    /// Trend tracker for trendline detection and interaction.
+    pub trend_tracker: TrendTracker,
+    /// Last processed candle index (for forward pass).
     pub last_processed_index: usize,
+    /// Number of candles when reverse pass last ran.
+    pub last_reverse_pass_candles: usize,
+    /// Flag to force a full reverse pass rescan (set when levels break).
+    pub needs_level_rescan: bool,
 }
 
 impl TimeframeState {
@@ -21,8 +27,21 @@ impl TimeframeState {
         Self {
             ranges: Vec::new(),
             level_index: LevelIndex::new(timeframe_idx),
+            trend_tracker: TrendTracker::new(0.0), // Tolerance set during processing
             last_processed_index: 0,
+            last_reverse_pass_candles: 0,
+            needs_level_rescan: true, // Start with rescan needed
         }
+    }
+
+    /// Mark that a level was broken and rescan may be needed.
+    pub fn mark_level_broken(&mut self) {
+        self.needs_level_rescan = true;
+    }
+
+    /// Clear the rescan flag after a successful reverse pass.
+    pub fn clear_rescan_flag(&mut self) {
+        self.needs_level_rescan = false;
     }
 
     /// Get the number of ranges.

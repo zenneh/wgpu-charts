@@ -1,82 +1,15 @@
-   0.197351750s  INFO prepare_target{force=false package_id=charter v0.1.0 (/Users/zenneh/git/charter/crates/charter) target="charter"}: cargo::core::compiler::fingerprint: stale: changed "/Users/zenneh/git/charter/crates/charter-ta/src/analyzer/forward_pass.rs"
-   0.197366083s  INFO prepare_target{force=false package_id=charter v0.1.0 (/Users/zenneh/git/charter/crates/charter) target="charter"}: cargo::core::compiler::fingerprint:           (vs) "/Users/zenneh/git/charter/target/debug/.fingerprint/charter-ta-a06fa43449a41a92/dep-lib-charter_ta"
-   0.197368833s  INFO prepare_target{force=false package_id=charter v0.1.0 (/Users/zenneh/git/charter/crates/charter) target="charter"}: cargo::core::compiler::fingerprint:                FileTime { seconds: 1768990319, nanos: 704682713 } < FileTime { seconds: 1768990332, nanos: 19579273 }
-   0.207955125s  INFO prepare_target{force=false package_id=charter v0.1.0 (/Users/zenneh/git/charter/crates/charter) target="charter"}: cargo::core::compiler::fingerprint: fingerprint dirty for charter v0.1.0 (/Users/zenneh/git/charter/crates/charter)/Check { test: false }/TargetInner { name: "charter", doc: true, ..: with_path("/Users/zenneh/git/charter/crates/charter/src/main.rs", Edition2024) }
-   0.207968042s  INFO prepare_target{force=false package_id=charter v0.1.0 (/Users/zenneh/git/charter/crates/charter) target="charter"}: cargo::core::compiler::fingerprint:     dirty: FsStatusOutdated(StaleDepFingerprint { name: "charter_ta" })
-   0.218278208s  INFO prepare_target{force=false package_id=charter-render v0.1.0 (/Users/zenneh/git/charter/crates/charter-render) target="charter_render"}: cargo::core::compiler::fingerprint: fingerprint dirty for charter-render v0.1.0 (/Users/zenneh/git/charter/crates/charter-render)/Check { test: false }/TargetInner { name_inferred: true, ..: lib_target("charter_render", ["lib"], "/Users/zenneh/git/charter/crates/charter-render/src/lib.rs", Edition2024) }
-   0.218295500s  INFO prepare_target{force=false package_id=charter-render v0.1.0 (/Users/zenneh/git/charter/crates/charter-render) target="charter_render"}: cargo::core::compiler::fingerprint:     dirty: FsStatusOutdated(StaleDepFingerprint { name: "charter_ta" })
-   0.218793417s  INFO prepare_target{force=false package_id=charter-ta v0.1.0 (/Users/zenneh/git/charter/crates/charter-ta) target="charter_ta"}: cargo::core::compiler::fingerprint: fingerprint dirty for charter-ta v0.1.0 (/Users/zenneh/git/charter/crates/charter-ta)/Check { test: false }/TargetInner { name_inferred: true, ..: lib_target("charter_ta", ["lib"], "/Users/zenneh/git/charter/crates/charter-ta/src/lib.rs", Edition2024) }
-   0.218799125s  INFO prepare_target{force=false package_id=charter-ta v0.1.0 (/Users/zenneh/git/charter/crates/charter-ta) target="charter_ta"}: cargo::core::compiler::fingerprint:     dirty: FsStatusOutdated(StaleItem(ChangedFile { reference: "/Users/zenneh/git/charter/target/debug/.fingerprint/charter-ta-a06fa43449a41a92/dep-lib-charter_ta", reference_mtime: FileTime { seconds: 1768990319, nanos: 704682713 }, stale: "/Users/zenneh/git/charter/crates/charter-ta/src/analyzer/forward_pass.rs", stale_mtime: FileTime { seconds: 1768990332, nanos: 19579273 } }))
-   0.229741167s  INFO prepare_target{force=false package_id=charter-ui v0.1.0 (/Users/zenneh/git/charter/crates/charter-ui) target="charter_ui"}: cargo::core::compiler::fingerprint: fingerprint dirty for charter-ui v0.1.0 (/Users/zenneh/git/charter/crates/charter-ui)/Check { test: false }/TargetInner { name_inferred: true, ..: lib_target("charter_ui", ["lib"], "/Users/zenneh/git/charter/crates/charter-ui/src/lib.rs", Edition2024) }
-   0.229759750s  INFO prepare_target{force=false package_id=charter-ui v0.1.0 (/Users/zenneh/git/charter/crates/charter-ui) target="charter_ui"}: cargo::core::compiler::fingerprint:     dirty: FsStatusOutdated(StaleDepFingerprint { name: "charter_render" })
-   0.233519583s  INFO prepare_target{force=false package_id=charter v0.1.0 (/Users/zenneh/git/charter/crates/charter) target="charter"}: cargo::core::compiler::fingerprint: fingerprint dirty for charter v0.1.0 (/Users/zenneh/git/charter/crates/charter)/Check { test: true }/TargetInner { name: "charter", doc: true, ..: with_path("/Users/zenneh/git/charter/crates/charter/src/main.rs", Edition2024) }
-   0.233529042s  INFO prepare_target{force=false package_id=charter v0.1.0 (/Users/zenneh/git/charter/crates/charter) target="charter"}: cargo::core::compiler::fingerprint:     dirty: FsStatusOutdated(StaleDepFingerprint { name: "charter_ta" })
-   0.234708167s  INFO prepare_target{force=false package_id=charter-backtest v0.1.0 (/Users/zenneh/git/charter/crates/charter-backtest) target="charter-backtest"}: cargo::core::compiler::fingerprint: fingerprint error for charter-backtest v0.1.0 (/Users/zenneh/git/charter/crates/charter-backtest)/Check { test: false }/TargetInner { name: "charter-backtest", doc: true, ..: with_path("/Users/zenneh/git/charter/crates/charter-backtest/src/main.rs", Edition2024) }
-   0.234719333s  INFO prepare_target{force=false package_id=charter-backtest v0.1.0 (/Users/zenneh/git/charter/crates/charter-backtest) target="charter-backtest"}: cargo::core::compiler::fingerprint:     err: failed to read `/Users/zenneh/git/charter/target/debug/.fingerprint/charter-backtest-76b37038195f0587/bin-charter-backtest`
-
-Caused by:
-    No such file or directory (os error 2)
-
-Stack backtrace:
-   0: std::backtrace::Backtrace::create
-   1: std::backtrace::Backtrace::capture
-   2: cargo_util::paths::read_bytes
-   3: cargo_util::paths::read
-   4: cargo::core::compiler::fingerprint::_compare_old_fingerprint
-   5: cargo::core::compiler::fingerprint::prepare_target
-   6: cargo::core::compiler::compile
-   7: <cargo::core::compiler::build_runner::BuildRunner>::compile
-   8: cargo::ops::cargo_compile::compile_ws
-   9: cargo::ops::cargo_compile::compile_with_exec
-  10: cargo::ops::cargo_compile::compile
-  11: cargo::commands::check::exec
-  12: <cargo::cli::Exec>::exec
-  13: cargo::main
-  14: std::sys::backtrace::__rust_begin_short_backtrace::<fn(), ()>
-  15: std::rt::lang_start::<()>::{closure#0}
-  16: std::rt::lang_start_internal
-  17: _main
-   0.237793792s  INFO prepare_target{force=false package_id=charter-backtest v0.1.0 (/Users/zenneh/git/charter/crates/charter-backtest) target="charter-backtest"}: cargo::core::compiler::fingerprint: fingerprint error for charter-backtest v0.1.0 (/Users/zenneh/git/charter/crates/charter-backtest)/Check { test: true }/TargetInner { name: "charter-backtest", doc: true, ..: with_path("/Users/zenneh/git/charter/crates/charter-backtest/src/main.rs", Edition2024) }
-   0.237799708s  INFO prepare_target{force=false package_id=charter-backtest v0.1.0 (/Users/zenneh/git/charter/crates/charter-backtest) target="charter-backtest"}: cargo::core::compiler::fingerprint:     err: failed to read `/Users/zenneh/git/charter/target/debug/.fingerprint/charter-backtest-fd3a86b2d69ac7aa/test-bin-charter-backtest`
-
-Caused by:
-    No such file or directory (os error 2)
-
-Stack backtrace:
-   0: std::backtrace::Backtrace::create
-   1: std::backtrace::Backtrace::capture
-   2: cargo_util::paths::read_bytes
-   3: cargo_util::paths::read
-   4: cargo::core::compiler::fingerprint::_compare_old_fingerprint
-   5: cargo::core::compiler::fingerprint::prepare_target
-   6: cargo::core::compiler::compile
-   7: <cargo::core::compiler::build_runner::BuildRunner>::compile
-   8: cargo::ops::cargo_compile::compile_ws
-   9: cargo::ops::cargo_compile::compile_with_exec
-  10: cargo::ops::cargo_compile::compile
-  11: cargo::commands::check::exec
-  12: <cargo::cli::Exec>::exec
-  13: cargo::main
-  14: std::sys::backtrace::__rust_begin_short_backtrace::<fn(), ()>
-  15: std::rt::lang_start::<()>::{closure#0}
-  16: std::rt::lang_start_internal
-  17: _main
-   0.238738000s  INFO prepare_target{force=false package_id=charter-render v0.1.0 (/Users/zenneh/git/charter/crates/charter-render) target="charter_render"}: cargo::core::compiler::fingerprint: fingerprint dirty for charter-render v0.1.0 (/Users/zenneh/git/charter/crates/charter-render)/Check { test: true }/TargetInner { name_inferred: true, ..: lib_target("charter_render", ["lib"], "/Users/zenneh/git/charter/crates/charter-render/src/lib.rs", Edition2024) }
-   0.238744000s  INFO prepare_target{force=false package_id=charter-render v0.1.0 (/Users/zenneh/git/charter/crates/charter-render) target="charter_render"}: cargo::core::compiler::fingerprint:     dirty: FsStatusOutdated(StaleDepFingerprint { name: "charter_ta" })
-   0.240875167s  INFO prepare_target{force=false package_id=charter-ta v0.1.0 (/Users/zenneh/git/charter/crates/charter-ta) target="charter_ta"}: cargo::core::compiler::fingerprint: stale: changed "/Users/zenneh/git/charter/crates/charter-ta/src/analyzer/forward_pass.rs"
-   0.240881167s  INFO prepare_target{force=false package_id=charter-ta v0.1.0 (/Users/zenneh/git/charter/crates/charter-ta) target="charter_ta"}: cargo::core::compiler::fingerprint:           (vs) "/Users/zenneh/git/charter/target/debug/.fingerprint/charter-ta-b69e73e764f862b8/dep-test-lib-charter_ta"
-   0.240882833s  INFO prepare_target{force=false package_id=charter-ta v0.1.0 (/Users/zenneh/git/charter/crates/charter-ta) target="charter_ta"}: cargo::core::compiler::fingerprint:                FileTime { seconds: 1768990319, nanos: 716163894 } < FileTime { seconds: 1768990332, nanos: 19579273 }
-   0.240952792s  INFO prepare_target{force=false package_id=charter-ta v0.1.0 (/Users/zenneh/git/charter/crates/charter-ta) target="charter_ta"}: cargo::core::compiler::fingerprint: fingerprint dirty for charter-ta v0.1.0 (/Users/zenneh/git/charter/crates/charter-ta)/Check { test: true }/TargetInner { name_inferred: true, ..: lib_target("charter_ta", ["lib"], "/Users/zenneh/git/charter/crates/charter-ta/src/lib.rs", Edition2024) }
-   0.240957917s  INFO prepare_target{force=false package_id=charter-ta v0.1.0 (/Users/zenneh/git/charter/crates/charter-ta) target="charter_ta"}: cargo::core::compiler::fingerprint:     dirty: FsStatusOutdated(StaleItem(ChangedFile { reference: "/Users/zenneh/git/charter/target/debug/.fingerprint/charter-ta-b69e73e764f862b8/dep-test-lib-charter_ta", reference_mtime: FileTime { seconds: 1768990319, nanos: 716163894 }, stale: "/Users/zenneh/git/charter/crates/charter-ta/src/analyzer/forward_pass.rs", stale_mtime: FileTime { seconds: 1768990332, nanos: 19579273 } }))
-   0.242541625s  INFO prepare_target{force=false package_id=charter-ta v0.1.0 (/Users/zenneh/git/charter/crates/charter-ta) target="analyzer_bench"}: cargo::core::compiler::fingerprint: fingerprint dirty for charter-ta v0.1.0 (/Users/zenneh/git/charter/crates/charter-ta)/Check { test: true }/TargetInner { kind: "bench", name: "analyzer_bench", tested: false, harness: false, ..: with_path("/Users/zenneh/git/charter/crates/charter-ta/benches/analyzer_bench.rs", Edition2024) }
-   0.242547167s  INFO prepare_target{force=false package_id=charter-ta v0.1.0 (/Users/zenneh/git/charter/crates/charter-ta) target="analyzer_bench"}: cargo::core::compiler::fingerprint:     dirty: FsStatusOutdated(StaleDepFingerprint { name: "charter_ta" })
-   0.242940875s  INFO prepare_target{force=false package_id=charter-ui v0.1.0 (/Users/zenneh/git/charter/crates/charter-ui) target="charter_ui"}: cargo::core::compiler::fingerprint: fingerprint dirty for charter-ui v0.1.0 (/Users/zenneh/git/charter/crates/charter-ui)/Check { test: true }/TargetInner { name_inferred: true, ..: lib_target("charter_ui", ["lib"], "/Users/zenneh/git/charter/crates/charter-ui/src/lib.rs", Edition2024) }
-   0.242945583s  INFO prepare_target{force=false package_id=charter-ui v0.1.0 (/Users/zenneh/git/charter/crates/charter-ui) target="charter_ui"}: cargo::core::compiler::fingerprint:     dirty: FsStatusOutdated(StaleDepFingerprint { name: "charter_render" })
-    Checking charter-ta v0.1.0 (/Users/zenneh/git/charter/crates/charter-ta)
+   0.204643041s  INFO prepare_target{force=false package_id=charter v0.1.0 (/Users/zenneh/git/charter/crates/charter) target="charter"}: cargo::core::compiler::fingerprint: dependency on `charter_ta` is newer than we are 1769007001.729345078s > 1768991037.966728752s "/Users/zenneh/git/charter/crates/charter-render"
+   0.213560250s  INFO prepare_target{force=false package_id=charter v0.1.0 (/Users/zenneh/git/charter/crates/charter) target="charter"}: cargo::core::compiler::fingerprint: fingerprint dirty for charter v0.1.0 (/Users/zenneh/git/charter/crates/charter)/Check { test: false }/TargetInner { name: "charter", doc: true, ..: with_path("/Users/zenneh/git/charter/crates/charter/src/main.rs", Edition2024) }
+   0.213572583s  INFO prepare_target{force=false package_id=charter v0.1.0 (/Users/zenneh/git/charter/crates/charter) target="charter"}: cargo::core::compiler::fingerprint:     dirty: FsStatusOutdated(StaleDepFingerprint { name: "charter_render" })
+   0.224214458s  INFO prepare_target{force=false package_id=charter-render v0.1.0 (/Users/zenneh/git/charter/crates/charter-render) target="charter_render"}: cargo::core::compiler::fingerprint: fingerprint dirty for charter-render v0.1.0 (/Users/zenneh/git/charter/crates/charter-render)/Check { test: false }/TargetInner { name_inferred: true, ..: lib_target("charter_render", ["lib"], "/Users/zenneh/git/charter/crates/charter-render/src/lib.rs", Edition2024) }
+   0.224230541s  INFO prepare_target{force=false package_id=charter-render v0.1.0 (/Users/zenneh/git/charter/crates/charter-render) target="charter_render"}: cargo::core::compiler::fingerprint:     dirty: FsStatusOutdated(StaleDependency { name: "charter_ta", dep_mtime: FileTime { seconds: 1769007001, nanos: 729345078 }, max_mtime: FileTime { seconds: 1768991037, nanos: 966728752 } })
+   0.235778958s  INFO prepare_target{force=false package_id=charter-ui v0.1.0 (/Users/zenneh/git/charter/crates/charter-ui) target="charter_ui"}: cargo::core::compiler::fingerprint: fingerprint dirty for charter-ui v0.1.0 (/Users/zenneh/git/charter/crates/charter-ui)/Check { test: false }/TargetInner { name_inferred: true, ..: lib_target("charter_ui", ["lib"], "/Users/zenneh/git/charter/crates/charter-ui/src/lib.rs", Edition2024) }
+   0.235792916s  INFO prepare_target{force=false package_id=charter-ui v0.1.0 (/Users/zenneh/git/charter/crates/charter-ui) target="charter_ui"}: cargo::core::compiler::fingerprint:     dirty: FsStatusOutdated(StaleDepFingerprint { name: "charter_render" })
+   0.239520833s  INFO prepare_target{force=false package_id=charter v0.1.0 (/Users/zenneh/git/charter/crates/charter) target="charter"}: cargo::core::compiler::fingerprint: fingerprint dirty for charter v0.1.0 (/Users/zenneh/git/charter/crates/charter)/Check { test: true }/TargetInner { name: "charter", doc: true, ..: with_path("/Users/zenneh/git/charter/crates/charter/src/main.rs", Edition2024) }
+   0.239529958s  INFO prepare_target{force=false package_id=charter v0.1.0 (/Users/zenneh/git/charter/crates/charter) target="charter"}: cargo::core::compiler::fingerprint:     dirty: FsStatusOutdated(StaleDepFingerprint { name: "charter_render" })
+   0.251091625s  INFO prepare_target{force=false package_id=charter-ui v0.1.0 (/Users/zenneh/git/charter/crates/charter-ui) target="charter_ui"}: cargo::core::compiler::fingerprint: fingerprint dirty for charter-ui v0.1.0 (/Users/zenneh/git/charter/crates/charter-ui)/Check { test: true }/TargetInner { name_inferred: true, ..: lib_target("charter_ui", ["lib"], "/Users/zenneh/git/charter/crates/charter-ui/src/lib.rs", Edition2024) }
+   0.251101708s  INFO prepare_target{force=false package_id=charter-ui v0.1.0 (/Users/zenneh/git/charter/crates/charter-ui) target="charter_ui"}: cargo::core::compiler::fingerprint:     dirty: FsStatusOutdated(StaleDepFingerprint { name: "charter_render" })
     Checking charter-render v0.1.0 (/Users/zenneh/git/charter/crates/charter-render)
-    Checking charter-backtest v0.1.0 (/Users/zenneh/git/charter/crates/charter-backtest)
     Checking charter-ui v0.1.0 (/Users/zenneh/git/charter/crates/charter-ui)
-error: could not compile `charter-backtest` (bin "charter-backtest" test) due to 22 previous errors
-warning: build failed, waiting for other jobs to finish...
-error: could not compile `charter-backtest` (bin "charter-backtest") due to 22 previous errors
     Checking charter v0.1.0 (/Users/zenneh/git/charter/crates/charter)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.96s

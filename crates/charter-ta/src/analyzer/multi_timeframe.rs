@@ -6,6 +6,7 @@
 use charter_core::{Candle, Timeframe};
 
 use super::{AnalysisResult, Analyzer, DefaultAnalyzer};
+use crate::ml::{extract_features_from_state, TimeframeFeatures};
 use crate::types::{AnalyzerConfig, LevelEvent};
 
 // Re-export charter_core's aggregate_candles for convenience
@@ -47,14 +48,115 @@ impl MultiTimeframeResult {
 /// to enable early-stopping optimization in lower timeframes.
 pub struct MultiTimeframeAnalyzer {
     analyzer: DefaultAnalyzer,
+    /// Configured timeframes for this analyzer.
+    timeframes: Vec<Timeframe>,
+    /// Accumulated 1m candles for aggregation.
+    candles_1m: Vec<Candle>,
+    /// Aggregated candles per timeframe.
+    aggregated_candles: Vec<Vec<Candle>>,
+    /// Current candle index for feature extraction.
+    current_index: usize,
 }
 
 impl MultiTimeframeAnalyzer {
-    /// Create a new multi-timeframe analyzer.
-    pub fn new(config: AnalyzerConfig) -> Self {
+    /// Create a new multi-timeframe analyzer with the given timeframes.
+    pub fn with_timeframes(timeframes: Vec<Timeframe>, config: AnalyzerConfig) -> Self {
+        let num_tf = timeframes.len();
         Self {
             analyzer: DefaultAnalyzer::new(config),
+            timeframes,
+            candles_1m: Vec::new(),
+            aggregated_candles: vec![Vec::new(); num_tf],
+            current_index: 0,
         }
+    }
+
+    /// Create a new multi-timeframe analyzer from config.
+    pub fn new(config: AnalyzerConfig) -> Self {
+        let timeframes: Vec<Timeframe> = config.timeframes.iter().map(|tc| tc.timeframe).collect();
+        let num_tf = timeframes.len();
+        Self {
+            analyzer: DefaultAnalyzer::new(config),
+            timeframes,
+            candles_1m: Vec::new(),
+            aggregated_candles: vec![Vec::new(); num_tf],
+            current_index: 0,
+        }
+    }
+
+    /// Process a single 1-minute candle and update all timeframes.
+    ///
+    /// This method:
+    /// 1. Adds the candle to the 1m buffer
+    /// 2. Re-aggregates all higher timeframes
+    /// 3. Updates the analyzer with all timeframes
+    pub fn process_1m_candle(&mut self, candle: &Candle) {
+        self.candles_1m.push(candle.clone());
+        self.current_index += 1;
+
+        let current_price = candle.close;
+
+        // Re-aggregate candles for each timeframe
+        for (tf_idx, &tf) in self.timeframes.iter().enumerate() {
+            self.aggregated_candles[tf_idx] = if tf == Timeframe::Min1 {
+                self.candles_1m.clone()
+            } else {
+                aggregate_candles(&self.candles_1m, tf)
+            };
+        }
+
+        // Update analyzer for each timeframe (highest first for early stopping)
+        for (tf_idx, _tf) in self.timeframes.iter().enumerate().rev() {
+            let candles = &self.aggregated_candles[tf_idx];
+            if !candles.is_empty() {
+                self.analyzer.update(tf_idx as u8, candles, current_price);
+            }
+        }
+    }
+
+    /// Extract features for all timeframes at the current state.
+    ///
+    /// Returns features for all configured timeframes (always the same count),
+    /// padding with empty features for timeframes without data.
+    pub fn extract_all_features(&self, _current_price: f32) -> Vec<TimeframeFeatures> {
+        let state = self.analyzer.state();
+        let extracted = extract_features_from_state(state, self.current_index, 1000.0);
+
+        // Create a map of extracted features by timeframe index
+        let mut tf_map: std::collections::HashMap<u8, TimeframeFeatures> =
+            extracted.timeframes.into_iter()
+                .map(|tf| (tf.timeframe_index, tf))
+                .collect();
+
+        // Ensure all configured timeframes have features (in order)
+        self.timeframes
+            .iter()
+            .enumerate()
+            .map(|(idx, _tf)| {
+                tf_map.remove(&(idx as u8)).unwrap_or_else(|| {
+                    TimeframeFeatures {
+                        timeframe_index: idx as u8,
+                        ..Default::default()
+                    }
+                })
+            })
+            .collect()
+    }
+
+    /// Get TA statistics: (timeframe, level_count, range_count) for each timeframe.
+    pub fn ta_counts(&self) -> Vec<(Timeframe, usize, usize)> {
+        let state = self.analyzer.state();
+        self.timeframes
+            .iter()
+            .enumerate()
+            .map(|(tf_idx, &tf)| {
+                if let Some(tf_state) = state.get_timeframe(tf_idx as u8) {
+                    (tf, tf_state.level_count(), tf_state.range_count())
+                } else {
+                    (tf, 0, 0)
+                }
+            })
+            .collect()
     }
 
     /// Process multiple timeframes in the correct order.

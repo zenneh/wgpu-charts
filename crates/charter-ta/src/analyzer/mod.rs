@@ -21,7 +21,7 @@ pub use state::{AnalyzerState, TimeframeState};
 
 use charter_core::Candle;
 
-use crate::types::{AnalyzerConfig, Level, LevelEvent, Range};
+use crate::types::{AnalyzerConfig, Level, LevelEvent, Range, Trend, TrendEvent};
 
 /// Result of analyzing data.
 #[derive(Debug, Default)]
@@ -32,6 +32,10 @@ pub struct AnalysisResult {
     pub levels: Vec<Level>,
     /// Level events that occurred.
     pub level_events: Vec<LevelEvent>,
+    /// Trends created in this analysis.
+    pub trends: Vec<Trend>,
+    /// Trend events that occurred.
+    pub trend_events: Vec<TrendEvent>,
 }
 
 /// Trait for technical analysis algorithms.
@@ -81,80 +85,85 @@ impl DefaultAnalyzer {
             None => return AnalysisResult::default(),
         };
 
-        // Perform reverse pass to detect ranges and create levels
-        let reverse_result = reverse_pass(
-            candles,
-            timeframe_idx,
-            tf_config.doji_threshold,
-            tf_config.min_candles,
-            tf_config.create_greedy_levels,
-            current_price,
-            self.state.closest_unbroken_resistance.map(|(p, _)| p),
-            self.state.closest_unbroken_support.map(|(p, _)| p),
-        );
+        // Check if we can skip the reverse pass entirely
+        // Conditions: we have levels on both sides, no rescan needed, and no new candles
+        let skip_reverse_pass = {
+            let tf_state = self.state.get_timeframe(timeframe_idx);
+            let has_both_levels = self.state.closest_unbroken_resistance.is_some()
+                && self.state.closest_unbroken_support.is_some();
+            let no_rescan_needed = tf_state.map(|s| !s.needs_level_rescan).unwrap_or(false);
+            let no_new_candles = tf_state
+                .map(|s| s.last_reverse_pass_candles >= candles.len())
+                .unwrap_or(false);
 
-        let mut result = AnalysisResult {
-            ranges: reverse_result.ranges,
-            levels: Vec::new(),
-            level_events: Vec::new(),
+            has_both_levels && no_rescan_needed && no_new_candles
         };
 
-        // Insert levels into the index and run forward pass
-        {
-            let tf_state = self.state.get_or_create_timeframe(timeframe_idx);
+        let mut result = AnalysisResult {
+            ranges: Vec::new(),
+            levels: Vec::new(),
+            level_events: Vec::new(),
+            trends: Vec::new(),
+            trend_events: Vec::new(),
+        };
 
-            // Track newly inserted levels that need catch-up forward pass
-            let mut new_levels: Vec<(crate::types::LevelId, usize)> = Vec::new();
+        // Only run reverse pass if needed
+        if !skip_reverse_pass {
+            let reverse_result = reverse_pass(
+                candles,
+                timeframe_idx,
+                tf_config.doji_threshold,
+                tf_config.min_candles,
+                tf_config.create_greedy_levels,
+                current_price,
+                self.state.closest_unbroken_resistance.map(|(p, _)| p),
+                self.state.closest_unbroken_support.map(|(p, _)| p),
+            );
 
-            for level in reverse_result.levels {
-                let id = level.id;
-                let created_at = level.created_at_index;
+            result.ranges = reverse_result.ranges.clone();
 
-                // Only insert if level doesn't already exist (preserves activation state)
-                if !tf_state.level_index.contains(id) {
-                    result.level_events.push(LevelEvent::Created { level_id: id });
-                    // Don't push to result.levels here - we'll clone from index AFTER forward pass
-                    tf_state.level_index.insert(level);
-                    new_levels.push((id, created_at));
+            // Update timeframe state with reverse pass results
+            {
+                let tf_state = self.state.get_or_create_timeframe(timeframe_idx);
+                tf_state.last_reverse_pass_candles = candles.len();
+
+                // Clear rescan flag if early stopping found levels on both sides
+                if reverse_result.early_stopped {
+                    tf_state.clear_rescan_flag();
                 }
-            }
 
-            // Run catch-up forward pass for newly inserted levels only
-            // This processes candles from created_at_index to last_processed_index
-            // to properly activate new levels and register historical hits
-            for (level_id, created_at) in new_levels {
-                if created_at < tf_state.last_processed_index {
-                    // Process historical candles for this specific level
-                    let catch_up_end = tf_state.last_processed_index.min(candles.len());
-                    for (i, candle) in candles.iter().enumerate().skip(created_at + 1).take(catch_up_end.saturating_sub(created_at + 1)) {
-                        if let Some(level) = tf_state.level_index.get_mut(level_id) {
-                            let meta = crate::types::CandleMetadata::from_candle(candle, tf_config.doji_threshold);
-                            let interaction = level.check_interaction(candle, meta.direction, i, timeframe_idx);
+                // Insert new levels
+                for level in reverse_result.levels {
+                    let id = level.id;
+                    if !tf_state.level_index.contains(id) {
+                        result.level_events.push(LevelEvent::Created { level_id: id });
+                        tf_state.level_index.insert(level);
+                    }
+                }
 
-                            match interaction {
-                                crate::types::LevelInteraction::Activated => {
-                                    result.level_events.push(LevelEvent::Activated { level_id });
-                                }
-                                crate::types::LevelInteraction::Hit(hit) => {
-                                    result.level_events.push(LevelEvent::Hit { level_id, hit });
-                                }
-                                crate::types::LevelInteraction::Broken => {
-                                    if let Some(break_event) = level.break_event {
-                                        result.level_events.push(LevelEvent::Broken {
-                                            level_id,
-                                            break_event,
-                                        });
-                                        tf_state.level_index.mark_broken(level_id);
-                                    }
-                                }
-                                crate::types::LevelInteraction::None => {}
-                            }
-                        }
+                // Process ranges through TrendTracker to create trends
+                // Set tolerance based on current price (0.1% of price)
+                tf_state.trend_tracker.default_tolerance = current_price * 0.001;
+
+                // Clear existing trends and rebuild from ranges
+                // Ranges from reverse pass are newest-to-oldest, but TrendTracker needs
+                // chronological order (oldest-to-newest) to track "last" ranges properly
+                tf_state.trend_tracker.clear();
+                let mut sorted_ranges = reverse_result.ranges.clone();
+                sorted_ranges.sort_by_key(|r| r.start_index);
+                for range in &sorted_ranges {
+                    if let Some(event) = tf_state.trend_tracker.process_range(range, range.end_index) {
+                        result.trend_events.push(event);
                     }
                 }
             }
+        }
 
-            // Run forward pass for all levels on new candles (from last_processed_index onwards)
+        // Run forward pass for all levels on new candles
+        {
+            let tf_state = self.state.get_or_create_timeframe(timeframe_idx);
+
+            // Run forward pass (from last_processed_index onwards)
             let forward_result = forward_pass(
                 candles,
                 &mut tf_state.level_index,
@@ -163,6 +172,12 @@ impl DefaultAnalyzer {
                 tf_state.last_processed_index,
             );
 
+            // Check if any levels were broken - if so, mark for rescan
+            let had_breaks = forward_result.broken.iter().any(|_| true);
+            if had_breaks {
+                tf_state.mark_level_broken();
+            }
+
             // Update last processed index
             tf_state.last_processed_index = candles.len();
 
@@ -170,10 +185,47 @@ impl DefaultAnalyzer {
             result.level_events.extend(forward_result.events);
 
             // Clone levels from index AFTER forward pass so they have updated states
-            result.levels = tf_state.level_index.iter().cloned().collect();
+            // Sort by ID for deterministic ordering
+            let mut levels: Vec<_> = tf_state.level_index.iter().cloned().collect();
+            levels.sort_by_key(|l| l.id);
+            result.levels = levels;
+
+            // Check trend interactions for new candles
+            let start_idx = tf_state.last_processed_index.saturating_sub(candles.len() - tf_state.last_processed_index);
+            for (i, candle) in candles.iter().enumerate().skip(start_idx) {
+                let trend_events = tf_state.trend_tracker.check_interactions(i, candle);
+                result.trend_events.extend(trend_events);
+            }
+
+            // Copy trends to result
+            result.trends = tf_state.trend_tracker.trends.clone();
         }
 
         // Update global closest levels (separate borrow scope)
+        // First, check if current closest levels are still valid (not broken)
+        if let Some((_, id)) = self.state.closest_unbroken_resistance {
+            let tf_state = self.state.get_timeframe(timeframe_idx);
+            let is_broken = tf_state
+                .and_then(|s| s.level_index.get(id))
+                .map(|l| l.state == crate::types::LevelState::Broken)
+                .unwrap_or(false);
+            if is_broken {
+                self.state.closest_unbroken_resistance = None;
+            }
+        }
+
+        if let Some((_, id)) = self.state.closest_unbroken_support {
+            let tf_state = self.state.get_timeframe(timeframe_idx);
+            let is_broken = tf_state
+                .and_then(|s| s.level_index.get(id))
+                .map(|l| l.state == crate::types::LevelState::Broken)
+                .unwrap_or(false);
+            if is_broken {
+                self.state.closest_unbroken_support = None;
+            }
+        }
+
+        // Now find the closest levels from this timeframe
         let closest_resistance = {
             let tf_state = self.state.get_timeframe(timeframe_idx);
             tf_state.and_then(|s| {

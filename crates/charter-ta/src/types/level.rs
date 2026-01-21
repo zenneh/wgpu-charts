@@ -541,8 +541,27 @@ impl LevelIndex {
     }
 
     /// Get all unbroken levels (active or inactive).
+    ///
+    /// O(L) where L is only the unbroken levels, not all levels ever created.
+    /// Uses the BTreeSets which already track unbroken levels efficiently.
     pub fn unbroken_levels(&self) -> impl Iterator<Item = &Level> {
-        self.by_id.values().filter(|l| l.state != LevelState::Broken)
+        // Chain resistance and support sets - both contain only unbroken levels
+        let resistance_iter = self
+            .active_resistance
+            .iter()
+            .filter_map(|(_, id)| self.by_id.get(id));
+        let support_iter = self
+            .active_support
+            .iter()
+            .filter_map(|(_, id)| self.by_id.get(id));
+        resistance_iter.chain(support_iter)
+    }
+
+    /// Get count of unbroken levels.
+    ///
+    /// O(1) complexity.
+    pub fn unbroken_count(&self) -> usize {
+        self.active_resistance.len() + self.active_support.len()
     }
 
     /// Get the number of active levels.
