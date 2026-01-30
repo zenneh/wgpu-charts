@@ -78,7 +78,9 @@ pub fn load_candles_from_csv<P: AsRef<Path>>(path: P) -> anyhow::Result<Vec<Cand
     let headers_lower: Vec<String> = headers.iter().map(|h| h.to_lowercase()).collect();
 
     // Find column indices
-    let ts_col = headers_lower.iter().position(|h| h.contains("timestamp") || h == "time");
+    let ts_col = headers_lower
+        .iter()
+        .position(|h| h.contains("timestamp") || h == "time");
     let open_col = headers_lower.iter().position(|h| h == "open");
     let high_col = headers_lower.iter().position(|h| h == "high");
     let low_col = headers_lower.iter().position(|h| h == "low");

@@ -93,6 +93,8 @@ pub struct DrawingManager {
     pub selected: Option<DrawingId>,
     /// Currently hovered anchor.
     pub hovered_anchor: Option<HoveredAnchor>,
+    /// Currently hovered drawing body (when not hovering an anchor).
+    pub hovered_drawing: Option<DrawingId>,
     /// Current cursor position in chart coordinates.
     pub cursor_pos: Option<AnchorPoint>,
 }
@@ -112,6 +114,7 @@ impl DrawingManager {
         if tool != DrawingTool::Select {
             self.selected = None;
             self.hovered_anchor = None;
+            self.hovered_drawing = None;
         }
     }
 
@@ -172,6 +175,7 @@ impl DrawingManager {
             }
         } else {
             self.hovered_anchor = None;
+            self.hovered_drawing = None;
         }
     }
 
@@ -198,6 +202,7 @@ impl DrawingManager {
             }
         } else {
             self.hovered_anchor = None;
+            self.hovered_drawing = None;
         }
     }
 
@@ -207,7 +212,7 @@ impl DrawingManager {
         self.update_hover_with_scale(world_x, world_y, candle_spacing, candle_spacing, candle_spacing);
     }
 
-    /// Find if cursor is hovering over an anchor with proper scale factors.
+    /// Find if cursor is hovering over an anchor or drawing body with proper scale factors.
     fn update_hover_with_scale(
         &mut self,
         world_x: f32,
@@ -220,6 +225,7 @@ impl DrawingManager {
         const ANCHOR_HIT_RADIUS_PIXELS: f32 = 12.0;
 
         self.hovered_anchor = None;
+        self.hovered_drawing = None;
 
         // Convert pixel radius to world coordinates
         let hit_radius_x = ANCHOR_HIT_RADIUS_PIXELS * x_world_per_pixel;
@@ -246,10 +252,27 @@ impl DrawingManager {
                 }
             }
         }
+
+        // No anchor hit — check for drawing body hover
+        self.hovered_drawing = self.find_drawing_at(
+            world_x,
+            world_y,
+            candle_spacing,
+            x_world_per_pixel,
+            y_world_per_pixel,
+        );
     }
 
     /// Handle mouse press.
-    pub fn handle_press(&mut self, world_x: f32, world_y: f32, candles: &[Candle], candle_spacing: f32) -> bool {
+    pub fn handle_press(
+        &mut self,
+        world_x: f32,
+        world_y: f32,
+        candles: &[Candle],
+        candle_spacing: f32,
+        x_world_per_pixel: f32,
+        y_world_per_pixel: f32,
+    ) -> bool {
         let anchor = self.snap_target(world_x, world_y, candles, candle_spacing);
 
         match self.tool {
@@ -267,7 +290,7 @@ impl DrawingManager {
                 }
 
                 // Check if clicking on a drawing body
-                if let Some(drawing_id) = self.find_drawing_at(world_x, world_y, candle_spacing) {
+                if let Some(drawing_id) = self.find_drawing_at(world_x, world_y, candle_spacing, x_world_per_pixel, y_world_per_pixel) {
                     self.selected = Some(drawing_id);
                     self.interaction = InteractionState::DraggingDrawing {
                         drawing_id,
@@ -373,15 +396,24 @@ impl DrawingManager {
         false
     }
 
-    /// Find a drawing at the given position.
-    fn find_drawing_at(&self, world_x: f32, world_y: f32, candle_spacing: f32) -> Option<DrawingId> {
-        const HIT_TOLERANCE: f32 = 8.0;
+    /// Find a drawing at the given position with scale-aware hit detection.
+    fn find_drawing_at(
+        &self,
+        world_x: f32,
+        world_y: f32,
+        candle_spacing: f32,
+        x_world_per_pixel: f32,
+        y_world_per_pixel: f32,
+    ) -> Option<DrawingId> {
+        const HIT_TOLERANCE_PIXELS: f32 = 8.0;
+        let hit_x = HIT_TOLERANCE_PIXELS * x_world_per_pixel;
+        let hit_y = HIT_TOLERANCE_PIXELS * y_world_per_pixel;
 
         for drawing in self.drawings.iter().rev() {
             match drawing {
                 Drawing::HorizontalRay(hr) => {
                     let line_x = hr.anchor.candle_index * candle_spacing;
-                    if world_x >= line_x && (world_y - hr.anchor.price).abs() < HIT_TOLERANCE {
+                    if world_x >= line_x - hit_x && (world_y - hr.anchor.price).abs() < hit_y {
                         return Some(hr.id);
                     }
                 }
@@ -390,10 +422,10 @@ impl DrawingManager {
                     let x2 = ray.end.candle_index * candle_spacing;
                     let y1 = ray.start.price;
                     let y2 = ray.end.price;
-                    let x_min = x1.min(x2);
-                    let x_max = x1.max(x2);
-                    let y_min = y1.min(y2) - HIT_TOLERANCE;
-                    let y_max = y1.max(y2) + HIT_TOLERANCE;
+                    let x_min = x1.min(x2) - hit_x;
+                    let x_max = x1.max(x2) + hit_x;
+                    let y_min = y1.min(y2) - hit_y;
+                    let y_max = y1.max(y2) + hit_y;
 
                     if world_x >= x_min && world_x <= x_max && world_y >= y_min && world_y <= y_max {
                         return Some(ray.id);

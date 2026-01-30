@@ -31,8 +31,8 @@ pub use view::ViewState;
 pub use view::WorldPos;
 
 use std::cell::RefCell;
-use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::Arc;
+use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread;
 use std::time::Instant;
 
@@ -43,23 +43,23 @@ use winit::{
     window::Window,
 };
 
-use crate::drawing::{prepare_drawing_render_data, DrawingManager, DrawingTool};
+use crate::drawing::{DrawingManager, DrawingTool, prepare_drawing_render_data};
 use crate::indicators::{DynMacd, IndicatorGpuBuffers, IndicatorRegistry, MacdGpuBuffers};
 use crate::input::{InputAction, InputHandler};
 use crate::replay::TimeframeTaData;
 use crate::ui::{
-    show_drawing_toolbar, show_loading_overlay, show_macd_panel, show_ta_panel,
     DrawingToolbarResponse, MacdPanelResponse, SymbolPickerState, TaHoveredInfo,
+    show_drawing_toolbar, show_loading_overlay, show_macd_panel, show_ta_panel,
 };
 use charter_config::Config as AppConfig;
-use charter_core::{aggregate_candles, Candle, Timeframe};
+use charter_core::{Candle, Timeframe, aggregate_candles};
 use charter_data::{LiveDataEvent, LiveDataManager, MexcSource};
 use charter_indicators::{Indicator, Macd, MacdConfig};
 use charter_render::{
-    ChartRenderer, DrawingPipeline, DrawingRenderParams, IndicatorParams, IndicatorPointGpu,
-    LevelGpu, RangeGpu, RenderParams, TaRenderParams, TimeframeData, TrendGpu, VolumeRenderParams,
-    CANDLE_SPACING, INDICES_PER_CANDLE, MAX_TA_LEVELS, MAX_TA_RANGES, MAX_TA_TRENDS,
-    STATS_PANEL_WIDTH, VOLUME_HEIGHT_RATIO,
+    CANDLE_SPACING, ChartRenderer, DrawingPipeline, DrawingRenderParams, INDICES_PER_CANDLE,
+    IndicatorParams, IndicatorPointGpu, LevelGpu, MAX_TA_LEVELS, MAX_TA_RANGES, MAX_TA_TRENDS,
+    RangeGpu, RenderParams, STATS_PANEL_WIDTH, TaRenderParams, TimeframeData, TrendGpu,
+    VOLUME_HEIGHT_RATIO, VolumeRenderParams,
 };
 use charter_sync::SyncManager;
 use charter_ta::{
@@ -80,9 +80,30 @@ struct MacdConversionResult {
 impl MacdConversionResult {
     fn empty() -> Self {
         Self {
-            macd_points: vec![IndicatorPointGpu { x: 0.0, y: 0.0, r: 0.0, g: 0.0, b: 0.0, _padding: 0.0 }],
-            signal_points: vec![IndicatorPointGpu { x: 0.0, y: 0.0, r: 0.0, g: 0.0, b: 0.0, _padding: 0.0 }],
-            histogram_points: vec![IndicatorPointGpu { x: 0.0, y: 0.0, r: 0.0, g: 0.0, b: 0.0, _padding: 0.0 }],
+            macd_points: vec![IndicatorPointGpu {
+                x: 0.0,
+                y: 0.0,
+                r: 0.0,
+                g: 0.0,
+                b: 0.0,
+                _padding: 0.0,
+            }],
+            signal_points: vec![IndicatorPointGpu {
+                x: 0.0,
+                y: 0.0,
+                r: 0.0,
+                g: 0.0,
+                b: 0.0,
+                _padding: 0.0,
+            }],
+            histogram_points: vec![IndicatorPointGpu {
+                x: 0.0,
+                y: 0.0,
+                r: 0.0,
+                g: 0.0,
+                b: 0.0,
+                _padding: 0.0,
+            }],
             macd_start_index: 0,
             signal_start_index: 0,
         }
@@ -123,7 +144,6 @@ pub enum BackgroundMessage {
     /// Sync encountered an error.
     SyncError(String),
 }
-
 
 /// Main application state, composing all sub-states.
 ///
@@ -234,8 +254,8 @@ impl AppState {
     pub fn snapshot_for_render(&self) -> RenderSnapshot {
         RenderSnapshotBuilder::new()
             .camera(
-                self.graphics.renderer.camera.position,
-                self.graphics.renderer.camera.scale,
+                self.graphics.renderer.main_camera.camera.position,
+                self.graphics.renderer.main_camera.camera.scale,
             )
             .surface_size(self.graphics.config.width, self.graphics.config.height)
             .visible_range(
@@ -446,7 +466,7 @@ impl AppState {
         let drawing_pipeline = DrawingPipeline::new(
             &device,
             graphics.surface_format(),
-            &graphics.renderer.candle_pipeline.camera_bind_group_layout,
+            &graphics.renderer.shared_layouts,
         );
         let drawing_hray_buffer = drawing_pipeline.create_hray_buffer(&device);
         let drawing_ray_buffer = drawing_pipeline.create_ray_buffer(&device);
@@ -554,10 +574,8 @@ impl AppState {
                                 aggregate_candles(&base_candles, *tf)
                             };
 
-                            let _ = sender.send(BackgroundMessage::TimeframeAggregated {
-                                index: i,
-                                candles,
-                            });
+                            let _ = sender
+                                .send(BackgroundMessage::TimeframeAggregated { index: i, candles });
                         }
 
                         let _ = sender.send(BackgroundMessage::LoadingStateChanged(
@@ -577,15 +595,29 @@ impl AppState {
                     // Debug: Print TA analysis summary
                     if self.document.ta_settings.show_ta {
                         use charter_ta::LevelState;
-                        let active_count = levels.iter().filter(|l| l.state == LevelState::Active).count();
-                        let inactive_count = levels.iter().filter(|l| l.state == LevelState::Inactive).count();
-                        let broken_count = levels.iter().filter(|l| l.state == LevelState::Broken).count();
+                        let active_count = levels
+                            .iter()
+                            .filter(|l| l.state == LevelState::Active)
+                            .count();
+                        let inactive_count = levels
+                            .iter()
+                            .filter(|l| l.state == LevelState::Inactive)
+                            .count();
+                        let broken_count = levels
+                            .iter()
+                            .filter(|l| l.state == LevelState::Broken)
+                            .count();
                         let total_hits: usize = levels.iter().map(|l| l.hits.len()).sum();
 
                         println!("\n=== TA Analysis Complete (Timeframe {}) ===", timeframe);
                         println!("Ranges: {}", ranges.len());
-                        println!("Levels: {} total ({} active, {} inactive, {} broken)",
-                            levels.len(), active_count, inactive_count, broken_count);
+                        println!(
+                            "Levels: {} total ({} active, {} inactive, {} broken)",
+                            levels.len(),
+                            active_count,
+                            inactive_count,
+                            broken_count
+                        );
                         println!("Total hits across all levels: {}", total_hits);
                         println!("Trends: {}", trends.len());
 
@@ -593,10 +625,16 @@ impl AppState {
                         if !trends.is_empty() {
                             println!("\nSample trends (first 5):");
                             for (i, trend) in trends.iter().take(5).enumerate() {
-                                println!("  [{}] dir={:?}, state={:?}, start=({}, {:.2}), end=({}, {:.2})",
-                                    i, trend.direction, trend.state,
-                                    trend.start.candle_index, trend.start.price,
-                                    trend.end.candle_index, trend.end.price);
+                                println!(
+                                    "  [{}] dir={:?}, state={:?}, start=({}, {:.2}), end=({}, {:.2})",
+                                    i,
+                                    trend.direction,
+                                    trend.state,
+                                    trend.start.candle_index,
+                                    trend.start.price,
+                                    trend.end.candle_index,
+                                    trend.end.price
+                                );
                             }
                         }
 
@@ -604,36 +642,67 @@ impl AppState {
                         if !levels.is_empty() {
                             println!("\nSample levels (first 5):");
                             for (i, level) in levels.iter().take(5).enumerate() {
-                                println!("  [{}] price={:.2}, type={:?}, dir={:?}, state={:?}, hits={}, created_at={}",
-                                    i, level.price, level.level_type, level.level_direction,
-                                    level.state, level.hits.len(), level.created_at_index);
+                                println!(
+                                    "  [{}] price={:.2}, type={:?}, dir={:?}, state={:?}, hits={}, created_at={}",
+                                    i,
+                                    level.price,
+                                    level.level_type,
+                                    level.level_direction,
+                                    level.state,
+                                    level.hits.len(),
+                                    level.created_at_index
+                                );
                             }
                         }
 
                         // Check if any levels should have been activated
-                        if let Some(candles) = self.document.timeframes.get(timeframe).map(|tf| &tf.candles) {
+                        if let Some(candles) = self
+                            .document
+                            .timeframes
+                            .get(timeframe)
+                            .map(|tf| &tf.candles)
+                        {
                             if !candles.is_empty() && inactive_count > 0 {
                                 println!("\nDiagnostic: Checking why levels are inactive...");
-                                for level in levels.iter().filter(|l| l.state == LevelState::Inactive).take(3) {
-                                    let candles_after = candles.iter().skip(level.created_at_index + 1).take(10);
+                                for level in levels
+                                    .iter()
+                                    .filter(|l| l.state == LevelState::Inactive)
+                                    .take(3)
+                                {
+                                    let candles_after =
+                                        candles.iter().skip(level.created_at_index + 1).take(10);
                                     let mut could_activate = false;
                                     for (offset, c) in candles_after.enumerate() {
                                         let body_top = c.open.max(c.close);
                                         let body_bottom = c.open.min(c.close);
                                         let would_activate = match level.level_direction {
-                                            charter_ta::LevelDirection::Resistance => body_bottom > level.price,
-                                            charter_ta::LevelDirection::Support => body_top < level.price,
+                                            charter_ta::LevelDirection::Resistance => {
+                                                body_bottom > level.price
+                                            }
+                                            charter_ta::LevelDirection::Support => {
+                                                body_top < level.price
+                                            }
                                         };
                                         if would_activate {
-                                            println!("  Level at {:.2} ({:?}): candle {} after creation SHOULD activate (body={:.2}-{:.2})",
-                                                level.price, level.level_direction, offset + 1, body_bottom, body_top);
+                                            println!(
+                                                "  Level at {:.2} ({:?}): candle {} after creation SHOULD activate (body={:.2}-{:.2})",
+                                                level.price,
+                                                level.level_direction,
+                                                offset + 1,
+                                                body_bottom,
+                                                body_top
+                                            );
                                             could_activate = true;
                                             break;
                                         }
                                     }
                                     if !could_activate {
-                                        println!("  Level at {:.2} ({:?}): no activating candle in first 10 candles after creation (created_at={})",
-                                            level.price, level.level_direction, level.created_at_index);
+                                        println!(
+                                            "  Level at {:.2} ({:?}): no activating candle in first 10 candles after creation (created_at={})",
+                                            level.price,
+                                            level.level_direction,
+                                            level.created_at_index
+                                        );
                                     }
                                 }
                             }
@@ -664,7 +733,13 @@ impl AppState {
                     if self.interaction.loading_state.is_loading() {
                         continue;
                     }
-                    if self.document.timeframes.first().map(|tf| tf.candles.is_empty()).unwrap_or(true) {
+                    if self
+                        .document
+                        .timeframes
+                        .first()
+                        .map(|tf| tf.candles.is_empty())
+                        .unwrap_or(true)
+                    {
                         continue;
                     }
                     self.update_live_candle(candle, is_closed);
@@ -673,8 +748,16 @@ impl AppState {
                 BackgroundMessage::ConnectionStatus(connected) => {
                     self.interaction.ws_connected = connected;
                     if connected {
-                        if let Some(last_candle) = self.document.timeframes.first().and_then(|tf| tf.candles.last()) {
-                            self.update_current_price_line(Some(last_candle.close), last_candle.open);
+                        if let Some(last_candle) = self
+                            .document
+                            .timeframes
+                            .first()
+                            .and_then(|tf| tf.candles.last())
+                        {
+                            self.update_current_price_line(
+                                Some(last_candle.close),
+                                last_candle.open,
+                            );
                         }
                     } else {
                         self.update_current_price_line(None, 0.0);
@@ -758,7 +841,9 @@ impl AppState {
                 self.start_live_updates();
             }
 
-            if self.sync_enabled && !matches!(self.sync_state, charter_sync::SyncState::Syncing { .. }) {
+            if self.sync_enabled
+                && !matches!(self.sync_state, charter_sync::SyncState::Syncing { .. })
+            {
                 self.start_sync();
             }
 
@@ -773,22 +858,32 @@ impl AppState {
     // =========================================================================
 
     fn update_visible_range(&mut self) {
-        if let Some(tf) = self.document.timeframes.get(self.document.current_timeframe) {
-            self.graphics.renderer.update_visible_range(&self.graphics.queue, tf);
+        if let Some(tf) = self
+            .document
+            .timeframes
+            .get(self.document.current_timeframe)
+        {
+            self.graphics
+                .renderer
+                .update_visible_range(&self.graphics.queue, tf);
             if self.document.ta_settings.show_ta {
                 self.update_ta_buffers();
             }
             if !self.document.indicators.is_empty() {
                 self.update_macd_params();
             }
-            self.graphics.renderer.update_current_price_line(&self.graphics.queue);
+            self.graphics
+                .renderer
+                .update_current_price_line(&self.graphics.queue);
         }
     }
 
     /// Fit all candles in view.
     pub fn fit_view(&mut self) {
         let candles = self.document.current_candles();
-        self.graphics.renderer.fit_view(&self.graphics.queue, candles);
+        self.graphics
+            .renderer
+            .fit_view(&self.graphics.queue, candles);
         self.update_visible_range();
         self.window.request_redraw();
     }
@@ -809,7 +904,7 @@ impl AppState {
         }
 
         let old_candle_idx =
-            (self.graphics.renderer.camera.position[0] / CANDLE_SPACING).round() as usize;
+            (self.graphics.renderer.main_camera.camera.position[0] / CANDLE_SPACING).round() as usize;
         let old_candle_idx = old_candle_idx.min(old_candles.len().saturating_sub(1));
         let target_timestamp = old_candles[old_candle_idx].timestamp;
 
@@ -822,10 +917,10 @@ impl AppState {
 
         let new_x = (new_candle_idx as f32) * CANDLE_SPACING;
         let ratio = old_candles.len() as f32 / new_candles.len() as f32;
-        let new_scale_x = self.graphics.renderer.camera.scale[0] / ratio;
+        let new_scale_x = self.graphics.renderer.main_camera.camera.scale[0] / ratio;
 
-        self.graphics.renderer.camera.position[0] = new_x;
-        self.graphics.renderer.camera.scale[0] = new_scale_x.max(5.0);
+        self.graphics.renderer.main_camera.camera.position[0] = new_x;
+        self.graphics.renderer.main_camera.camera.scale[0] = new_scale_x.max(5.0);
 
         self.document.current_timeframe = index;
         self.graphics.renderer.update_camera(&self.graphics.queue);
@@ -862,10 +957,10 @@ impl AppState {
         let ndc_x = (screen_x / chart_width) * 2.0 - 1.0;
         let ndc_y = 1.0 - (screen_y / chart_height) * 2.0;
 
-        let world_x =
-            self.graphics.renderer.camera.position[0] + ndc_x * self.graphics.renderer.camera.scale[0] * aspect;
-        let world_y =
-            self.graphics.renderer.camera.position[1] + ndc_y * self.graphics.renderer.camera.scale[1];
+        let world_x = self.graphics.renderer.main_camera.camera.position[0]
+            + ndc_x * self.graphics.renderer.main_camera.camera.scale[0] * aspect;
+        let world_y = self.graphics.renderer.main_camera.camera.position[1]
+            + ndc_y * self.graphics.renderer.main_camera.camera.scale[1];
 
         (world_x, world_y)
     }
@@ -882,7 +977,8 @@ impl AppState {
                     if self.ui.panels.show_symbol_picker {
                         self.ui.panels.show_symbol_picker = false;
                         self.window.request_redraw();
-                    } else if self.drawing.is_interacting() || self.drawing.tool != DrawingTool::None
+                    } else if self.drawing.is_interacting()
+                        || self.drawing.tool != DrawingTool::None
                     {
                         self.drawing.cancel();
                         self.drawing.set_tool(DrawingTool::None);
@@ -937,6 +1033,16 @@ impl AppState {
                     let (world_x, world_y) = self.screen_to_world(last_pos[0], last_pos[1]);
                     let candles = self.document.current_candles();
 
+                    // Calculate scale factors for hit detection
+                    let aspect = self.graphics.config.width as f32
+                        / self.graphics.config.height as f32;
+                    let x_world_per_pixel =
+                        (self.graphics.renderer.main_camera.camera.scale[0] * aspect * 2.0)
+                            / self.graphics.config.width as f32;
+                    let y_world_per_pixel =
+                        (self.graphics.renderer.main_camera.camera.scale[1] * 2.0)
+                            / self.graphics.config.height as f32;
+
                     if state == ElementState::Pressed {
                         // For selection when no tool is active, temporarily set to Select mode
                         let original_tool = self.drawing.tool;
@@ -944,7 +1050,14 @@ impl AppState {
                             self.drawing.tool = DrawingTool::Select;
                         }
 
-                        if self.drawing.handle_press(world_x, world_y, candles, CANDLE_SPACING) {
+                        if self.drawing.handle_press(
+                            world_x,
+                            world_y,
+                            candles,
+                            CANDLE_SPACING,
+                            x_world_per_pixel,
+                            y_world_per_pixel,
+                        ) {
                             self.window.request_redraw();
                             // Keep Select mode if we selected something, otherwise restore
                             if self.drawing.selected.is_none() && !tool_active {
@@ -988,9 +1101,8 @@ impl AppState {
 
         // Update drawing cursor and handle dragging when tool is active, interacting, or when drawings exist
         let has_drawings = !self.drawing.drawings.is_empty();
-        let needs_drawing_update = self.drawing.tool != DrawingTool::None
-            || self.drawing.is_interacting()
-            || has_drawings;
+        let needs_drawing_update =
+            self.drawing.tool != DrawingTool::None || self.drawing.is_interacting() || has_drawings;
 
         if needs_drawing_update {
             let (world_x, world_y) = self.screen_to_world(pos.0, pos.1);
@@ -998,10 +1110,10 @@ impl AppState {
 
             // Calculate scale factors for hit detection
             let aspect = self.graphics.config.width as f32 / self.graphics.config.height as f32;
-            let x_world_per_pixel = (self.graphics.renderer.camera.scale[0] * aspect * 2.0)
+            let x_world_per_pixel = (self.graphics.renderer.main_camera.camera.scale[0] * aspect * 2.0)
                 / self.graphics.config.width as f32;
-            let y_world_per_pixel = (self.graphics.renderer.camera.scale[1] * 2.0)
-                / self.graphics.config.height as f32;
+            let y_world_per_pixel =
+                (self.graphics.renderer.main_camera.camera.scale[1] * 2.0) / self.graphics.config.height as f32;
 
             self.drawing.update_cursor_with_scale(
                 world_x,
@@ -1013,10 +1125,37 @@ impl AppState {
             );
 
             if self.input.mouse_pressed && self.drawing.is_interacting() {
-                if self.drawing.handle_drag(world_x, world_y, candles, CANDLE_SPACING) {
+                if self
+                    .drawing
+                    .handle_drag(world_x, world_y, candles, CANDLE_SPACING)
+                {
                     self.window.request_redraw();
                 }
             }
+        }
+
+        // Update cursor icon based on drawing interaction/hover state
+        {
+            use crate::drawing::DrawingInteraction;
+            use winit::window::CursorIcon;
+
+            let icon = if self.drawing.is_interacting() {
+                match &self.drawing.interaction {
+                    DrawingInteraction::DraggingAnchor { .. } => CursorIcon::Grabbing,
+                    DrawingInteraction::DraggingDrawing { .. } => CursorIcon::Move,
+                    DrawingInteraction::Drawing { .. } => CursorIcon::Crosshair,
+                    _ => CursorIcon::Default,
+                }
+            } else if self.drawing.hovered_anchor.is_some() {
+                CursorIcon::Grab
+            } else if self.drawing.hovered_drawing.is_some() {
+                CursorIcon::Move
+            } else if self.drawing.tool.is_drawing_tool() {
+                CursorIcon::Crosshair
+            } else {
+                CursorIcon::Default
+            };
+            self.window.set_cursor(icon);
         }
 
         if let Some(action) = self.input.handle_cursor_moved(pos) {
@@ -1028,14 +1167,13 @@ impl AppState {
 
                     let aspect =
                         self.graphics.config.width as f32 / self.graphics.config.height as f32;
-                    let world_dx = -dx
-                        * (self.graphics.renderer.camera.scale[0] * aspect * 2.0)
+                    let world_dx = -dx * (self.graphics.renderer.main_camera.camera.scale[0] * aspect * 2.0)
                         / self.graphics.config.width as f32;
-                    let world_dy = dy * (self.graphics.renderer.camera.scale[1] * 2.0)
+                    let world_dy = dy * (self.graphics.renderer.main_camera.camera.scale[1] * 2.0)
                         / self.graphics.config.height as f32;
 
-                    self.graphics.renderer.camera.position[0] += world_dx;
-                    self.graphics.renderer.camera.position[1] += world_dy;
+                    self.graphics.renderer.main_camera.camera.position[0] += world_dx;
+                    self.graphics.renderer.main_camera.camera.position[1] += world_dy;
 
                     self.graphics.renderer.update_camera(&self.graphics.queue);
                     self.update_visible_range();
@@ -1093,39 +1231,38 @@ impl AppState {
             [0.0, 0.0]
         };
 
-        let world_x = self.graphics.renderer.camera.position[0]
-            + cursor_ndc[0] * self.graphics.renderer.camera.scale[0] * aspect;
-        let world_y = self.graphics.renderer.camera.position[1]
-            + cursor_ndc[1] * self.graphics.renderer.camera.scale[1];
+        let world_x = self.graphics.renderer.main_camera.camera.position[0]
+            + cursor_ndc[0] * self.graphics.renderer.main_camera.camera.scale[0] * aspect;
+        let world_y = self.graphics.renderer.main_camera.camera.position[1]
+            + cursor_ndc[1] * self.graphics.renderer.main_camera.camera.scale[1];
 
         let data_width = (candles.len() as f32) * CANDLE_SPACING;
         let max_x_zoom = (data_width / 2.0 / aspect).max(10.0) * 1.2;
 
-        let (min_price, max_price) =
-            candles
-                .iter()
-                .fold((f32::MAX, f32::MIN), |(min, max), c| {
-                    (min.min(c.low), max.max(c.high))
-                });
+        let (min_price, max_price) = candles.iter().fold((f32::MAX, f32::MIN), |(min, max), c| {
+            (min.min(c.low), max.max(c.high))
+        });
         let price_range = (max_price - min_price).max(1.0);
         let max_y_zoom = (price_range / 2.0).max(10.0) * 1.5;
 
         if scroll_x.abs() > 0.001 {
             let zoom_factor = 1.0 - scroll_x * 0.1;
-            let old_scale = self.graphics.renderer.camera.scale[0];
-            self.graphics.renderer.camera.scale[0] = (old_scale * zoom_factor).clamp(5.0, max_x_zoom);
-            let new_world_x = self.graphics.renderer.camera.position[0]
-                + cursor_ndc[0] * self.graphics.renderer.camera.scale[0] * aspect;
-            self.graphics.renderer.camera.position[0] += world_x - new_world_x;
+            let old_scale = self.graphics.renderer.main_camera.camera.scale[0];
+            self.graphics.renderer.main_camera.camera.scale[0] =
+                (old_scale * zoom_factor).clamp(5.0, max_x_zoom);
+            let new_world_x = self.graphics.renderer.main_camera.camera.position[0]
+                + cursor_ndc[0] * self.graphics.renderer.main_camera.camera.scale[0] * aspect;
+            self.graphics.renderer.main_camera.camera.position[0] += world_x - new_world_x;
         }
 
         if scroll_y.abs() > 0.001 {
             let zoom_factor = 1.0 + scroll_y * 0.1;
-            let old_scale = self.graphics.renderer.camera.scale[1];
-            self.graphics.renderer.camera.scale[1] = (old_scale * zoom_factor).clamp(1.0, max_y_zoom);
-            let new_world_y = self.graphics.renderer.camera.position[1]
-                + cursor_ndc[1] * self.graphics.renderer.camera.scale[1];
-            self.graphics.renderer.camera.position[1] += world_y - new_world_y;
+            let old_scale = self.graphics.renderer.main_camera.camera.scale[1];
+            self.graphics.renderer.main_camera.camera.scale[1] =
+                (old_scale * zoom_factor).clamp(1.0, max_y_zoom);
+            let new_world_y = self.graphics.renderer.main_camera.camera.position[1]
+                + cursor_ndc[1] * self.graphics.renderer.main_camera.camera.scale[1];
+            self.graphics.renderer.main_camera.camera.position[1] += world_y - new_world_y;
         }
 
         self.graphics.renderer.update_camera(&self.graphics.queue);
@@ -1162,7 +1299,9 @@ impl AppState {
 
     fn toggle_replay_mode(&mut self) {
         let was_enabled = self.interaction.replay.enabled;
-        self.interaction.replay.toggle(self.document.current_timeframe);
+        self.interaction
+            .replay
+            .toggle(self.document.current_timeframe);
 
         if was_enabled && !self.interaction.replay.enabled {
             // Exiting replay mode - refresh TA buffers
@@ -1174,7 +1313,12 @@ impl AppState {
     }
 
     fn replay_step_forward(&mut self) {
-        let base_candles = self.document.timeframes.first().map(|tf| &tf.candles[..]).unwrap_or(&[]);
+        let base_candles = self
+            .document
+            .timeframes
+            .first()
+            .map(|tf| &tf.candles[..])
+            .unwrap_or(&[]);
         if self.interaction.replay.step_forward(base_candles) {
             self.recompute_replay_candles();
             self.recompute_replay_ta();
@@ -1183,7 +1327,12 @@ impl AppState {
     }
 
     fn replay_step_backward(&mut self) {
-        let base_candles = self.document.timeframes.first().map(|tf| &tf.candles[..]).unwrap_or(&[]);
+        let base_candles = self
+            .document
+            .timeframes
+            .first()
+            .map(|tf| &tf.candles[..])
+            .unwrap_or(&[]);
         if self.interaction.replay.step_backward(base_candles) {
             self.recompute_replay_candles();
             self.recompute_replay_ta();
@@ -1192,7 +1341,11 @@ impl AppState {
     }
 
     fn replay_increase_step_size(&mut self) {
-        if self.interaction.replay.increase_step_size(self.document.current_timeframe) {
+        if self
+            .interaction
+            .replay
+            .increase_step_size(self.document.current_timeframe)
+        {
             self.window.request_redraw();
         }
     }
@@ -1212,7 +1365,12 @@ impl AppState {
     }
 
     fn recompute_replay_candles(&mut self) {
-        let base_candles = self.document.timeframes.first().map(|tf| &tf.candles[..]).unwrap_or(&[]);
+        let base_candles = self
+            .document
+            .timeframes
+            .first()
+            .map(|tf| &tf.candles[..])
+            .unwrap_or(&[]);
         let current_timeframe_idx = self.document.current_timeframe;
         let device = &self.graphics.device;
         let renderer = &self.graphics.renderer;
@@ -1238,22 +1396,27 @@ impl AppState {
             }
         };
 
-        let current_tf_candles: Vec<Candle> = if let Some(ref replay_candles) = self.interaction.replay.candles {
-            replay_candles.clone()
-        } else if let Some(replay_idx) = self.interaction.replay.index {
-            let tf_candles = self.document.current_candles();
-            if tf_candles.is_empty() || replay_idx == 0 {
-                Vec::new()
+        let current_tf_candles: Vec<Candle> =
+            if let Some(ref replay_candles) = self.interaction.replay.candles {
+                replay_candles.clone()
+            } else if let Some(replay_idx) = self.interaction.replay.index {
+                let tf_candles = self.document.current_candles();
+                if tf_candles.is_empty() || replay_idx == 0 {
+                    Vec::new()
+                } else {
+                    tf_candles[..=replay_idx.min(tf_candles.len() - 1)].to_vec()
+                }
             } else {
-                tf_candles[..=replay_idx.min(tf_candles.len() - 1)].to_vec()
-            }
-        } else {
-            self.interaction.replay.ta_data = None;
-            return;
-        };
+                self.interaction.replay.ta_data = None;
+                return;
+            };
 
         if current_tf_candles.is_empty() {
-            self.interaction.replay.ta_data = Some(TimeframeTaData::with_data(Vec::new(), Vec::new(), Vec::new()));
+            self.interaction.replay.ta_data = Some(TimeframeTaData::with_data(
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+            ));
             self.update_ta_buffers();
             return;
         }
@@ -1264,26 +1427,42 @@ impl AppState {
         let ta_data = if let Some(ta) = self.document.ta_data.get(current_tf_idx) {
             if ta.computed {
                 // Filter ranges, levels, and trends to those visible at replay position
-                let ranges: Vec<_> = ta.ranges.iter().filter(|r| r.end_index <= replay_candle_idx).cloned().collect();
-                let levels: Vec<_> = ta.levels.iter().filter(|l| {
-                    if l.created_at_index > replay_candle_idx { return false; }
-                    if l.state == LevelState::Broken {
-                        if let Some(ref break_event) = l.break_event {
-                            return break_event.candle_index > replay_candle_idx;
+                let ranges: Vec<_> = ta
+                    .ranges
+                    .iter()
+                    .filter(|r| r.end_index <= replay_candle_idx)
+                    .cloned()
+                    .collect();
+                let levels: Vec<_> = ta
+                    .levels
+                    .iter()
+                    .filter(|l| {
+                        if l.created_at_index > replay_candle_idx {
+                            return false;
                         }
-                    }
-                    true
-                }).cloned().collect();
-                let trends: Vec<_> = ta.trends.iter().filter(|t| {
-                    t.created_at_index <= replay_candle_idx
-                }).cloned().collect();
+                        if l.state == LevelState::Broken {
+                            if let Some(ref break_event) = l.break_event {
+                                return break_event.candle_index > replay_candle_idx;
+                            }
+                        }
+                        true
+                    })
+                    .cloned()
+                    .collect();
+                let trends: Vec<_> = ta
+                    .trends
+                    .iter()
+                    .filter(|t| t.created_at_index <= replay_candle_idx)
+                    .cloned()
+                    .collect();
                 TimeframeTaData::with_data(ranges, levels, trends)
             } else {
                 // Run analysis on current candles
                 let current_price = current_tf_candles.last().map(|c| c.close).unwrap_or(0.0);
                 let config = self.create_analyzer_config();
                 let mut analyzer = DefaultAnalyzer::new(config);
-                let result = analyzer.update(current_tf_idx as u8, &current_tf_candles, current_price);
+                let result =
+                    analyzer.update(current_tf_idx as u8, &current_tf_candles, current_price);
                 TimeframeTaData::with_data(result.ranges, result.levels, result.trends)
             }
         } else {
@@ -1306,8 +1485,17 @@ impl AppState {
             }
             self.reaggregate_timeframes();
 
-            if let Some(candles) = self.document.timeframes.first().map(|tf| tf.candles.clone()) {
-                let new_tf_data = self.graphics.renderer.create_timeframe_data(&self.graphics.device, candles, "1m");
+            if let Some(candles) = self
+                .document
+                .timeframes
+                .first()
+                .map(|tf| tf.candles.clone())
+            {
+                let new_tf_data = self.graphics.renderer.create_timeframe_data(
+                    &self.graphics.device,
+                    candles,
+                    "1m",
+                );
                 if let Some(tf) = self.document.timeframes.first_mut() {
                     *tf = new_tf_data;
                 }
@@ -1328,8 +1516,17 @@ impl AppState {
                 candle.open
             };
 
-            if let Some(candles) = self.document.timeframes.first().map(|tf| tf.candles.clone()) {
-                let new_tf_data = self.graphics.renderer.create_timeframe_data(&self.graphics.device, candles, "1m");
+            if let Some(candles) = self
+                .document
+                .timeframes
+                .first()
+                .map(|tf| tf.candles.clone())
+            {
+                let new_tf_data = self.graphics.renderer.create_timeframe_data(
+                    &self.graphics.device,
+                    candles,
+                    "1m",
+                );
                 if let Some(tf) = self.document.timeframes.first_mut() {
                     *tf = new_tf_data;
                 }
@@ -1353,17 +1550,32 @@ impl AppState {
             return;
         }
         let aspect = chart_width / chart_height;
-        let (x_min, x_max) = self.graphics.renderer.camera.visible_x_range(aspect);
-        self.graphics.renderer.set_current_price(&self.graphics.queue, close_price, open_price, x_min, x_max);
+        let (x_min, x_max) = self.graphics.renderer.main_camera.camera.visible_x_range(aspect);
+        self.graphics.renderer.set_current_price(
+            &self.graphics.queue,
+            close_price,
+            open_price,
+            x_min,
+            x_max,
+        );
     }
 
     fn reaggregate_timeframes(&mut self) {
-        let base_candles = self.document.timeframes.first().map(|tf| tf.candles.clone()).unwrap_or_default();
+        let base_candles = self
+            .document
+            .timeframes
+            .first()
+            .map(|tf| tf.candles.clone())
+            .unwrap_or_default();
         let timeframe_types = Timeframe::all();
 
         for (i, tf) in timeframe_types.iter().enumerate().skip(1) {
             let candles = aggregate_candles(&base_candles, *tf);
-            let new_tf_data = self.graphics.renderer.create_timeframe_data(&self.graphics.device, candles, tf.label());
+            let new_tf_data = self.graphics.renderer.create_timeframe_data(
+                &self.graphics.device,
+                candles,
+                tf.label(),
+            );
             if let Some(tf_data) = self.document.timeframes.get_mut(i) {
                 *tf_data = new_tf_data;
             }
@@ -1378,11 +1590,17 @@ impl AppState {
 
         let symbol = symbol.to_uppercase();
         self.interaction.current_symbol = symbol.clone();
-        self.interaction.loading_state = LoadingState::FetchingMexcData { symbol: symbol.clone() };
+        self.interaction.loading_state = LoadingState::FetchingMexcData {
+            symbol: symbol.clone(),
+        };
 
         let timeframe_types = Timeframe::all();
         for (i, tf) in timeframe_types.iter().enumerate() {
-            let empty_tf = self.graphics.renderer.create_timeframe_data(&self.graphics.device, Vec::new(), tf.label());
+            let empty_tf = self.graphics.renderer.create_timeframe_data(
+                &self.graphics.device,
+                Vec::new(),
+                tf.label(),
+            );
             if let Some(tf_data) = self.document.timeframes.get_mut(i) {
                 *tf_data = empty_tf;
             }
@@ -1418,7 +1636,10 @@ impl AppState {
                             let _ = sender.send(BackgroundMessage::DataLoaded(base_candles));
                         }
                         Err(e) => {
-                            let _ = sender.send(BackgroundMessage::Error(format!("Failed to load {}: {}", sym, e)));
+                            let _ = sender.send(BackgroundMessage::Error(format!(
+                                "Failed to load {}: {}",
+                                sym, e
+                            )));
                         }
                     }
                 }
@@ -1443,7 +1664,10 @@ impl AppState {
                         while let Some(event) = rx.recv().await {
                             match event {
                                 LiveDataEvent::CandleUpdate { candle, is_closed } => {
-                                    let _ = sender.send(BackgroundMessage::LiveCandleUpdate { candle, is_closed });
+                                    let _ = sender.send(BackgroundMessage::LiveCandleUpdate {
+                                        candle,
+                                        is_closed,
+                                    });
                                 }
                                 LiveDataEvent::Connected => {
                                     let _ = sender.send(BackgroundMessage::ConnectionStatus(true));
@@ -1503,13 +1727,18 @@ impl AppState {
 
                 match handle.await {
                     Ok(Ok(total)) => {
-                        let _ = sender.send(BackgroundMessage::SyncComplete { total_candles: total });
+                        let _ = sender.send(BackgroundMessage::SyncComplete {
+                            total_candles: total,
+                        });
                     }
                     Ok(Err(e)) => {
                         let _ = sender.send(BackgroundMessage::SyncError(e.to_string()));
                     }
                     Err(e) => {
-                        let _ = sender.send(BackgroundMessage::SyncError(format!("Task panicked: {}", e)));
+                        let _ = sender.send(BackgroundMessage::SyncError(format!(
+                            "Task panicked: {}",
+                            e
+                        )));
                     }
                 }
             });
@@ -1527,7 +1756,11 @@ impl AppState {
             .iter()
             .map(|tf| {
                 let ta_config = self.app_config.ta_analysis_for_timeframe(tf.label());
-                let mut tf_config = TimeframeConfig::new(*tf, ta_config.min_range_candles, ta_config.doji_threshold);
+                let mut tf_config = TimeframeConfig::new(
+                    *tf,
+                    ta_config.min_range_candles,
+                    ta_config.doji_threshold,
+                );
                 if !ta_config.create_greedy_levels {
                     tf_config = tf_config.without_greedy_levels();
                 }
@@ -1538,16 +1771,24 @@ impl AppState {
     }
 
     fn compute_ta_background(&self, timeframe: usize) {
-        let candles = self.document.timeframes.get(timeframe).map(|tf| tf.candles.clone()).unwrap_or_default();
+        let candles = self
+            .document
+            .timeframes
+            .get(timeframe)
+            .map(|tf| tf.candles.clone())
+            .unwrap_or_default();
         let sender = self.bg_sender.clone();
         let tf = Timeframe::all()[timeframe];
         let ta_config = self.app_config.ta_analysis_for_timeframe(tf.label());
 
         thread::spawn(move || {
-            let _ = sender.send(BackgroundMessage::LoadingStateChanged(LoadingState::ComputingTa { timeframe }));
+            let _ = sender.send(BackgroundMessage::LoadingStateChanged(
+                LoadingState::ComputingTa { timeframe },
+            ));
 
             // Create config for this single timeframe
-            let mut tf_config = TimeframeConfig::new(tf, ta_config.min_range_candles, ta_config.doji_threshold);
+            let mut tf_config =
+                TimeframeConfig::new(tf, ta_config.min_range_candles, ta_config.doji_threshold);
             if !ta_config.create_greedy_levels {
                 tf_config = tf_config.without_greedy_levels();
             }
@@ -1600,38 +1841,61 @@ impl AppState {
         // Clone to avoid borrow issues since we need to borrow self mutably later for queue writes
         let ta: TimeframeTaData = if self.interaction.replay.is_locked() {
             self.interaction.replay.ta_data.clone().unwrap_or_else(|| {
-                self.document.ta_data.get(tf_idx).cloned().unwrap_or_default()
+                self.document
+                    .ta_data
+                    .get(tf_idx)
+                    .cloned()
+                    .unwrap_or_default()
             })
         } else {
-            self.document.ta_data.get(tf_idx).cloned().unwrap_or_default()
+            self.document
+                .ta_data
+                .get(tf_idx)
+                .cloned()
+                .unwrap_or_default()
         };
 
         // Convert ranges to GPU format
-        let mut range_gpus: Vec<RangeGpu> = ta.ranges.iter()
+        let mut range_gpus: Vec<RangeGpu> = ta
+            .ranges
+            .iter()
             .filter(|_| self.document.ta_settings.show_ranges)
             .take(MAX_TA_RANGES)
             .map(|r| RangeGpu {
                 x_start: r.start_index as f32 * CANDLE_SPACING,
                 x_end: r.end_index as f32 * CANDLE_SPACING,
                 y_pos: r.low,
-                is_bullish: if r.direction == CandleDirection::Bullish { 1 } else { 0 },
+                is_bullish: if r.direction == CandleDirection::Bullish {
+                    1
+                } else {
+                    0
+                },
             })
             .collect();
 
         let range_count = range_gpus.len() as u32;
         while range_gpus.len() < MAX_TA_RANGES {
-            range_gpus.push(RangeGpu { x_start: 0.0, x_end: 0.0, y_pos: 0.0, is_bullish: 0 });
+            range_gpus.push(RangeGpu {
+                x_start: 0.0,
+                x_end: 0.0,
+                y_pos: 0.0,
+                is_bullish: 0,
+            });
         }
 
         // Filter and convert levels
-        let filtered_levels: Vec<&Level> = ta.levels.iter()
+        let filtered_levels: Vec<&Level> = ta
+            .levels
+            .iter()
             .filter(|l| {
                 let type_ok = match l.level_type {
                     LevelType::Hold => self.document.ta_settings.show_hold_levels,
                     LevelType::GreedyHold => self.document.ta_settings.show_greedy_levels,
                 };
                 let state_ok = match l.state {
-                    LevelState::Inactive | LevelState::Active => self.document.ta_settings.show_active_levels,
+                    LevelState::Inactive | LevelState::Active => {
+                        self.document.ta_settings.show_active_levels
+                    }
                     LevelState::Broken => self.document.ta_settings.show_broken_levels,
                 };
                 type_ok && state_ok
@@ -1640,7 +1904,8 @@ impl AppState {
             .collect();
 
         let level_count = filtered_levels.len() as u32;
-        let mut level_gpus: Vec<LevelGpu> = filtered_levels.iter()
+        let mut level_gpus: Vec<LevelGpu> = filtered_levels
+            .iter()
             .map(|l| {
                 // Use source_direction (the direction of the range that created the level)
                 let (r, g, b, a) = match (l.source_direction, l.state) {
@@ -1655,24 +1920,44 @@ impl AppState {
                 LevelGpu {
                     y_value: l.price,
                     x_start: l.source_candle_index as f32 * CANDLE_SPACING,
-                    r, g, b, a,
-                    level_type: if l.level_type == LevelType::Hold { 0 } else { 1 },
+                    r,
+                    g,
+                    b,
+                    a,
+                    level_type: if l.level_type == LevelType::Hold {
+                        0
+                    } else {
+                        1
+                    },
                     hit_count: l.hits.len() as u32,
                 }
             })
             .collect();
 
         while level_gpus.len() < MAX_TA_LEVELS {
-            level_gpus.push(LevelGpu { y_value: 0.0, x_start: 0.0, r: 0.0, g: 0.0, b: 0.0, a: 0.0, level_type: 0, hit_count: 0 });
+            level_gpus.push(LevelGpu {
+                y_value: 0.0,
+                x_start: 0.0,
+                r: 0.0,
+                g: 0.0,
+                b: 0.0,
+                a: 0.0,
+                level_type: 0,
+                hit_count: 0,
+            });
         }
 
         // Convert trends to GPU format
-        use charter_ta::{TrendState, CandleDirection as TaDirection};
-        let filtered_trends: Vec<_> = ta.trends.iter()
+        use charter_ta::{CandleDirection as TaDirection, TrendState};
+        let filtered_trends: Vec<_> = ta
+            .trends
+            .iter()
             .filter(|t| {
                 // Filter by state - show active and hit trends, optionally show broken
                 match t.state {
-                    TrendState::Active | TrendState::Hit => self.document.ta_settings.show_active_levels,
+                    TrendState::Active | TrendState::Hit => {
+                        self.document.ta_settings.show_active_levels
+                    }
                     TrendState::Broken => self.document.ta_settings.show_broken_levels,
                 }
             })
@@ -1680,7 +1965,8 @@ impl AppState {
             .collect();
 
         let trend_count = filtered_trends.len() as u32;
-        let mut trend_gpus: Vec<TrendGpu> = filtered_trends.iter()
+        let mut trend_gpus: Vec<TrendGpu> = filtered_trends
+            .iter()
             .map(|t| {
                 // Color based on direction and state
                 let (r, g, b, a) = match (t.direction, t.state) {
@@ -1697,13 +1983,25 @@ impl AppState {
                     y_start: t.start.price,
                     x_end: t.end.candle_index as f32 * CANDLE_SPACING,
                     y_end: t.end.price,
-                    r, g, b, a,
+                    r,
+                    g,
+                    b,
+                    a,
                 }
             })
             .collect();
 
         while trend_gpus.len() < MAX_TA_TRENDS {
-            trend_gpus.push(TrendGpu { x_start: 0.0, y_start: 0.0, x_end: 0.0, y_end: 0.0, r: 0.0, g: 0.0, b: 0.0, a: 0.0 });
+            trend_gpus.push(TrendGpu {
+                x_start: 0.0,
+                y_start: 0.0,
+                x_end: 0.0,
+                y_end: 0.0,
+                r: 0.0,
+                g: 0.0,
+                b: 0.0,
+                a: 0.0,
+            });
         }
 
         // Compute params
@@ -1713,8 +2011,8 @@ impl AppState {
             return;
         }
         let aspect = chart_width / chart_height;
-        let (y_min, y_max) = self.graphics.renderer.camera.visible_y_range(aspect);
-        let (_, visible_x_max) = self.graphics.renderer.camera.visible_x_range(aspect);
+        let (y_min, y_max) = self.graphics.renderer.main_camera.camera.visible_y_range(aspect);
+        let (_, visible_x_max) = self.graphics.renderer.main_camera.camera.visible_x_range(aspect);
         let candle_x_max = (tf.candles.len() as f32) * CANDLE_SPACING;
         let x_max = visible_x_max.max(candle_x_max);
         let price_range = y_max - y_min;
@@ -1734,10 +2032,20 @@ impl AppState {
         };
 
         // Write to GPU buffers
-        self.graphics.queue.write_buffer(&tf.ta_range_buffer, 0, bytemuck::cast_slice(&range_gpus));
-        self.graphics.queue.write_buffer(&tf.ta_level_buffer, 0, bytemuck::cast_slice(&level_gpus));
-        self.graphics.queue.write_buffer(&tf.ta_trend_buffer, 0, bytemuck::cast_slice(&trend_gpus));
-        self.graphics.queue.write_buffer(&tf.ta_params_buffer, 0, bytemuck::cast_slice(&[ta_params]));
+        self.graphics
+            .queue
+            .write_buffer(&tf.ta_range_buffer, 0, bytemuck::cast_slice(&range_gpus));
+        self.graphics
+            .queue
+            .write_buffer(&tf.ta_level_buffer, 0, bytemuck::cast_slice(&level_gpus));
+        self.graphics
+            .queue
+            .write_buffer(&tf.ta_trend_buffer, 0, bytemuck::cast_slice(&trend_gpus));
+        self.graphics.queue.write_buffer(
+            &tf.ta_params_buffer,
+            0,
+            bytemuck::cast_slice(&[ta_params]),
+        );
     }
 
     // =========================================================================
@@ -1752,7 +2060,7 @@ impl AppState {
             return;
         }
         let aspect = chart_width / chart_height;
-        let (y_min, y_max) = self.graphics.renderer.camera.visible_y_range(aspect);
+        let (y_min, y_max) = self.graphics.renderer.main_camera.camera.visible_y_range(aspect);
         let price_range = y_max - y_min;
         let world_units_per_pixel = price_range / chart_height;
         let line_thickness = (world_units_per_pixel * 1.5).max(0.001);
@@ -1780,7 +2088,11 @@ impl AppState {
                 line_thickness,
                 count: buffers.macd_point_count,
             };
-            self.graphics.queue.write_buffer(&buffers.params_buffer, 0, bytemuck::cast_slice(&[macd_params]));
+            self.graphics.queue.write_buffer(
+                &buffers.params_buffer,
+                0,
+                bytemuck::cast_slice(&[macd_params]),
+            );
 
             let signal_params = IndicatorParams {
                 first_visible: signal_first_visible,
@@ -1788,7 +2100,11 @@ impl AppState {
                 line_thickness,
                 count: buffers.signal_point_count,
             };
-            self.graphics.queue.write_buffer(&buffers.signal_params_buffer, 0, bytemuck::cast_slice(&[signal_params]));
+            self.graphics.queue.write_buffer(
+                &buffers.signal_params_buffer,
+                0,
+                bytemuck::cast_slice(&[signal_params]),
+            );
         }
     }
 
@@ -1798,7 +2114,10 @@ impl AppState {
         let dyn_macd = DynMacd::new(config);
         let label = dyn_macd.label();
 
-        let id = self.document.indicators.add(dyn_macd, label, num_timeframes);
+        let id = self
+            .document
+            .indicators
+            .add(dyn_macd, label, num_timeframes);
 
         let candles = self.document.current_candles().to_vec();
         let tf = self.document.current_timeframe;
@@ -1815,7 +2134,11 @@ impl AppState {
         self.document.indicators.remove(index);
     }
 
-    fn compute_macd_for_instance_internal(instance: &mut crate::indicators::IndicatorInstance, candles: &[Candle], timeframe: usize) {
+    fn compute_macd_for_instance_internal(
+        instance: &mut crate::indicators::IndicatorInstance,
+        candles: &[Candle],
+        timeframe: usize,
+    ) {
         if candles.is_empty() {
             instance.outputs[timeframe] = None;
             instance.macd_outputs[timeframe] = None;
@@ -1864,15 +2187,47 @@ impl AppState {
         let tf = self.document.current_timeframe;
         let conversion = self.convert_macd_to_gpu_points_from_instance(instance, tf);
 
-        let macd_line_buffer = self.graphics.renderer.indicator_pipeline.create_indicator_buffer(&self.graphics.device, &conversion.macd_points);
-        let signal_line_buffer = self.graphics.renderer.indicator_pipeline.create_indicator_buffer(&self.graphics.device, &conversion.signal_points);
-        let histogram_buffer = self.graphics.renderer.indicator_pipeline.create_indicator_buffer(&self.graphics.device, &conversion.histogram_points);
-        let params_buffer = self.graphics.renderer.indicator_pipeline.create_indicator_params_buffer(&self.graphics.device);
-        let signal_params_buffer = self.graphics.renderer.indicator_pipeline.create_indicator_params_buffer(&self.graphics.device);
+        let macd_line_buffer = self
+            .graphics
+            .renderer
+            .indicator_pipeline
+            .create_indicator_buffer(&self.graphics.device, &conversion.macd_points);
+        let signal_line_buffer = self
+            .graphics
+            .renderer
+            .indicator_pipeline
+            .create_indicator_buffer(&self.graphics.device, &conversion.signal_points);
+        let histogram_buffer = self
+            .graphics
+            .renderer
+            .indicator_pipeline
+            .create_indicator_buffer(&self.graphics.device, &conversion.histogram_points);
+        let params_buffer = self
+            .graphics
+            .renderer
+            .indicator_pipeline
+            .create_indicator_params_buffer(&self.graphics.device);
+        let signal_params_buffer = self
+            .graphics
+            .renderer
+            .indicator_pipeline
+            .create_indicator_params_buffer(&self.graphics.device);
 
-        let macd_bind_group = self.graphics.renderer.indicator_pipeline.create_bind_group(&self.graphics.device, &macd_line_buffer, &params_buffer);
-        let signal_bind_group = self.graphics.renderer.indicator_pipeline.create_bind_group(&self.graphics.device, &signal_line_buffer, &signal_params_buffer);
-        let histogram_bind_group = self.graphics.renderer.indicator_pipeline.create_bind_group(&self.graphics.device, &histogram_buffer, &params_buffer);
+        let macd_bind_group = self.graphics.renderer.indicator_pipeline.create_bind_group(
+            &self.graphics.device,
+            &macd_line_buffer,
+            &params_buffer,
+        );
+        let signal_bind_group = self.graphics.renderer.indicator_pipeline.create_bind_group(
+            &self.graphics.device,
+            &signal_line_buffer,
+            &signal_params_buffer,
+        );
+        let histogram_bind_group = self.graphics.renderer.indicator_pipeline.create_bind_group(
+            &self.graphics.device,
+            &histogram_buffer,
+            &params_buffer,
+        );
 
         let buffers = MacdGpuBuffers {
             macd_line_buffer,
@@ -1895,7 +2250,11 @@ impl AppState {
         }
     }
 
-    fn convert_macd_to_gpu_points_from_instance(&self, instance: &crate::indicators::IndicatorInstance, timeframe: usize) -> MacdConversionResult {
+    fn convert_macd_to_gpu_points_from_instance(
+        &self,
+        instance: &crate::indicators::IndicatorInstance,
+        timeframe: usize,
+    ) -> MacdConversionResult {
         let output = match &instance.macd_outputs[timeframe] {
             Some(o) => o,
             None => return MacdConversionResult::empty(),
@@ -1909,7 +2268,9 @@ impl AppState {
         let macd_start_index = output.macd_line.start_index();
         let signal_start_index = output.signal_line.start_index();
 
-        let mut macd_points: Vec<IndicatorPointGpu> = output.macd_line.iter()
+        let mut macd_points: Vec<IndicatorPointGpu> = output
+            .macd_line
+            .iter()
             .map(|(idx, &val)| IndicatorPointGpu {
                 x: idx as f32 * CANDLE_SPACING,
                 y: val,
@@ -1920,7 +2281,9 @@ impl AppState {
             })
             .collect();
 
-        let mut signal_points: Vec<IndicatorPointGpu> = output.signal_line.iter()
+        let mut signal_points: Vec<IndicatorPointGpu> = output
+            .signal_line
+            .iter()
             .map(|(idx, &val)| IndicatorPointGpu {
                 x: idx as f32 * CANDLE_SPACING,
                 y: val,
@@ -1931,9 +2294,15 @@ impl AppState {
             })
             .collect();
 
-        let mut histogram_points: Vec<IndicatorPointGpu> = output.histogram.iter()
+        let mut histogram_points: Vec<IndicatorPointGpu> = output
+            .histogram
+            .iter()
             .map(|(idx, &val)| {
-                let color = if val >= 0.0 { config.histogram_pos_color } else { config.histogram_neg_color };
+                let color = if val >= 0.0 {
+                    config.histogram_pos_color
+                } else {
+                    config.histogram_neg_color
+                };
                 IndicatorPointGpu {
                     x: idx as f32 * CANDLE_SPACING,
                     y: val,
@@ -1946,16 +2315,43 @@ impl AppState {
             .collect();
 
         if macd_points.is_empty() {
-            macd_points.push(IndicatorPointGpu { x: 0.0, y: 0.0, r: 0.0, g: 0.0, b: 0.0, _padding: 0.0 });
+            macd_points.push(IndicatorPointGpu {
+                x: 0.0,
+                y: 0.0,
+                r: 0.0,
+                g: 0.0,
+                b: 0.0,
+                _padding: 0.0,
+            });
         }
         if signal_points.is_empty() {
-            signal_points.push(IndicatorPointGpu { x: 0.0, y: 0.0, r: 0.0, g: 0.0, b: 0.0, _padding: 0.0 });
+            signal_points.push(IndicatorPointGpu {
+                x: 0.0,
+                y: 0.0,
+                r: 0.0,
+                g: 0.0,
+                b: 0.0,
+                _padding: 0.0,
+            });
         }
         if histogram_points.is_empty() {
-            histogram_points.push(IndicatorPointGpu { x: 0.0, y: 0.0, r: 0.0, g: 0.0, b: 0.0, _padding: 0.0 });
+            histogram_points.push(IndicatorPointGpu {
+                x: 0.0,
+                y: 0.0,
+                r: 0.0,
+                g: 0.0,
+                b: 0.0,
+                _padding: 0.0,
+            });
         }
 
-        MacdConversionResult { macd_points, signal_points, histogram_points, macd_start_index, signal_start_index }
+        MacdConversionResult {
+            macd_points,
+            signal_points,
+            histogram_points,
+            macd_start_index,
+            signal_start_index,
+        }
     }
 
     fn update_macd_gpu_buffers(&mut self) {
@@ -1968,7 +2364,7 @@ impl AppState {
             return;
         }
         let aspect = chart_width / chart_height;
-        let (y_min, y_max) = self.graphics.renderer.camera.visible_y_range(aspect);
+        let (y_min, y_max) = self.graphics.renderer.main_camera.camera.visible_y_range(aspect);
         let price_range = y_max - y_min;
         let world_units_per_pixel = price_range / chart_height;
         let line_thickness = (world_units_per_pixel * 1.5).max(0.001);
@@ -1992,12 +2388,32 @@ impl AppState {
                 _ => continue,
             };
 
-            self.graphics.queue.write_buffer(&buffers.macd_line_buffer, 0, bytemuck::cast_slice(&conversion.macd_points));
-            self.graphics.queue.write_buffer(&buffers.signal_line_buffer, 0, bytemuck::cast_slice(&conversion.signal_points));
-            self.graphics.queue.write_buffer(&buffers.histogram_buffer, 0, bytemuck::cast_slice(&conversion.histogram_points));
+            self.graphics.queue.write_buffer(
+                &buffers.macd_line_buffer,
+                0,
+                bytemuck::cast_slice(&conversion.macd_points),
+            );
+            self.graphics.queue.write_buffer(
+                &buffers.signal_line_buffer,
+                0,
+                bytemuck::cast_slice(&conversion.signal_points),
+            );
+            self.graphics.queue.write_buffer(
+                &buffers.histogram_buffer,
+                0,
+                bytemuck::cast_slice(&conversion.histogram_points),
+            );
 
-            let macd_first_visible = if visible_start > conversion.macd_start_index { (visible_start - conversion.macd_start_index) as u32 } else { 0 };
-            let signal_first_visible = if visible_start > conversion.signal_start_index { (visible_start - conversion.signal_start_index) as u32 } else { 0 };
+            let macd_first_visible = if visible_start > conversion.macd_start_index {
+                (visible_start - conversion.macd_start_index) as u32
+            } else {
+                0
+            };
+            let signal_first_visible = if visible_start > conversion.signal_start_index {
+                (visible_start - conversion.signal_start_index) as u32
+            } else {
+                0
+            };
 
             let macd_params = IndicatorParams {
                 first_visible: macd_first_visible,
@@ -2005,7 +2421,11 @@ impl AppState {
                 line_thickness,
                 count: conversion.macd_points.len() as u32,
             };
-            self.graphics.queue.write_buffer(&buffers.params_buffer, 0, bytemuck::cast_slice(&[macd_params]));
+            self.graphics.queue.write_buffer(
+                &buffers.params_buffer,
+                0,
+                bytemuck::cast_slice(&[macd_params]),
+            );
 
             let signal_params = IndicatorParams {
                 first_visible: signal_first_visible,
@@ -2013,7 +2433,11 @@ impl AppState {
                 line_thickness,
                 count: conversion.signal_points.len() as u32,
             };
-            self.graphics.queue.write_buffer(&buffers.signal_params_buffer, 0, bytemuck::cast_slice(&[signal_params]));
+            self.graphics.queue.write_buffer(
+                &buffers.signal_params_buffer,
+                0,
+                bytemuck::cast_slice(&[signal_params]),
+            );
 
             if let Some(instance) = self.document.indicators.get_mut(i)
                 && let Some(IndicatorGpuBuffers::Macd(buffers)) = &mut instance.gpu_buffers
@@ -2083,7 +2507,11 @@ impl AppState {
     // =========================================================================
 
     fn get_cursor_candle_index(&self) -> usize {
-        let tf = match self.document.timeframes.get(self.document.current_timeframe) {
+        let tf = match self
+            .document
+            .timeframes
+            .get(self.document.current_timeframe)
+        {
             Some(tf) => tf,
             None => return 0,
         };
@@ -2095,9 +2523,10 @@ impl AppState {
                     return tf.candles.len().saturating_sub(1);
                 }
                 let aspect = chart_width / chart_height;
-                let (x_min, _) = self.graphics.renderer.camera.visible_x_range(aspect);
+                let (x_min, _) = self.graphics.renderer.main_camera.camera.visible_x_range(aspect);
                 let normalized_x = pos[0] / chart_width;
-                let world_x = x_min + normalized_x * (self.graphics.renderer.camera.scale[0] * aspect * 2.0);
+                let world_x =
+                    x_min + normalized_x * (self.graphics.renderer.main_camera.camera.scale[0] * aspect * 2.0);
                 let idx = (world_x / CANDLE_SPACING).round() as usize;
                 return idx.min(tf.candles.len().saturating_sub(1));
             }
@@ -2119,13 +2548,14 @@ impl AppState {
         }
 
         let aspect = chart_width / chart_height;
-        let (x_min, _) = self.graphics.renderer.camera.visible_x_range(aspect);
-        let (y_min, y_max) = self.graphics.renderer.camera.visible_y_range(aspect);
+        let (x_min, _) = self.graphics.renderer.main_camera.camera.visible_x_range(aspect);
+        let (y_min, y_max) = self.graphics.renderer.main_camera.camera.visible_y_range(aspect);
 
         let normalized_x = pos[0] / chart_width;
         let normalized_y = pos[1] / chart_height;
 
-        let world_x = x_min + normalized_x * (self.graphics.renderer.camera.scale[0] * aspect * 2.0);
+        let world_x =
+            x_min + normalized_x * (self.graphics.renderer.main_camera.camera.scale[0] * aspect * 2.0);
         let world_y = y_max - normalized_y * (y_max - y_min);
 
         Some((world_x, world_y))
@@ -2151,7 +2581,7 @@ impl AppState {
             return None;
         }
         let aspect = chart_width / chart_height;
-        let (y_min, y_max) = self.graphics.renderer.camera.visible_y_range(aspect);
+        let (y_min, y_max) = self.graphics.renderer.main_camera.camera.visible_y_range(aspect);
         let price_range = y_max - y_min;
         let tolerance = price_range * 0.01;
 
@@ -2189,7 +2619,7 @@ impl AppState {
             return None;
         }
         let aspect = chart_width / chart_height;
-        let (y_min, y_max) = self.graphics.renderer.camera.visible_y_range(aspect);
+        let (y_min, y_max) = self.graphics.renderer.main_camera.camera.visible_y_range(aspect);
         let price_range = y_max - y_min;
         let tolerance = price_range * 0.005;
 
@@ -2199,7 +2629,9 @@ impl AppState {
                 LevelType::GreedyHold => self.document.ta_settings.show_greedy_levels,
             };
             let state_visible = match level.state {
-                LevelState::Inactive | LevelState::Active => self.document.ta_settings.show_active_levels,
+                LevelState::Inactive | LevelState::Active => {
+                    self.document.ta_settings.show_active_levels
+                }
                 LevelState::Broken => self.document.ta_settings.show_broken_levels,
             };
 
@@ -2242,17 +2674,25 @@ impl AppState {
         }
 
         let output = self.graphics.surface.get_current_texture()?;
-        let view = output.texture.create_view(&wgpu::TextureViewDescriptor::default());
+        let view = output
+            .texture
+            .create_view(&wgpu::TextureViewDescriptor::default());
 
         let total_width = self.graphics.config.width as f32;
         let total_height = self.graphics.config.height as f32;
         let chart_width = (total_width - STATS_PANEL_WIDTH).floor().max(1.0);
-        let chart_height = (total_height * (1.0 - VOLUME_HEIGHT_RATIO)).floor().max(1.0);
+        let chart_height = (total_height * (1.0 - VOLUME_HEIGHT_RATIO))
+            .floor()
+            .max(1.0);
         let volume_height = (total_height - chart_height).max(1.0);
 
         // Get data needed for egui
         let cursor_candle_idx = self.get_cursor_candle_index();
-        let candle = self.document.current_candles().get(cursor_candle_idx).copied();
+        let candle = self
+            .document
+            .current_candles()
+            .get(cursor_candle_idx)
+            .copied();
         let candle_count = self.document.current_candles().len();
 
         // Build hovered info for TA panel
@@ -2266,12 +2706,29 @@ impl AppState {
         let ta_hovered = TaHoveredInfo {
             range: self.document.hovered_range.and_then(|idx| {
                 ta_for_hover.and_then(|ta| {
-                    ta.ranges.get(idx).map(|r| (r.direction, r.candle_count, r.high, r.low, r.start_index, r.end_index))
+                    ta.ranges.get(idx).map(|r| {
+                        (
+                            r.direction,
+                            r.candle_count,
+                            r.high,
+                            r.low,
+                            r.start_index,
+                            r.end_index,
+                        )
+                    })
                 })
             }),
             level: self.document.hovered_level.and_then(|idx| {
                 ta_for_hover.and_then(|ta| {
-                    ta.levels.get(idx).map(|l| (l.price, l.level_type, l.source_direction, l.state, l.hits.len()))
+                    ta.levels.get(idx).map(|l| {
+                        (
+                            l.price,
+                            l.level_type,
+                            l.source_direction,
+                            l.state,
+                            l.hits.len(),
+                        )
+                    })
                 })
             }),
         };
@@ -2291,10 +2748,18 @@ impl AppState {
 
         let ta_data = if self.interaction.replay.is_locked() {
             self.interaction.replay.ta_data.clone().unwrap_or_else(|| {
-                self.document.ta_data.get(self.document.current_timeframe).cloned().unwrap_or_default()
+                self.document
+                    .ta_data
+                    .get(self.document.current_timeframe)
+                    .cloned()
+                    .unwrap_or_default()
             })
         } else {
-            self.document.ta_data.get(self.document.current_timeframe).cloned().unwrap_or_default()
+            self.document
+                .ta_data
+                .get(self.document.current_timeframe)
+                .cloned()
+                .unwrap_or_default()
         };
 
         let indicators = &self.document.indicators;
@@ -2309,7 +2774,7 @@ impl AppState {
 
         let guideline_values = self.graphics.renderer.guideline_values.clone();
         let aspect = chart_width / chart_height;
-        let (y_min, y_max) = self.graphics.renderer.camera.visible_y_range(aspect);
+        let (y_min, y_max) = self.graphics.renderer.main_camera.camera.visible_y_range(aspect);
 
         // Build egui UI
         let raw_input = self.ui.egui_state.take_egui_input(&self.window);
@@ -2363,11 +2828,18 @@ impl AppState {
             }
 
             // Drawing toolbar
-            *drawing_toolbar_response.borrow_mut() = show_drawing_toolbar(ctx, drawing_tool, drawing_snap_enabled);
+            *drawing_toolbar_response.borrow_mut() =
+                show_drawing_toolbar(ctx, drawing_tool, drawing_snap_enabled);
 
             // TA control panel
             {
-                let ta_response = show_ta_panel(ctx, &ta_settings.borrow(), Some(&ta_data), &ta_hovered, screen_width);
+                let ta_response = show_ta_panel(
+                    ctx,
+                    &ta_settings.borrow(),
+                    Some(&ta_data),
+                    &ta_hovered,
+                    screen_width,
+                );
                 if ta_response.settings_changed
                     && let Some(new_settings) = ta_response.new_settings
                 {
@@ -2385,13 +2857,18 @@ impl AppState {
 
             // Symbol picker overlay
             if should_show_symbol_picker {
-                let response = crate::ui::show_symbol_picker(ctx, &mut symbol_picker_state.borrow_mut(), &current_symbol);
-                *symbol_picker_response.borrow_mut() = Some((response.closed, response.selected_symbol));
+                let response = crate::ui::show_symbol_picker(
+                    ctx,
+                    &mut symbol_picker_state.borrow_mut(),
+                    &current_symbol,
+                );
+                *symbol_picker_response.borrow_mut() =
+                    Some((response.closed, response.selected_symbol));
             }
 
             // Replay mode overlay and cursor line
             if self.interaction.replay.enabled {
-                let (x_min, _x_max) = self.graphics.renderer.camera.visible_x_range(aspect);
+                let (x_min, _x_max) = self.graphics.renderer.main_camera.camera.visible_x_range(aspect);
 
                 let cursor_x = if let Some(replay_ts) = self.interaction.replay.timestamp {
                     let tf_candles = self.document.current_candles();
@@ -2402,8 +2879,10 @@ impl AppState {
                             .min(tf_candles.len() - 1);
 
                         let candle_start_ts = tf_candles[idx].timestamp;
-                        let candle_duration = Timeframe::all()[self.document.current_timeframe].seconds() as f32;
-                        let fraction = ((replay_ts - candle_start_ts) as f32 / candle_duration).clamp(0.0, 1.0);
+                        let candle_duration =
+                            Timeframe::all()[self.document.current_timeframe].seconds() as f32;
+                        let fraction = ((replay_ts - candle_start_ts) as f32 / candle_duration)
+                            .clamp(0.0, 1.0);
 
                         (idx as f32 + fraction) * CANDLE_SPACING
                     } else {
@@ -2411,12 +2890,14 @@ impl AppState {
                     }
                 } else if let Some(pos) = self.input.last_mouse_pos {
                     let normalized_x = pos[0] / chart_width;
-                    x_min + normalized_x * (self.graphics.renderer.camera.scale[0] * aspect * 2.0)
+                    x_min + normalized_x * (self.graphics.renderer.main_camera.camera.scale[0] * aspect * 2.0)
                 } else {
                     x_min
                 };
 
-                let screen_x = ((cursor_x - x_min) / (self.graphics.renderer.camera.scale[0] * aspect * 2.0)) * chart_width;
+                let screen_x = ((cursor_x - x_min)
+                    / (self.graphics.renderer.main_camera.camera.scale[0] * aspect * 2.0))
+                    * chart_width;
 
                 if screen_x >= 0.0 && screen_x <= chart_width {
                     egui::Area::new(egui::Id::new("replay_cursor"))
@@ -2427,7 +2908,10 @@ impl AppState {
                             let (color, width) = if self.interaction.replay.index.is_some() {
                                 (egui::Color32::from_rgba_unmultiplied(255, 200, 0, 100), 1.0)
                             } else {
-                                (egui::Color32::from_rgba_unmultiplied(255, 255, 255, 150), 1.5)
+                                (
+                                    egui::Color32::from_rgba_unmultiplied(255, 255, 255, 150),
+                                    1.5,
+                                )
                             };
                             painter.line_segment(
                                 [
@@ -2440,7 +2924,12 @@ impl AppState {
                 }
 
                 let base_candle_info = if let Some(ts) = self.interaction.replay.timestamp {
-                    let base_candles = self.document.timeframes.first().map(|tf| &tf.candles[..]).unwrap_or(&[]);
+                    let base_candles = self
+                        .document
+                        .timeframes
+                        .first()
+                        .map(|tf| &tf.candles[..])
+                        .unwrap_or(&[]);
                     if !base_candles.is_empty() {
                         let base_idx = base_candles
                             .binary_search_by(|c| c.timestamp.partial_cmp(&ts).unwrap())
@@ -2459,7 +2948,11 @@ impl AppState {
                     .anchor(egui::Align2::CENTER_TOP, [0.0, 10.0])
                     .show(ctx, |ui| {
                         ui.horizontal(|ui| {
-                            ui.label(egui::RichText::new("REPLAY").color(egui::Color32::YELLOW).strong());
+                            ui.label(
+                                egui::RichText::new("REPLAY")
+                                    .color(egui::Color32::YELLOW)
+                                    .strong(),
+                            );
                             if let Some(idx) = self.interaction.replay.index {
                                 ui.label(format!("Candle {}/{}", idx + 1, candle_count));
                                 if let Some((base_idx, base_total)) = base_candle_info {
@@ -2470,7 +2963,10 @@ impl AppState {
                             }
                         });
                         ui.horizontal(|ui| {
-                            ui.label(format!("Step: {}", self.interaction.replay.step_timeframe.label()));
+                            ui.label(format!(
+                                "Step: {}",
+                                self.interaction.replay.step_timeframe.label()
+                            ));
                             ui.label("| [ ] step | ,. size | R exit");
                         });
                     });
@@ -2548,7 +3044,9 @@ impl AppState {
                 self.ui.panels.show_symbol_picker = false;
             }
             if let Some(symbol) = selected {
-                self.ui.symbol_picker_state.add_recent(&self.interaction.current_symbol);
+                self.ui
+                    .symbol_picker_state
+                    .add_recent(&self.interaction.current_symbol);
                 self.switch_symbol(&symbol);
                 self.ui.panels.show_symbol_picker = false;
             }
@@ -2575,44 +3073,68 @@ impl AppState {
             self.drawing.toggle_snap();
         }
 
-        self.ui.egui_state.handle_platform_output(&self.window, full_output.platform_output);
+        self.ui
+            .egui_state
+            .handle_platform_output(&self.window, full_output.platform_output);
 
-        let paint_jobs = self.ui.egui_ctx.tessellate(full_output.shapes, full_output.pixels_per_point);
+        let paint_jobs = self
+            .ui
+            .egui_ctx
+            .tessellate(full_output.shapes, full_output.pixels_per_point);
         let screen_descriptor = egui_wgpu::ScreenDescriptor {
             size_in_pixels: [self.graphics.config.width, self.graphics.config.height],
             pixels_per_point: full_output.pixels_per_point,
         };
 
         for (id, image_delta) in &full_output.textures_delta.set {
-            self.ui.egui_renderer.update_texture(&self.graphics.device, &self.graphics.queue, *id, image_delta);
+            self.ui.egui_renderer.update_texture(
+                &self.graphics.device,
+                &self.graphics.queue,
+                *id,
+                image_delta,
+            );
         }
 
-        let mut encoder = self.graphics.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-            label: Some("Render Encoder"),
-        });
+        let mut encoder =
+            self.graphics
+                .device
+                .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                    label: Some("Render Encoder"),
+                });
 
-        self.ui.egui_renderer.update_buffers(&self.graphics.device, &self.graphics.queue, &mut encoder, &paint_jobs, &screen_descriptor);
+        self.ui.egui_renderer.update_buffers(
+            &self.graphics.device,
+            &self.graphics.queue,
+            &mut encoder,
+            &paint_jobs,
+            &screen_descriptor,
+        );
 
         // First render pass: Clear and render charts
         {
-            let tf = match self.document.timeframes.get(self.document.current_timeframe) {
+            let tf = match self
+                .document
+                .timeframes
+                .get(self.document.current_timeframe)
+            {
                 Some(tf) => tf,
                 None => {
-                    self.graphics.queue.submit(std::iter::once(encoder.finish()));
+                    self.graphics
+                        .queue
+                        .submit(std::iter::once(encoder.finish()));
                     output.present();
                     return Ok(());
                 }
             };
 
-            let use_replay_data = self.interaction.replay.enabled && self.interaction.replay.has_custom_timeframe_data();
+            let use_replay_data = self.interaction.replay.enabled
+                && self.interaction.replay.has_custom_timeframe_data();
             let replay_tf = self.interaction.replay.timeframe_data.as_ref();
 
             // Update render params for replay data
-            if use_replay_data
-                && let Some(ref rtf) = self.interaction.replay.timeframe_data
-            {
-                let (x_min, x_max) = self.graphics.renderer.camera.visible_x_range(aspect);
-                let (y_min, y_max) = self.graphics.renderer.camera.visible_y_range(aspect);
+            if use_replay_data && let Some(ref rtf) = self.interaction.replay.timeframe_data {
+                let (x_min, x_max) = self.graphics.renderer.main_camera.camera.visible_x_range(aspect);
+                let (y_min, y_max) = self.graphics.renderer.main_camera.camera.visible_y_range(aspect);
 
                 let visible_width = x_max - x_min;
                 let x_pixel_size = visible_width / chart_width;
@@ -2632,12 +3154,14 @@ impl AppState {
                     x_max,
                     y_min,
                     y_max,
-                    price_min: rtf.price_normalization.price_min,
-                    price_range: rtf.price_normalization.price_range,
                     min_body_height,
                     _padding: 0.0,
                 };
-                self.graphics.queue.write_buffer(&self.graphics.renderer.render_params_buffer, 0, bytemuck::cast_slice(&[render_params]));
+                self.graphics.queue.write_buffer(
+                    &self.graphics.renderer.render_params_buffer,
+                    0,
+                    bytemuck::cast_slice(&[render_params]),
+                );
 
                 let volume_params = VolumeRenderParams {
                     first_visible: 0,
@@ -2645,7 +3169,11 @@ impl AppState {
                     bar_spacing: CANDLE_SPACING,
                     max_volume: rtf.max_volume.max(1.0),
                 };
-                self.graphics.queue.write_buffer(&self.graphics.renderer.volume_params_buffer, 0, bytemuck::cast_slice(&[volume_params]));
+                self.graphics.queue.write_buffer(
+                    &self.graphics.renderer.volume_params_buffer,
+                    0,
+                    bytemuck::cast_slice(&[volume_params]),
+                );
             }
 
             let effective_visible_count = if use_replay_data {
@@ -2674,7 +3202,12 @@ impl AppState {
                     view: &view,
                     resolve_target: None,
                     ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(wgpu::Color { r: 0.04, g: 0.04, b: 0.06, a: 1.0 }),
+                        load: wgpu::LoadOp::Clear(wgpu::Color {
+                            r: 0.04,
+                            g: 0.04,
+                            b: 0.06,
+                            a: 1.0,
+                        }),
                         store: wgpu::StoreOp::Store,
                     },
                 })],
@@ -2688,30 +3221,43 @@ impl AppState {
             // Render price guidelines first
             if self.graphics.renderer.guideline_count > 0 {
                 render_pass.set_pipeline(&self.graphics.renderer.guideline_pipeline.pipeline);
-                render_pass.set_bind_group(0, &self.graphics.renderer.camera_bind_group, &[]);
+                render_pass.set_bind_group(0, &self.graphics.renderer.main_camera.bind_group, &[]);
                 render_pass.set_bind_group(1, &self.graphics.renderer.guideline_bind_group, &[]);
                 render_pass.draw(0..6, 0..self.graphics.renderer.guideline_count);
             }
 
             // Render candle chart
             render_pass.set_pipeline(&self.graphics.renderer.candle_pipeline.pipeline);
-            render_pass.set_bind_group(0, &self.graphics.renderer.camera_bind_group, &[]);
+            render_pass.set_bind_group(0, &self.graphics.renderer.main_camera.bind_group, &[]);
 
             let candle_bind_group = if use_replay_data {
                 &replay_tf.unwrap().candle_bind_group
             } else if self.graphics.renderer.current_lod_factor == 1 {
                 &tf.candle_bind_group
-            } else if let Some(lod) = tf.lod_levels.iter().find(|l| l.factor == self.graphics.renderer.current_lod_factor) {
+            } else if let Some(lod) = tf
+                .lod_levels
+                .iter()
+                .find(|l| l.factor == self.graphics.renderer.current_lod_factor)
+            {
                 &lod.candle_bind_group
             } else {
                 &tf.candle_bind_group
             };
             render_pass.set_bind_group(1, candle_bind_group, &[]);
-            render_pass.set_index_buffer(self.graphics.renderer.candle_pipeline.index_buffer.slice(..), wgpu::IndexFormat::Uint16);
+            render_pass.set_index_buffer(
+                self.graphics
+                    .renderer
+                    .candle_pipeline
+                    .index_buffer
+                    .slice(..),
+                wgpu::IndexFormat::Uint16,
+            );
             render_pass.draw_indexed(0..INDICES_PER_CANDLE, 0, 0..effective_visible_count);
 
             // Render current price line
-            self.graphics.renderer.render_current_price(&mut render_pass);
+            self.graphics
+                .renderer
+                .render_current_price(&mut render_pass);
 
             // Render TA
             if self.document.ta_settings.show_ta {
@@ -2730,20 +3276,24 @@ impl AppState {
                 if self.document.ta_settings.show_ranges && !ta.ranges.is_empty() {
                     let range_count = ta.ranges.len().min(MAX_TA_RANGES) as u32;
                     render_pass.set_pipeline(&self.graphics.renderer.ta_pipeline.range_pipeline);
-                    render_pass.set_bind_group(0, &self.graphics.renderer.camera_bind_group, &[]);
+                    render_pass.set_bind_group(0, &self.graphics.renderer.main_camera.bind_group, &[]);
                     render_pass.set_bind_group(1, &tf.ta_bind_group, &[]);
                     render_pass.draw(0..6, 0..range_count);
                 }
 
                 // Render levels
-                let filtered_level_count = ta.levels.iter()
+                let filtered_level_count = ta
+                    .levels
+                    .iter()
                     .filter(|l| {
                         let type_ok = match l.level_type {
                             LevelType::Hold => self.document.ta_settings.show_hold_levels,
                             LevelType::GreedyHold => self.document.ta_settings.show_greedy_levels,
                         };
                         let state_ok = match l.state {
-                            LevelState::Inactive | LevelState::Active => self.document.ta_settings.show_active_levels,
+                            LevelState::Inactive | LevelState::Active => {
+                                self.document.ta_settings.show_active_levels
+                            }
                             LevelState::Broken => self.document.ta_settings.show_broken_levels,
                         };
                         type_ok && state_ok
@@ -2753,7 +3303,7 @@ impl AppState {
 
                 if filtered_level_count > 0 {
                     render_pass.set_pipeline(&self.graphics.renderer.ta_pipeline.level_pipeline);
-                    render_pass.set_bind_group(0, &self.graphics.renderer.camera_bind_group, &[]);
+                    render_pass.set_bind_group(0, &self.graphics.renderer.main_camera.bind_group, &[]);
                     render_pass.set_bind_group(1, &tf.ta_bind_group, &[]);
                     render_pass.draw(0..6, 0..filtered_level_count);
                 }
@@ -2761,19 +3311,26 @@ impl AppState {
                 // Render trends (6 vertices per quad, one per trend)
                 if self.document.ta_settings.show_trends && !ta.trends.is_empty() {
                     use charter_ta::TrendState;
-                    let filtered_trend_count = ta.trends.iter()
-                        .filter(|t| {
-                            match t.state {
-                                TrendState::Active | TrendState::Hit => self.document.ta_settings.show_active_trends,
-                                TrendState::Broken => self.document.ta_settings.show_broken_levels,
+                    let filtered_trend_count = ta
+                        .trends
+                        .iter()
+                        .filter(|t| match t.state {
+                            TrendState::Active | TrendState::Hit => {
+                                self.document.ta_settings.show_active_trends
                             }
+                            TrendState::Broken => self.document.ta_settings.show_broken_levels,
                         })
                         .take(MAX_TA_TRENDS)
                         .count() as u32;
 
                     if filtered_trend_count > 0 {
-                        render_pass.set_pipeline(&self.graphics.renderer.ta_pipeline.trend_pipeline);
-                        render_pass.set_bind_group(0, &self.graphics.renderer.camera_bind_group, &[]);
+                        render_pass
+                            .set_pipeline(&self.graphics.renderer.ta_pipeline.trend_pipeline);
+                        render_pass.set_bind_group(
+                            0,
+                            &self.graphics.renderer.main_camera.bind_group,
+                            &[],
+                        );
                         render_pass.set_bind_group(1, &tf.ta_bind_group, &[]);
                         render_pass.draw(0..6, 0..filtered_trend_count);
                     }
@@ -2782,22 +3339,38 @@ impl AppState {
 
             // Render user drawings
             if !self.drawing.drawings.is_empty() || self.drawing.tool != DrawingTool::None {
-                let (x_min, x_max) = self.graphics.renderer.camera.visible_x_range(aspect);
-                let (y_min, y_max) = self.graphics.renderer.camera.visible_y_range(aspect);
+                let (x_min, x_max) = self.graphics.renderer.main_camera.camera.visible_x_range(aspect);
+                let (y_min, y_max) = self.graphics.renderer.main_camera.camera.visible_y_range(aspect);
 
                 let render_data = prepare_drawing_render_data(&self.drawing, CANDLE_SPACING);
 
                 if !render_data.hrays.is_empty() {
-                    self.graphics.queue.write_buffer(&self.drawing_hray_buffer, 0, bytemuck::cast_slice(&render_data.hrays));
+                    self.graphics.queue.write_buffer(
+                        &self.drawing_hray_buffer,
+                        0,
+                        bytemuck::cast_slice(&render_data.hrays),
+                    );
                 }
                 if !render_data.rays.is_empty() {
-                    self.graphics.queue.write_buffer(&self.drawing_ray_buffer, 0, bytemuck::cast_slice(&render_data.rays));
+                    self.graphics.queue.write_buffer(
+                        &self.drawing_ray_buffer,
+                        0,
+                        bytemuck::cast_slice(&render_data.rays),
+                    );
                 }
                 if !render_data.rects.is_empty() {
-                    self.graphics.queue.write_buffer(&self.drawing_rect_buffer, 0, bytemuck::cast_slice(&render_data.rects));
+                    self.graphics.queue.write_buffer(
+                        &self.drawing_rect_buffer,
+                        0,
+                        bytemuck::cast_slice(&render_data.rects),
+                    );
                 }
                 if !render_data.anchors.is_empty() {
-                    self.graphics.queue.write_buffer(&self.drawing_anchor_buffer, 0, bytemuck::cast_slice(&render_data.anchors));
+                    self.graphics.queue.write_buffer(
+                        &self.drawing_anchor_buffer,
+                        0,
+                        bytemuck::cast_slice(&render_data.anchors),
+                    );
                 }
 
                 let price_range = y_max - y_min;
@@ -2825,13 +3398,42 @@ impl AppState {
                     _padding1: 0,
                     _padding2: 0,
                 };
-                self.graphics.queue.write_buffer(&self.drawing_params_buffer, 0, bytemuck::cast_slice(&[params]));
+                self.graphics.queue.write_buffer(
+                    &self.drawing_params_buffer,
+                    0,
+                    bytemuck::cast_slice(&[params]),
+                );
 
-                self.drawing_pipeline.render_rect_fills(&mut render_pass, &self.graphics.renderer.camera_bind_group, &self.drawing_bind_group, render_data.rects.len() as u32);
-                self.drawing_pipeline.render_rect_borders(&mut render_pass, &self.graphics.renderer.camera_bind_group, &self.drawing_bind_group, render_data.rects.len() as u32);
-                self.drawing_pipeline.render_hrays(&mut render_pass, &self.graphics.renderer.camera_bind_group, &self.drawing_bind_group, render_data.hrays.len() as u32);
-                self.drawing_pipeline.render_rays(&mut render_pass, &self.graphics.renderer.camera_bind_group, &self.drawing_bind_group, render_data.rays.len() as u32);
-                self.drawing_pipeline.render_anchors(&mut render_pass, &self.graphics.renderer.camera_bind_group, &self.drawing_bind_group, render_data.anchors.len() as u32);
+                self.drawing_pipeline.render_rect_fills(
+                    &mut render_pass,
+                    &self.graphics.renderer.main_camera.bind_group,
+                    &self.drawing_bind_group,
+                    render_data.rects.len() as u32,
+                );
+                self.drawing_pipeline.render_rect_borders(
+                    &mut render_pass,
+                    &self.graphics.renderer.main_camera.bind_group,
+                    &self.drawing_bind_group,
+                    render_data.rects.len() as u32,
+                );
+                self.drawing_pipeline.render_hrays(
+                    &mut render_pass,
+                    &self.graphics.renderer.main_camera.bind_group,
+                    &self.drawing_bind_group,
+                    render_data.hrays.len() as u32,
+                );
+                self.drawing_pipeline.render_rays(
+                    &mut render_pass,
+                    &self.graphics.renderer.main_camera.bind_group,
+                    &self.drawing_bind_group,
+                    render_data.rays.len() as u32,
+                );
+                self.drawing_pipeline.render_anchors(
+                    &mut render_pass,
+                    &self.graphics.renderer.main_camera.bind_group,
+                    &self.drawing_bind_group,
+                    render_data.anchors.len() as u32,
+                );
             }
 
             // Render MACD indicators
@@ -2847,14 +3449,14 @@ impl AppState {
 
                 if buffers.macd_point_count > 1 {
                     render_pass.set_pipeline(&self.graphics.renderer.indicator_pipeline.pipeline);
-                    render_pass.set_bind_group(0, &self.graphics.renderer.camera_bind_group, &[]);
+                    render_pass.set_bind_group(0, &self.graphics.renderer.main_camera.bind_group, &[]);
                     render_pass.set_bind_group(1, &buffers.macd_bind_group, &[]);
                     render_pass.draw(0..6, 0..(buffers.macd_point_count - 1));
                 }
 
                 if buffers.signal_point_count > 1 {
                     render_pass.set_pipeline(&self.graphics.renderer.indicator_pipeline.pipeline);
-                    render_pass.set_bind_group(0, &self.graphics.renderer.camera_bind_group, &[]);
+                    render_pass.set_bind_group(0, &self.graphics.renderer.main_camera.bind_group, &[]);
                     render_pass.set_bind_group(1, &buffers.signal_bind_group, &[]);
                     render_pass.draw(0..6, 0..(buffers.signal_point_count - 1));
                 }
@@ -2863,13 +3465,17 @@ impl AppState {
             // Render volume bars
             render_pass.set_viewport(0.0, chart_height, chart_width, volume_height, 0.0, 1.0);
             render_pass.set_pipeline(&self.graphics.renderer.volume_pipeline.pipeline);
-            render_pass.set_bind_group(0, &self.graphics.renderer.volume_camera_bind_group, &[]);
+            render_pass.set_bind_group(0, &self.graphics.renderer.volume_camera.bind_group, &[]);
 
             let volume_bind_group = if use_replay_data {
                 &replay_tf.unwrap().volume_bind_group
             } else if self.graphics.renderer.current_lod_factor == 1 {
                 &tf.volume_bind_group
-            } else if let Some(lod) = tf.lod_levels.iter().find(|l| l.factor == self.graphics.renderer.current_lod_factor) {
+            } else if let Some(lod) = tf
+                .lod_levels
+                .iter()
+                .find(|l| l.factor == self.graphics.renderer.current_lod_factor)
+            {
                 &lod.volume_bind_group
             } else {
                 &tf.volume_bind_group
@@ -2878,12 +3484,17 @@ impl AppState {
             render_pass.draw(0..6, 0..effective_visible_count);
         }
 
-        self.graphics.queue.submit(std::iter::once(encoder.finish()));
+        self.graphics
+            .queue
+            .submit(std::iter::once(encoder.finish()));
 
         // Second encoder for egui
-        let mut egui_encoder = self.graphics.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-            label: Some("Egui Encoder"),
-        });
+        let mut egui_encoder =
+            self.graphics
+                .device
+                .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                    label: Some("Egui Encoder"),
+                });
 
         {
             let render_pass = egui_encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
@@ -2902,14 +3513,18 @@ impl AppState {
             });
 
             let mut render_pass = render_pass.forget_lifetime();
-            self.ui.egui_renderer.render(&mut render_pass, &paint_jobs, &screen_descriptor);
+            self.ui
+                .egui_renderer
+                .render(&mut render_pass, &paint_jobs, &screen_descriptor);
         }
 
         for id in &full_output.textures_delta.free {
             self.ui.egui_renderer.free_texture(id);
         }
 
-        self.graphics.queue.submit(std::iter::once(egui_encoder.finish()));
+        self.graphics
+            .queue
+            .submit(std::iter::once(egui_encoder.finish()));
         output.present();
 
         // Update FPS counter
@@ -2920,7 +3535,9 @@ impl AppState {
             self.frame_count = 0;
             self.last_frame_time = Instant::now();
 
-            let tf_labels = ["1m", "3m", "5m", "30m", "1h", "3h", "5h", "10h", "1d", "1w", "3w", "1M"];
+            let tf_labels = [
+                "1m", "3m", "5m", "30m", "1h", "3h", "5h", "10h", "1d", "1w", "3w", "1M",
+            ];
             let tf_label = tf_labels[self.document.current_timeframe];
             let candle_count = self.document.current_candles().len();
 

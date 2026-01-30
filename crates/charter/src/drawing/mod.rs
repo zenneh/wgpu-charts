@@ -3,7 +3,7 @@
 mod state;
 mod types;
 
-pub use state::{DrawingManager, DrawingTool};
+pub use state::{DrawingManager, DrawingTool, InteractionState as DrawingInteraction};
 pub use types::{Drawing, DrawingId};
 
 use charter_render::{AnchorGpu, DrawingHRayGpu, DrawingRayGpu, DrawingRectGpu};

@@ -423,7 +423,7 @@ impl State {
         };
 
         // Create drawing pipeline and buffers
-        let drawing_pipeline = DrawingPipeline::new(&device, surface_format, &renderer.candle_pipeline.camera_bind_group_layout);
+        let drawing_pipeline = DrawingPipeline::new(&device, surface_format, &renderer.shared_layouts);
         let drawing_hray_buffer = drawing_pipeline.create_hray_buffer(&device);
         let drawing_ray_buffer = drawing_pipeline.create_ray_buffer(&device);
         let drawing_rect_buffer = drawing_pipeline.create_rect_buffer(&device);
@@ -525,7 +525,7 @@ impl State {
         let chart_height = self.config.height as f32 * (1.0 - VOLUME_HEIGHT_RATIO);
         let chart_width = self.config.width as f32 - STATS_PANEL_WIDTH;
         let aspect = chart_width / chart_height;
-        let (y_min, y_max) = self.renderer.camera.visible_y_range(aspect);
+        let (y_min, y_max) = self.renderer.main_camera.camera.visible_y_range(aspect);
         let price_range = y_max - y_min;
         let world_units_per_pixel = price_range / chart_height;
         let line_thickness = (world_units_per_pixel * 1.5).max(0.001);
@@ -832,7 +832,6 @@ impl State {
             open_price
         };
 
-        // Update render params with new price_normalization (critical for correct rendering)
         self.update_visible_range();
 
         // Update current price line if websocket is connected
@@ -851,7 +850,7 @@ impl State {
         let chart_width = self.config.width as f32 - STATS_PANEL_WIDTH;
         let chart_height = self.config.height as f32 * (1.0 - VOLUME_HEIGHT_RATIO);
         let aspect = chart_width / chart_height;
-        let (x_min, x_max) = self.renderer.camera.visible_x_range(aspect);
+        let (x_min, x_max) = self.renderer.main_camera.camera.visible_x_range(aspect);
         self.renderer.set_current_price(&self.queue, close_price, open_price, x_min, x_max);
     }
 
@@ -1891,10 +1890,10 @@ impl State {
         // Compute line thickness based on current view
         let chart_height = self.config.height as f32 * (1.0 - VOLUME_HEIGHT_RATIO);
         let aspect = (self.config.width as f32 - STATS_PANEL_WIDTH) / chart_height;
-        let (y_min, y_max) = self.renderer.camera.visible_y_range(aspect);
+        let (y_min, y_max) = self.renderer.main_camera.camera.visible_y_range(aspect);
 
         // Extend levels/trends to the right edge of visible screen (not just last candle)
-        let (_, visible_x_max) = self.renderer.camera.visible_x_range(aspect);
+        let (_, visible_x_max) = self.renderer.main_camera.camera.visible_x_range(aspect);
         let candle_x_max = (tf.candles.len() as f32) * CANDLE_SPACING;
         let x_max = visible_x_max.max(candle_x_max);
         let price_range = y_max - y_min;
@@ -2267,7 +2266,7 @@ impl State {
         let chart_height = self.config.height as f32 * (1.0 - VOLUME_HEIGHT_RATIO);
         let chart_width = self.config.width as f32 - STATS_PANEL_WIDTH;
         let aspect = chart_width / chart_height;
-        let (y_min, y_max) = self.renderer.camera.visible_y_range(aspect);
+        let (y_min, y_max) = self.renderer.main_camera.camera.visible_y_range(aspect);
         let price_range = y_max - y_min;
         let world_units_per_pixel = price_range / chart_height;
         let line_thickness = (world_units_per_pixel * 1.5).max(0.001);
@@ -2376,7 +2375,7 @@ impl State {
         }
 
         let old_candle_idx =
-            (self.renderer.camera.position[0] / CANDLE_SPACING).round() as usize;
+            (self.renderer.main_camera.camera.position[0] / CANDLE_SPACING).round() as usize;
         let old_candle_idx = old_candle_idx.min(old_candles.len().saturating_sub(1));
         let target_timestamp = old_candles[old_candle_idx].timestamp;
 
@@ -2390,10 +2389,10 @@ impl State {
         let new_x = (new_candle_idx as f32) * CANDLE_SPACING;
 
         let ratio = old_candles.len() as f32 / new_candles.len() as f32;
-        let new_scale_x = self.renderer.camera.scale[0] / ratio;
+        let new_scale_x = self.renderer.main_camera.camera.scale[0] / ratio;
 
-        self.renderer.camera.position[0] = new_x;
-        self.renderer.camera.scale[0] = new_scale_x.max(5.0);
+        self.renderer.main_camera.camera.position[0] = new_x;
+        self.renderer.main_camera.camera.scale[0] = new_scale_x.max(5.0);
 
         self.current_timeframe = index;
         self.renderer.update_camera(&self.queue);
@@ -2435,8 +2434,8 @@ impl State {
         let ndc_y = 1.0 - (screen_y / chart_height) * 2.0;
 
         // Convert from NDC to world coordinates
-        let world_x = self.renderer.camera.position[0] + ndc_x * self.renderer.camera.scale[0] * aspect;
-        let world_y = self.renderer.camera.position[1] + ndc_y * self.renderer.camera.scale[1];
+        let world_x = self.renderer.main_camera.camera.position[0] + ndc_x * self.renderer.main_camera.camera.scale[0] * aspect;
+        let world_y = self.renderer.main_camera.camera.position[1] + ndc_y * self.renderer.main_camera.camera.scale[1];
 
         (world_x, world_y)
     }
@@ -2448,8 +2447,15 @@ impl State {
                 let (world_x, world_y) = self.screen_to_world(last_pos[0], last_pos[1]);
                 let candles = &self.timeframes[self.current_timeframe].candles;
 
+                let aspect =
+                    self.config.width as f32 / self.config.height as f32;
+                let x_wpp = (self.renderer.main_camera.camera.scale[0] * aspect * 2.0)
+                    / self.config.width as f32;
+                let y_wpp = (self.renderer.main_camera.camera.scale[1] * 2.0)
+                    / self.config.height as f32;
+
                 if state == ElementState::Pressed {
-                    if self.drawing.handle_press(world_x, world_y, candles, CANDLE_SPACING) {
+                    if self.drawing.handle_press(world_x, world_y, candles, CANDLE_SPACING, x_wpp, y_wpp) {
                         self.window.request_redraw();
                         return; // Drawing consumed the click
                     }
@@ -2504,13 +2510,13 @@ impl State {
                     }
 
                     let aspect = self.config.width as f32 / self.config.height as f32;
-                    let world_dx = -dx * (self.renderer.camera.scale[0] * aspect * 2.0)
+                    let world_dx = -dx * (self.renderer.main_camera.camera.scale[0] * aspect * 2.0)
                         / self.config.width as f32;
                     let world_dy =
-                        dy * (self.renderer.camera.scale[1] * 2.0) / self.config.height as f32;
+                        dy * (self.renderer.main_camera.camera.scale[1] * 2.0) / self.config.height as f32;
 
-                    self.renderer.camera.position[0] += world_dx;
-                    self.renderer.camera.position[1] += world_dy;
+                    self.renderer.main_camera.camera.position[0] += world_dx;
+                    self.renderer.main_camera.camera.position[1] += world_dy;
 
                     self.renderer.update_camera(&self.queue);
                     self.update_visible_range();
@@ -2572,10 +2578,10 @@ impl State {
             [0.0, 0.0]
         };
 
-        let world_x = self.renderer.camera.position[0]
-            + cursor_ndc[0] * self.renderer.camera.scale[0] * aspect;
+        let world_x = self.renderer.main_camera.camera.position[0]
+            + cursor_ndc[0] * self.renderer.main_camera.camera.scale[0] * aspect;
         let world_y =
-            self.renderer.camera.position[1] + cursor_ndc[1] * self.renderer.camera.scale[1];
+            self.renderer.main_camera.camera.position[1] + cursor_ndc[1] * self.renderer.main_camera.camera.scale[1];
 
         let data_width = (candles.len() as f32) * CANDLE_SPACING;
         let max_x_zoom = (data_width / 2.0 / aspect).max(10.0) * 1.2; // Ensure minimum zoom
@@ -2590,20 +2596,20 @@ impl State {
 
         if scroll_x.abs() > 0.001 {
             let zoom_factor = 1.0 - scroll_x * 0.1;
-            let old_scale = self.renderer.camera.scale[0];
-            self.renderer.camera.scale[0] = (old_scale * zoom_factor).clamp(5.0, max_x_zoom);
-            let new_world_x = self.renderer.camera.position[0]
-                + cursor_ndc[0] * self.renderer.camera.scale[0] * aspect;
-            self.renderer.camera.position[0] += world_x - new_world_x;
+            let old_scale = self.renderer.main_camera.camera.scale[0];
+            self.renderer.main_camera.camera.scale[0] = (old_scale * zoom_factor).clamp(5.0, max_x_zoom);
+            let new_world_x = self.renderer.main_camera.camera.position[0]
+                + cursor_ndc[0] * self.renderer.main_camera.camera.scale[0] * aspect;
+            self.renderer.main_camera.camera.position[0] += world_x - new_world_x;
         }
 
         if scroll_y.abs() > 0.001 {
             let zoom_factor = 1.0 + scroll_y * 0.1;
-            let old_scale = self.renderer.camera.scale[1];
-            self.renderer.camera.scale[1] = (old_scale * zoom_factor).clamp(1.0, max_y_zoom);
-            let new_world_y = self.renderer.camera.position[1]
-                + cursor_ndc[1] * self.renderer.camera.scale[1];
-            self.renderer.camera.position[1] += world_y - new_world_y;
+            let old_scale = self.renderer.main_camera.camera.scale[1];
+            self.renderer.main_camera.camera.scale[1] = (old_scale * zoom_factor).clamp(1.0, max_y_zoom);
+            let new_world_y = self.renderer.main_camera.camera.position[1]
+                + cursor_ndc[1] * self.renderer.main_camera.camera.scale[1];
+            self.renderer.main_camera.camera.position[1] += world_y - new_world_y;
         }
 
         self.renderer.update_camera(&self.queue);
@@ -2717,7 +2723,7 @@ impl State {
         // Get guideline values and visible range for price labels
         let guideline_values = self.renderer.guideline_values.clone();
         let aspect = chart_width / chart_height;
-        let (y_min, y_max) = self.renderer.camera.visible_y_range(aspect);
+        let (y_min, y_max) = self.renderer.main_camera.camera.visible_y_range(aspect);
 
         // Build egui UI
         let raw_input = self.egui_state.take_egui_input(&self.window);
@@ -2816,7 +2822,7 @@ impl State {
             // Replay mode overlay and cursor line
             if self.replay.enabled {
                 let aspect = chart_width / chart_height;
-                let (x_min, _x_max) = self.renderer.camera.visible_x_range(aspect);
+                let (x_min, _x_max) = self.renderer.main_camera.camera.visible_x_range(aspect);
 
                 // Determine cursor X position
                 let cursor_x = if let Some(replay_ts) = self.replay.timestamp {
@@ -2841,13 +2847,13 @@ impl State {
                 } else if let Some(pos) = self.input.last_mouse_pos {
                     // Following cursor
                     let normalized_x = pos[0] / chart_width;
-                    x_min + normalized_x * (self.renderer.camera.scale[0] * aspect * 2.0)
+                    x_min + normalized_x * (self.renderer.main_camera.camera.scale[0] * aspect * 2.0)
                 } else {
                     x_min
                 };
 
                 // Convert world X to screen X
-                let screen_x = ((cursor_x - x_min) / (self.renderer.camera.scale[0] * aspect * 2.0)) * chart_width;
+                let screen_x = ((cursor_x - x_min) / (self.renderer.main_camera.camera.scale[0] * aspect * 2.0)) * chart_width;
 
                 // Draw vertical cursor line (thinner and more subtle when locked)
                 if screen_x >= 0.0 && screen_x <= chart_width {
@@ -3057,8 +3063,8 @@ impl State {
                 && let Some(ref rtf) = self.replay.timeframe_data
             {
                 let aspect = chart_width / chart_height;
-                let (x_min, x_max) = self.renderer.camera.visible_x_range(aspect);
-                let (y_min, y_max) = self.renderer.camera.visible_y_range(aspect);
+                let (x_min, x_max) = self.renderer.main_camera.camera.visible_x_range(aspect);
+                let (y_min, y_max) = self.renderer.main_camera.camera.visible_y_range(aspect);
 
                 // Use fixed base values for replay - no LOD adjustment needed
                 let visible_width = x_max - x_min;
@@ -3080,8 +3086,6 @@ impl State {
                     x_max,
                     y_min,
                     y_max,
-                    price_min: rtf.price_normalization.price_min,
-                    price_range: rtf.price_normalization.price_range,
                     min_body_height,
                     _padding: 0.0,
                 };
@@ -3157,14 +3161,14 @@ impl State {
             // Render price guidelines first (behind candles)
             if self.renderer.guideline_count > 0 {
                 render_pass.set_pipeline(&self.renderer.guideline_pipeline.pipeline);
-                render_pass.set_bind_group(0, &self.renderer.camera_bind_group, &[]);
+                render_pass.set_bind_group(0, &self.renderer.main_camera.bind_group, &[]);
                 render_pass.set_bind_group(1, &self.renderer.guideline_bind_group, &[]);
                 render_pass.draw(0..6, 0..self.renderer.guideline_count);
             }
 
             // Render candle chart using appropriate LOD level
             render_pass.set_pipeline(&self.renderer.candle_pipeline.pipeline);
-            render_pass.set_bind_group(0, &self.renderer.camera_bind_group, &[]);
+            render_pass.set_bind_group(0, &self.renderer.main_camera.bind_group, &[]);
 
             // Select the appropriate bind group based on replay mode and LOD
             let candle_bind_group = if use_replay_data {
@@ -3200,7 +3204,7 @@ impl State {
                 if self.ta_settings.show_ranges && !ta.ranges.is_empty() {
                     let range_count = ta.ranges.len().min(MAX_TA_RANGES) as u32;
                     render_pass.set_pipeline(&self.renderer.ta_pipeline.range_pipeline);
-                    render_pass.set_bind_group(0, &self.renderer.camera_bind_group, &[]);
+                    render_pass.set_bind_group(0, &self.renderer.main_camera.bind_group, &[]);
                     render_pass.set_bind_group(1, &tf.ta_bind_group, &[]);
                     render_pass.draw(0..6, 0..range_count);
                 }
@@ -3224,7 +3228,7 @@ impl State {
 
                 if filtered_level_count > 0 {
                     render_pass.set_pipeline(&self.renderer.ta_pipeline.level_pipeline);
-                    render_pass.set_bind_group(0, &self.renderer.camera_bind_group, &[]);
+                    render_pass.set_bind_group(0, &self.renderer.main_camera.bind_group, &[]);
                     render_pass.set_bind_group(1, &tf.ta_bind_group, &[]);
                     render_pass.draw(0..6, 0..filtered_level_count);
                 }
@@ -3244,7 +3248,7 @@ impl State {
 
                     if filtered_trend_count > 0 {
                         render_pass.set_pipeline(&self.renderer.ta_pipeline.trend_pipeline);
-                        render_pass.set_bind_group(0, &self.renderer.camera_bind_group, &[]);
+                        render_pass.set_bind_group(0, &self.renderer.main_camera.bind_group, &[]);
                         render_pass.set_bind_group(1, &tf.ta_bind_group, &[]);
                         render_pass.draw(0..6, 0..filtered_trend_count);
                     }
@@ -3255,8 +3259,8 @@ impl State {
             if !self.drawing.drawings.is_empty() || self.drawing.tool != DrawingTool::None {
                 // Use visible x range for extending rays to full canvas width
                 let aspect = chart_width / chart_height;
-                let (x_min, x_max) = self.renderer.camera.visible_x_range(aspect);
-                let (y_min, y_max) = self.renderer.camera.visible_y_range(aspect);
+                let (x_min, x_max) = self.renderer.main_camera.camera.visible_x_range(aspect);
+                let (y_min, y_max) = self.renderer.main_camera.camera.visible_y_range(aspect);
 
                 // Convert drawings to GPU format (includes preview)
                 let render_data = prepare_drawing_render_data(&self.drawing, CANDLE_SPACING);
@@ -3309,7 +3313,7 @@ impl State {
                 // Render rectangle fills first (behind other elements)
                 self.drawing_pipeline.render_rect_fills(
                     &mut render_pass,
-                    &self.renderer.camera_bind_group,
+                    &self.renderer.main_camera.bind_group,
                     &self.drawing_bind_group,
                     render_data.rects.len() as u32,
                 );
@@ -3317,7 +3321,7 @@ impl State {
                 // Render rectangle borders
                 self.drawing_pipeline.render_rect_borders(
                     &mut render_pass,
-                    &self.renderer.camera_bind_group,
+                    &self.renderer.main_camera.bind_group,
                     &self.drawing_bind_group,
                     render_data.rects.len() as u32,
                 );
@@ -3325,7 +3329,7 @@ impl State {
                 // Render horizontal rays
                 self.drawing_pipeline.render_hrays(
                     &mut render_pass,
-                    &self.renderer.camera_bind_group,
+                    &self.renderer.main_camera.bind_group,
                     &self.drawing_bind_group,
                     render_data.hrays.len() as u32,
                 );
@@ -3333,7 +3337,7 @@ impl State {
                 // Render rays/trendlines
                 self.drawing_pipeline.render_rays(
                     &mut render_pass,
-                    &self.renderer.camera_bind_group,
+                    &self.renderer.main_camera.bind_group,
                     &self.drawing_bind_group,
                     render_data.rays.len() as u32,
                 );
@@ -3341,7 +3345,7 @@ impl State {
                 // Render anchor handles (on top)
                 self.drawing_pipeline.render_anchors(
                     &mut render_pass,
-                    &self.renderer.camera_bind_group,
+                    &self.renderer.main_camera.bind_group,
                     &self.drawing_bind_group,
                     render_data.anchors.len() as u32,
                 );
@@ -3364,7 +3368,7 @@ impl State {
                 // Render MACD line (each segment needs 6 vertices)
                 if buffers.macd_point_count > 1 {
                     render_pass.set_pipeline(&self.renderer.indicator_pipeline.pipeline);
-                    render_pass.set_bind_group(0, &self.renderer.camera_bind_group, &[]);
+                    render_pass.set_bind_group(0, &self.renderer.main_camera.bind_group, &[]);
                     render_pass.set_bind_group(1, &buffers.macd_bind_group, &[]);
                     render_pass.draw(0..6, 0..(buffers.macd_point_count - 1));
                 }
@@ -3372,7 +3376,7 @@ impl State {
                 // Render signal line
                 if buffers.signal_point_count > 1 {
                     render_pass.set_pipeline(&self.renderer.indicator_pipeline.pipeline);
-                    render_pass.set_bind_group(0, &self.renderer.camera_bind_group, &[]);
+                    render_pass.set_bind_group(0, &self.renderer.main_camera.bind_group, &[]);
                     render_pass.set_bind_group(1, &buffers.signal_bind_group, &[]);
                     render_pass.draw(0..6, 0..(buffers.signal_point_count - 1));
                 }
@@ -3381,7 +3385,7 @@ impl State {
             // Render volume bars using appropriate LOD level
             render_pass.set_viewport(0.0, chart_height, chart_width, volume_height, 0.0, 1.0);
             render_pass.set_pipeline(&self.renderer.volume_pipeline.pipeline);
-            render_pass.set_bind_group(0, &self.renderer.volume_camera_bind_group, &[]);
+            render_pass.set_bind_group(0, &self.renderer.volume_camera.bind_group, &[]);
 
             let volume_bind_group = if use_replay_data {
                 // Use replay timeframe data volume bind group
@@ -3461,9 +3465,9 @@ impl State {
             let chart_width = self.config.width as f32 - STATS_PANEL_WIDTH;
             if pos[0] < chart_width {
                 let aspect = chart_width / (self.config.height as f32 * (1.0 - VOLUME_HEIGHT_RATIO));
-                let (x_min, _) = self.renderer.camera.visible_x_range(aspect);
+                let (x_min, _) = self.renderer.main_camera.camera.visible_x_range(aspect);
                 let normalized_x = pos[0] / chart_width;
-                let world_x = x_min + normalized_x * (self.renderer.camera.scale[0] * aspect * 2.0);
+                let world_x = x_min + normalized_x * (self.renderer.main_camera.camera.scale[0] * aspect * 2.0);
                 let idx = (world_x / CANDLE_SPACING).round() as usize;
                 return idx.min(tf.candles.len().saturating_sub(1));
             }
@@ -3483,13 +3487,13 @@ impl State {
         }
 
         let aspect = chart_width / chart_height;
-        let (x_min, _) = self.renderer.camera.visible_x_range(aspect);
-        let (y_min, y_max) = self.renderer.camera.visible_y_range(aspect);
+        let (x_min, _) = self.renderer.main_camera.camera.visible_x_range(aspect);
+        let (y_min, y_max) = self.renderer.main_camera.camera.visible_y_range(aspect);
 
         let normalized_x = pos[0] / chart_width;
         let normalized_y = pos[1] / chart_height;
 
-        let world_x = x_min + normalized_x * (self.renderer.camera.scale[0] * aspect * 2.0);
+        let world_x = x_min + normalized_x * (self.renderer.main_camera.camera.scale[0] * aspect * 2.0);
         let world_y = y_max - normalized_y * (y_max - y_min); // Flip Y
 
         Some((world_x, world_y))
@@ -3508,7 +3512,7 @@ impl State {
         let chart_height = self.config.height as f32 * (1.0 - VOLUME_HEIGHT_RATIO);
         let chart_width = self.config.width as f32 - STATS_PANEL_WIDTH;
         let aspect = chart_width / chart_height;
-        let (y_min, y_max) = self.renderer.camera.visible_y_range(aspect);
+        let (y_min, y_max) = self.renderer.main_camera.camera.visible_y_range(aspect);
         let price_range = y_max - y_min;
         let tolerance = price_range * 0.01; // 1% of visible price range
 
@@ -3541,7 +3545,7 @@ impl State {
         let chart_height = self.config.height as f32 * (1.0 - VOLUME_HEIGHT_RATIO);
         let chart_width = self.config.width as f32 - STATS_PANEL_WIDTH;
         let aspect = chart_width / chart_height;
-        let (y_min, y_max) = self.renderer.camera.visible_y_range(aspect);
+        let (y_min, y_max) = self.renderer.main_camera.camera.visible_y_range(aspect);
         let price_range = y_max - y_min;
         let tolerance = price_range * 0.005; // 0.5% of visible price range
 
@@ -3583,7 +3587,7 @@ impl State {
 
         // Calculate tolerance based on view scale
         let chart_height = self.config.height as f32 * (1.0 - VOLUME_HEIGHT_RATIO);
-        let y_scale = self.renderer.camera.scale[1] * 2.0 / chart_height;
+        let y_scale = self.renderer.main_camera.camera.scale[1] * 2.0 / chart_height;
         let tolerance = y_scale * 10.0; // 10 pixels tolerance
 
         for (i, trend) in ta.trends.iter().enumerate() {

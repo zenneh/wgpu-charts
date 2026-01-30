@@ -1,10 +1,7 @@
 //! Live data management for real-time WebSocket updates.
 
 use charter_core::Candle;
-use mexc_api::{
-    types::WsEvent,
-    SpotWebSocket, SubscriptionBuilder,
-};
+use mexc_api::{SpotWebSocket, SubscriptionBuilder, types::WsEvent};
 use tokio::sync::mpsc;
 
 use crate::mexc::ws_kline_to_candle;
@@ -122,11 +119,7 @@ async fn process_ws_events(
 
     while let Some(event) = ws_rx.recv().await {
         match event {
-            WsEvent::Kline {
-                symbol,
-                kline,
-                ..
-            } => {
+            WsEvent::Kline { symbol, kline, .. } => {
                 // Only process events for our symbol
                 if symbol.to_uppercase() != expected_symbol {
                     continue;
@@ -142,6 +135,8 @@ async fn process_ws_events(
                 };
 
                 last_kline_time = Some(current_time);
+
+                println!("Got candle event");
 
                 if event_tx
                     .send(LiveDataEvent::CandleUpdate { candle, is_closed })
