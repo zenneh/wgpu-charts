@@ -505,3 +505,67 @@ pub const MAX_DRAWING_HRAYS: usize = 256;
 pub const MAX_DRAWING_RAYS: usize = 256;
 pub const MAX_DRAWING_RECTS: usize = 256;
 pub const MAX_DRAWING_ANCHORS: usize = 512;
+
+// ============================================================================
+// Volume Profile GPU Types
+// ============================================================================
+
+/// GPU struct for a single volume profile price bucket.
+/// Rendered as a horizontal bar on the right side of the chart.
+#[repr(C)]
+#[derive(Debug, Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct VolumeProfileBucketGpu {
+    pub price: f32,
+    pub buy_volume: f32,
+    pub sell_volume: f32,
+    pub _padding: f32,
+}
+
+/// Volume profile render parameters.
+#[repr(C)]
+#[derive(Debug, Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct VolumeProfileParams {
+    pub bucket_count: u32,
+    pub max_volume: f32,
+    pub profile_width: f32,
+    pub y_min: f32,
+    pub y_max: f32,
+    pub bucket_height: f32,
+    pub x_right: f32,
+    pub visible: u32,
+}
+
+/// Maximum number of volume profile price buckets.
+pub const MAX_VOLUME_PROFILE_BUCKETS: usize = 512;
+
+// ============================================================================
+// Depth Heatmap GPU Types
+// ============================================================================
+
+/// GPU struct for a single depth sidebar level.
+/// Each level is a horizontal bar at an exact price with bid/ask quantities.
+#[repr(C)]
+#[derive(Debug, Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct DepthHeatmapCellGpu {
+    pub price: f32,
+    pub bar_height: f32,
+    pub bid_quantity: f32,
+    pub ask_quantity: f32,
+}
+
+/// Depth sidebar render parameters.
+#[repr(C)]
+#[derive(Debug, Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct DepthHeatmapParams {
+    pub level_count: u32,
+    pub _pad0: u32,
+    pub max_quantity: f32,
+    pub half_width: f32,
+    pub _pad1: f32,
+    pub _pad2: f32,
+    pub x_center: f32,
+    pub visible: u32,
+}
+
+/// Maximum number of depth levels that can be rendered.
+pub const MAX_DEPTH_LEVELS: usize = 512;

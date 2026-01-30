@@ -25,6 +25,7 @@ pub struct Config {
     pub api: ApiConfig,
     pub ta: TaConfig,
     pub sync: SyncConfig,
+    pub market_data: MarketDataConfig,
 }
 
 impl Default for Config {
@@ -34,6 +35,7 @@ impl Default for Config {
             api: ApiConfig::default(),
             ta: TaConfig::default(),
             sync: SyncConfig::default(),
+            market_data: MarketDataConfig::default(),
         }
     }
 }
@@ -331,6 +333,34 @@ impl Default for TaDisplayConfig {
             show_active_trends: true,
             show_hit_trends: true,
             show_broken_trends: false,
+        }
+    }
+}
+
+/// Market data configuration for trades and depth.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct MarketDataConfig {
+    /// Subscribe to live trade data.
+    pub subscribe_trades: bool,
+    /// Subscribe to live depth data.
+    pub subscribe_depth: bool,
+    /// Number of depth levels to subscribe to.
+    pub depth_levels: u32,
+    /// Show volume profile on startup.
+    pub show_volume_profile: bool,
+    /// Show depth heatmap on startup.
+    pub show_depth_heatmap: bool,
+}
+
+impl Default for MarketDataConfig {
+    fn default() -> Self {
+        Self {
+            subscribe_trades: true,
+            subscribe_depth: true,
+            depth_levels: 20,
+            show_volume_profile: false,
+            show_depth_heatmap: false,
         }
     }
 }

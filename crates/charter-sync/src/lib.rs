@@ -16,7 +16,7 @@ use std::sync::Arc;
 use std::time::Instant;
 use tokio::sync::mpsc;
 
-pub use db::CandleDb;
+pub use db::{CandleDb, DepthLevel, TradeRecord};
 pub use fetcher::{FetchBatch, HistoricalFetcher};
 
 /// Sync state for the UI.
@@ -170,11 +170,9 @@ async fn sync_symbol(
     let existing_count = db.get_candle_count(&symbol)?;
     drop(db); // Close the connection
 
-    log::info!(
-        "Starting multi-timeframe sync for {}: existing={} candles, cutoff={}",
-        symbol,
-        existing_count,
-        cutoff_ms
+    eprintln!(
+        "[sync] starting {} sync: {} existing candles, {} days history",
+        symbol, existing_count, sync_days
     );
 
     let start_time = Instant::now();
@@ -183,9 +181,14 @@ async fn sync_symbol(
     // Estimate total based on sync_days (1 candle per minute as base)
     let estimated_total: u64 = (sync_days as u64) * 24 * 60;
 
-    // Track where we've synced to for each timeframe
-    // We start with the current time and work backwards
-    let mut oldest_synced_timestamp = now_ms;
+    // Track where we've synced to for each timeframe.
+    // Initialize from existing DB data rather than now_ms so we don't skip
+    // ranges that a previous partial sync already covered.
+    let mut oldest_synced_timestamp = {
+        let db = CandleDb::open(&db_path)?;
+        db.get_oldest_timestamp_any(&symbol)?
+            .unwrap_or(now_ms)
+    };
 
     // Timeframes to sync, from finest to coarsest
     let timeframes = SyncTimeframe::all();
@@ -209,6 +212,7 @@ async fn sync_symbol(
             newest_tf,
             oldest_synced_timestamp
         );
+        eprintln!("[sync] {} timeframe: checking...", tf.mexc_interval());
 
         // Phase 1: Forward fill - get recent data up to now
         if let Some(newest) = newest_tf {
@@ -266,8 +270,15 @@ async fn sync_symbol(
 
             total_fetched += fetched;
 
-            // Update the oldest synced timestamp
-            if let Some(oldest) = new_oldest {
+            // Update the oldest synced timestamp from what was actually fetched,
+            // falling back to whatever is in the DB (covers partial fetches that
+            // errored partway through).
+            let effective_oldest = new_oldest.or_else(|| {
+                CandleDb::open(&db_path)
+                    .ok()
+                    .and_then(|db| db.get_oldest_timestamp(&symbol, tf).ok().flatten())
+            });
+            if let Some(oldest) = effective_oldest {
                 if oldest < oldest_synced_timestamp {
                     oldest_synced_timestamp = oldest;
                     log::info!(
@@ -279,6 +290,121 @@ async fn sync_symbol(
             }
         }
 
+        // Phase 3: Gap fill — find and fill internal gaps in existing data.
+        // This catches gaps from previous partial syncs or API outages.
+        {
+            let db = CandleDb::open(&db_path)?;
+            let gaps = db.find_gaps(&symbol, tf)?;
+            drop(db);
+
+            if !gaps.is_empty() {
+                eprintln!(
+                    "[sync] {} gap fill: {} gaps to fill",
+                    tf.mexc_interval(),
+                    gaps.len()
+                );
+
+                let gap_count = gaps.len();
+                for (i, (gap_start, gap_end)) in gaps.iter().enumerate() {
+                    if cancel_flag.load(Ordering::Relaxed) {
+                        break;
+                    }
+
+                    let fetched = sync_gap_range(
+                        &db_path,
+                        &symbol,
+                        tf,
+                        *gap_start,
+                        *gap_end,
+                        batch_delay_ms,
+                        &cancel_flag,
+                    )
+                    .await?;
+                    total_fetched += fetched;
+
+                    if fetched > 0 && (i + 1) % 10 == 0 {
+                        eprintln!(
+                            "[sync] {} gap fill: {}/{} gaps done ({} candles fetched so far)",
+                            tf.mexc_interval(),
+                            i + 1,
+                            gap_count,
+                            total_fetched
+                        );
+                    }
+                }
+                eprintln!(
+                    "[sync] {} gap fill complete: {} total candles fetched",
+                    tf.mexc_interval(),
+                    total_fetched
+                );
+            }
+        }
+
+        // Phase 4: Validate + refetch loop.
+        // Check OHLC consistency and close/open continuity. Invalid candles are
+        // deleted, resulting gaps are re-fetched, then re-validated.
+        const MAX_VALIDATION_ROUNDS: u32 = 3;
+        for round in 0..MAX_VALIDATION_ROUNDS {
+            if cancel_flag.load(Ordering::Relaxed) {
+                break;
+            }
+
+            let db = CandleDb::open(&db_path)?;
+            let (valid, deleted) = db.validate_candles(&symbol, tf, 0.001)?;
+            if deleted > 0 {
+                eprintln!(
+                    "[sync] {} validation round {}: {} valid, {} deleted",
+                    tf.mexc_interval(),
+                    round + 1,
+                    valid,
+                    deleted
+                );
+            }
+            log::info!(
+                "{} validation round {}: {} valid, {} deleted",
+                tf.mexc_interval(),
+                round + 1,
+                valid,
+                deleted
+            );
+
+            if deleted == 0 {
+                break;
+            }
+
+            // Find gaps left by deleted candles and re-fetch them
+            let gaps = db.find_gaps(&symbol, tf)?;
+            drop(db);
+
+            if gaps.is_empty() {
+                break;
+            }
+
+            eprintln!(
+                "[sync] {} re-fetching {} gaps after validation",
+                tf.mexc_interval(),
+                gaps.len()
+            );
+
+            for (gap_start, gap_end) in &gaps {
+                if cancel_flag.load(Ordering::Relaxed) {
+                    break;
+                }
+
+                let fetched = sync_gap_range(
+                    &db_path,
+                    &symbol,
+                    tf,
+                    *gap_start,
+                    *gap_end,
+                    batch_delay_ms,
+                    &cancel_flag,
+                )
+                .await?;
+                total_fetched += fetched;
+            }
+        }
+
         // If we've reached the cutoff, no need to continue with coarser timeframes
         if oldest_synced_timestamp <= cutoff_ms {
             log::info!("Reached cutoff timestamp, stopping sync");
@@ -286,13 +412,31 @@ async fn sync_symbol(
         }
     }
 
+    // Final validation pass across all timeframes (no re-fetch, just clean up)
+    {
+        let db = CandleDb::open(&db_path)?;
+        let mut total_valid: u64 = 0;
+        let mut total_deleted: u64 = 0;
+        for &tf in SyncTimeframe::all() {
+            let (valid, deleted) = db.validate_candles(&symbol, tf, 0.001)?;
+            total_valid += valid;
+            total_deleted += deleted;
+        }
+        if total_valid > 0 || total_deleted > 0 {
+            log::info!(
+                "Final validation pass: {} valid, {} deleted",
+                total_valid,
+                total_deleted
+            );
+        }
+    }
+
     let db = CandleDb::open(&db_path)?;
     let final_count = db.get_candle_count(&symbol)?;
-    log::info!(
-        "Sync complete for {}: {} candles total ({} new)",
-        symbol,
-        final_count,
-        total_fetched
+    let elapsed = start_time.elapsed().as_secs_f32();
+    eprintln!(
+        "[sync] complete: {} candles total ({} new) in {:.1}s",
+        final_count, total_fetched, elapsed
     );
 
     Ok(final_count)
@@ -357,7 +501,7 @@ async fn sync_timeframe_forward(
                 }
             }
             Err(e) => {
-                log::error!("Error in forward fetch: {}", e);
+                log::error!("Forward fetch batch failed: {:#}", e);
                 break;
             }
         }
@@ -437,11 +581,117 @@ async fn sync_timeframe_backward(
                 }
             }
             Err(e) => {
-                log::error!("Error in backward fetch: {}", e);
+                log::error!("Backward fetch batch failed: {:#}", e);
                 break;
             }
         }
     }
 
     Ok((fetched_this_phase, oldest_reached))
+}
+
+/// Re-fetch a specific gap range for a timeframe.
+/// Uses the klines API directly with explicit start/end times.
+async fn sync_gap_range(
+    db_path: &PathBuf,
+    symbol: &str,
+    timeframe: SyncTimeframe,
+    gap_start_ms: i64,
+    gap_end_ms: i64,
+    batch_delay_ms: u64,
+    cancel_flag: &Arc<AtomicBool>,
+) -> Result<u64> {
+    use mexc_api::{MexcClient, SpotApi};
+
+    let client = MexcClient::public()
+        .map_err(|e| anyhow::anyhow!("Failed to create MEXC client: {}", e))?;
+    let api = SpotApi::new(client);
+    let interval = HistoricalFetcher::kline_interval(timeframe);
+    let candle_duration_ms = timeframe.millis();
+    let mut current_start = gap_start_ms;
+    let mut fetched_total: u64 = 0;
+    let mut consecutive_errors = 0u32;
+    const MAX_RETRIES: u32 = 3;
+
+    while current_start <= gap_end_ms {
+        if cancel_flag.load(Ordering::Relaxed) {
+            break;
+        }
+
+        let end_time = (current_start + 1000 * candle_duration_ms).min(gap_end_ms + candle_duration_ms);
+
+        match api
+            .market()
+            .klines(symbol, interval, Some(current_start), Some(end_time), Some(1000))
+            .await
+        {
+            Ok(klines) => {
+                consecutive_errors = 0;
+
+                if klines.is_empty() {
+                    log::debug!(
+                        "Gap fill: empty response for [{}, {}]",
+                        current_start,
+                        end_time
+                    );
+                    // Skip past this range
+                    current_start = end_time;
+                    continue;
+                }
+
+                let candles: Vec<charter_core::Candle> = klines
+                    .iter()
+                    .map(|k| charter_core::Candle {
+                        timestamp: k.open_time as f64 / 1000.0,
+                        open: k.open.0.try_into().unwrap_or(0.0),
+                        high: k.high.0.try_into().unwrap_or(0.0),
+                        low: k.low.0.try_into().unwrap_or(0.0),
+                        close: k.close.0.try_into().unwrap_or(0.0),
+                        volume: k.volume.0.try_into().unwrap_or(0.0),
+                    })
+                    .collect();
+
+                let newest_ts = klines.iter().map(|k| k.open_time).max().unwrap_or(end_time);
+
+                let db = CandleDb::open(db_path)?;
+                let count = db.insert_candles(symbol, timeframe, &candles)?;
+                drop(db);
+
+                fetched_total += count as u64;
+                current_start = newest_ts + candle_duration_ms;
+
+                if current_start > gap_end_ms {
+                    break;
+                }
+
+                if batch_delay_ms > 0 {
+                    tokio::time::sleep(std::time::Duration::from_millis(batch_delay_ms)).await;
+                }
+            }
+            Err(e) => {
+                consecutive_errors += 1;
+                if consecutive_errors >= MAX_RETRIES {
+                    log::warn!(
+                        "Gap fill [{} -> {}] failed after {} retries: {:#}",
+                        gap_start_ms,
+                        gap_end_ms,
+                        MAX_RETRIES,
+                        e
+                    );
+                    break;
+                }
+                let backoff_ms = 1000 * 2u64.pow(consecutive_errors - 1);
+                log::warn!(
+                    "Gap fill error (attempt {}/{}), retrying in {}ms: {:#}",
+                    consecutive_errors,
+                    MAX_RETRIES,
+                    backoff_ms,
+                    e
+                );
+                tokio::time::sleep(std::time::Duration::from_millis(backoff_ms)).await;
+            }
+        }
+    }
+
+    Ok(fetched_total)
 }

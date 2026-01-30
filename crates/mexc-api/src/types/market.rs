@@ -123,8 +123,8 @@ pub struct Trade {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct AggTrade {
     /// Aggregate trade ID.
-    #[serde(rename = "a")]
-    pub agg_id: i64,
+    #[serde(rename = "a", default)]
+    pub agg_id: Option<i64>,
     /// Price.
     #[serde(rename = "p")]
     pub price: StringDecimal,
@@ -132,11 +132,11 @@ pub struct AggTrade {
     #[serde(rename = "q")]
     pub qty: StringDecimal,
     /// First trade ID.
-    #[serde(rename = "f")]
-    pub first_id: i64,
+    #[serde(rename = "f", default)]
+    pub first_id: Option<i64>,
     /// Last trade ID.
-    #[serde(rename = "l")]
-    pub last_id: i64,
+    #[serde(rename = "l", default)]
+    pub last_id: Option<i64>,
     /// Timestamp.
     #[serde(rename = "T")]
     pub time: i64,
@@ -144,7 +144,7 @@ pub struct AggTrade {
     #[serde(rename = "m")]
     pub is_buyer_maker: bool,
     /// Is best price match?
-    #[serde(rename = "M")]
+    #[serde(rename = "M", default)]
     pub is_best_match: bool,
 }
 

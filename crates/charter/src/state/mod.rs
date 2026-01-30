@@ -18,6 +18,7 @@ pub mod ui;
 pub mod view;
 
 pub use document::DocumentState;
+pub use document::MarketDataDisplaySettings;
 pub use document::TaDisplaySettings;
 pub use graphics::GraphicsState;
 pub use interaction::InteractionState;
@@ -53,7 +54,7 @@ use crate::ui::{
 };
 use charter_config::Config as AppConfig;
 use charter_core::{Candle, Timeframe, aggregate_candles};
-use charter_data::{LiveDataEvent, LiveDataManager, MexcSource};
+use charter_data::{LiveDataEvent, LiveDataManager, MexcSource, TradeBatchAccumulator};
 use charter_indicators::{Indicator, Macd, MacdConfig};
 use charter_render::{
     CANDLE_SPACING, ChartRenderer, DrawingPipeline, DrawingRenderParams, INDICES_PER_CANDLE,
@@ -143,6 +144,16 @@ pub enum BackgroundMessage {
     SyncComplete { total_candles: u64 },
     /// Sync encountered an error.
     SyncError(String),
+    /// Batch of trades received from WebSocket.
+    TradesBatchReceived {
+        trades: Vec<charter_data::TradeData>,
+    },
+    /// Depth snapshot received from WebSocket.
+    DepthSnapshotReceived {
+        bids: Vec<(f32, f32)>,
+        asks: Vec<(f32, f32)>,
+        timestamp: i64,
+    },
 }
 
 /// Main application state, composing all sub-states.
@@ -222,6 +233,14 @@ pub struct AppState {
     pub drawing_params_buffer: wgpu::Buffer,
     /// Bind group for drawing pipeline.
     pub drawing_bind_group: wgpu::BindGroup,
+
+    // --- Market data ---
+    /// CPU-side market data state (volume profile, depth heatmap).
+    pub market_data: crate::market_data::MarketDataState,
+    /// GPU buffers for market data rendering.
+    pub market_data_gpu: Option<crate::market_data::MarketDataGpuBuffers>,
+    /// Trade batch accumulator for efficient DB inserts.
+    pub trade_accumulator: TradeBatchAccumulator,
 
     // --- View state tracking ---
     /// Whether we've performed the initial view fit.
@@ -374,7 +393,34 @@ impl AppState {
                 },
             ));
 
-            // First, try to load from DuckDB if it has data
+            // Always fetch fresh 1m candles from API so recent data is accurate.
+            // Then merge with DB data (DB has history, API has freshest prices).
+            let source = MexcSource::new(&symbol);
+            let fresh_candles = match source.load().await {
+                Ok(candles) => {
+                    // Write fresh candles into DuckDB to overwrite stale data
+                    if let Ok(db) = charter_sync::CandleDb::open(&db_path) {
+                        let count = db
+                            .insert_candles(
+                                &symbol,
+                                charter_sync::db::SyncTimeframe::Min1,
+                                &candles,
+                            )
+                            .unwrap_or(0);
+                        eprintln!(
+                            "[sync] wrote {} fresh 1m candles to DB",
+                            count
+                        );
+                    }
+                    Some(candles)
+                }
+                Err(e) => {
+                    eprintln!("Failed to fetch fresh candles: {}", e);
+                    None
+                }
+            };
+
+            // Load full history from DB (now includes the fresh data we just wrote)
             let db_candles = if let Ok(db) = charter_sync::CandleDb::open(&db_path) {
                 match db.load_candles(&symbol) {
                     Ok(candles) if !candles.is_empty() => {
@@ -391,22 +437,15 @@ impl AppState {
                 None
             };
 
-            // If we have DB data, use it; otherwise fetch from API
+            // Prefer DB (full history + fresh data), fall back to API-only
             if let Some(candles) = db_candles {
                 let _ = sender.send(BackgroundMessage::DataLoaded(candles));
+            } else if let Some(candles) = fresh_candles {
+                let _ = sender.send(BackgroundMessage::DataLoaded(candles));
             } else {
-                let source = MexcSource::new(&symbol);
-                match source.load().await {
-                    Ok(base_candles) => {
-                        let _ = sender.send(BackgroundMessage::DataLoaded(base_candles));
-                    }
-                    Err(e) => {
-                        let _ = sender.send(BackgroundMessage::Error(format!(
-                            "Failed to load data: {}",
-                            e
-                        )));
-                    }
-                }
+                let _ = sender.send(BackgroundMessage::Error(
+                    "Failed to load data from API and DB".to_string(),
+                ));
             }
         });
 
@@ -441,6 +480,8 @@ impl AppState {
         document.timeframes = timeframes;
         document.ta_data = ta_data;
         document.ta_settings = TaDisplaySettings::from_config(&app_config.ta.display);
+        document.market_data_settings =
+            document::MarketDataDisplaySettings::from_config(&app_config.market_data);
 
         // Create interaction state
         let mut interaction = InteractionState::new(default_symbol.clone());
@@ -513,6 +554,9 @@ impl AppState {
             drawing_anchor_buffer,
             drawing_params_buffer,
             drawing_bind_group,
+            market_data: crate::market_data::MarketDataState::default(),
+            market_data_gpu: None,
+            trade_accumulator: TradeBatchAccumulator::default(),
             has_initial_view: false,
         })
     }
@@ -803,6 +847,28 @@ impl AppState {
                     self.sync_enabled = false;
                     updated = true;
                 }
+                BackgroundMessage::TradesBatchReceived { trades } => {
+                    if !self.interaction.loading_state.is_loading() {
+                        self.market_data.process_trades(&trades);
+                        if self.document.market_data_settings.show_volume_profile {
+                            self.update_market_data_buffers();
+                        }
+                        updated = true;
+                    }
+                }
+                BackgroundMessage::DepthSnapshotReceived {
+                    bids,
+                    asks,
+                    timestamp,
+                } => {
+                    if !self.interaction.loading_state.is_loading() {
+                        self.market_data.process_depth(&bids, &asks, timestamp);
+                        if self.document.market_data_settings.show_depth_heatmap {
+                            self.update_market_data_buffers();
+                        }
+                        updated = true;
+                    }
+                }
             }
         }
 
@@ -875,6 +941,11 @@ impl AppState {
             self.graphics
                 .renderer
                 .update_current_price_line(&self.graphics.queue);
+            if self.document.market_data_settings.show_volume_profile
+                || self.document.market_data_settings.show_depth_heatmap
+            {
+                self.update_market_data_buffers();
+            }
         }
     }
 
@@ -1058,6 +1129,8 @@ impl AppState {
                             x_world_per_pixel,
                             y_world_per_pixel,
                         ) {
+                            // Mark mouse as pressed so cursor_moved can dispatch drag events
+                            self.input.mouse_pressed = true;
                             self.window.request_redraw();
                             // Keep Select mode if we selected something, otherwise restore
                             if self.drawing.selected.is_none() && !tool_active {
@@ -1655,6 +1728,25 @@ impl AppState {
             let sender = self.bg_sender.clone();
             let symbol = self.interaction.current_symbol.clone();
 
+            // Spawn historical trade fetch (REST API) for volume profile
+            {
+                let sender = sender.clone();
+                let symbol = symbol.clone();
+                runtime.spawn(async move {
+                    let source = MexcSource::new(&symbol);
+                    match source.fetch_recent_trades(30).await {
+                        Ok(trades) => {
+                            if !trades.is_empty() {
+                                let _ = sender.send(BackgroundMessage::TradesBatchReceived { trades });
+                            }
+                        }
+                        Err(e) => {
+                            eprintln!("[market-data] historical trade fetch error: {}", e);
+                        }
+                    }
+                });
+            }
+
             runtime.spawn(async move {
                 let mut manager = LiveDataManager::new();
                 match manager.subscribe(&symbol).await {
@@ -1674,6 +1766,24 @@ impl AppState {
                                 }
                                 LiveDataEvent::Disconnected => {
                                     let _ = sender.send(BackgroundMessage::ConnectionStatus(false));
+                                }
+                                LiveDataEvent::TradesBatch { trades, .. } => {
+                                    let _ = sender.send(
+                                        BackgroundMessage::TradesBatchReceived { trades },
+                                    );
+                                }
+                                LiveDataEvent::DepthSnapshot {
+                                    bids,
+                                    asks,
+                                    timestamp,
+                                } => {
+                                    let _ = sender.send(
+                                        BackgroundMessage::DepthSnapshotReceived {
+                                            bids,
+                                            asks,
+                                            timestamp,
+                                        },
+                                    );
                                 }
                                 LiveDataEvent::Error(e) => {
                                     eprintln!("Live data error: {}", e);
@@ -1953,12 +2063,13 @@ impl AppState {
             .trends
             .iter()
             .filter(|t| {
-                // Filter by state - show active and hit trends, optionally show broken
+                if !self.document.ta_settings.show_trends {
+                    return false;
+                }
                 match t.state {
-                    TrendState::Active | TrendState::Hit => {
-                        self.document.ta_settings.show_active_levels
-                    }
-                    TrendState::Broken => self.document.ta_settings.show_broken_levels,
+                    TrendState::Active => self.document.ta_settings.show_active_trends,
+                    TrendState::Hit => self.document.ta_settings.show_hit_trends,
+                    TrendState::Broken => self.document.ta_settings.show_broken_trends,
                 }
             })
             .take(MAX_TA_TRENDS)
@@ -2046,6 +2157,118 @@ impl AppState {
             0,
             bytemuck::cast_slice(&[ta_params]),
         );
+    }
+
+    // =========================================================================
+    // Market Data Methods
+    // =========================================================================
+
+    fn update_market_data_buffers(&mut self) {
+        // Ensure GPU buffers exist
+        if self.market_data_gpu.is_none() {
+            self.market_data_gpu = Some(crate::market_data::MarketDataGpuBuffers::new(
+                &self.graphics.device,
+                &self.graphics.renderer,
+            ));
+        }
+
+        let gpu = self.market_data_gpu.as_mut().unwrap();
+
+        // Update volume profile GPU data
+        if self.document.market_data_settings.show_volume_profile {
+            let chart_width = self.graphics.config.width as f32 - STATS_PANEL_WIDTH;
+            let chart_height =
+                self.graphics.config.height as f32 * (1.0 - VOLUME_HEIGHT_RATIO);
+            if chart_height > 1.0 && chart_width > 1.0 {
+                let aspect = chart_width / chart_height;
+                let (_, x_max) = self
+                    .graphics
+                    .renderer
+                    .main_camera
+                    .camera
+                    .visible_x_range(aspect);
+                let (y_min, y_max) = self
+                    .graphics
+                    .renderer
+                    .main_camera
+                    .camera
+                    .visible_y_range(aspect);
+
+                let (x_min, _) = self
+                    .graphics
+                    .renderer
+                    .main_camera
+                    .camera
+                    .visible_x_range(aspect);
+                let visible_x_width = x_max - x_min;
+
+                let candles = self
+                    .document
+                    .timeframes
+                    .get(self.document.current_timeframe)
+                    .map(|tf| &tf.candles[..])
+                    .unwrap_or(&[]);
+
+                let (buckets, params) =
+                    self.market_data
+                        .build_volume_profile_gpu(x_max, y_min, y_max, visible_x_width, candles);
+                gpu.vp_bucket_count = buckets.len() as u32;
+
+                if !buckets.is_empty() {
+                    self.graphics.queue.write_buffer(
+                        &gpu.vp_bucket_buffer,
+                        0,
+                        bytemuck::cast_slice(&buckets),
+                    );
+                }
+                self.graphics.queue.write_buffer(
+                    &gpu.vp_params_buffer,
+                    0,
+                    bytemuck::cast_slice(&[params]),
+                );
+            }
+        }
+
+        // Update depth heatmap GPU data
+        if self.document.market_data_settings.show_depth_heatmap {
+            let chart_width = self.graphics.config.width as f32 - STATS_PANEL_WIDTH;
+            let chart_height =
+                self.graphics.config.height as f32 * (1.0 - VOLUME_HEIGHT_RATIO);
+            if chart_height > 1.0 && chart_width > 1.0 {
+                let aspect = chart_width / chart_height;
+                let (x_min, x_right) = self
+                    .graphics
+                    .renderer
+                    .main_camera
+                    .camera
+                    .visible_x_range(aspect);
+                let (y_min, y_max) = self
+                    .graphics
+                    .renderer
+                    .main_camera
+                    .camera
+                    .visible_y_range(aspect);
+                let visible_x_width = x_right - x_min;
+
+                let (cells, params) =
+                    self.market_data
+                        .build_depth_heatmap_gpu(x_right, visible_x_width, y_min, y_max);
+                gpu.dh_cell_count = cells.len() as u32;
+
+                if !cells.is_empty() {
+                    self.graphics.queue.write_buffer(
+                        &gpu.dh_cell_buffer,
+                        0,
+                        bytemuck::cast_slice(&cells),
+                    );
+                }
+                self.graphics.queue.write_buffer(
+                    &gpu.dh_params_buffer,
+                    0,
+                    bytemuck::cast_slice(&[params]),
+                );
+            }
+        }
     }
 
     // =========================================================================
@@ -2744,6 +2967,7 @@ impl AppState {
         let should_toggle_sync = RefCell::new(false);
 
         let ta_settings = RefCell::new(self.document.ta_settings.clone());
+        let md_settings = RefCell::new(self.document.market_data_settings.clone());
         let symbol_picker_state = RefCell::new(self.ui.symbol_picker_state.clone());
 
         let ta_data = if self.interaction.replay.is_locked() {
@@ -2839,11 +3063,17 @@ impl AppState {
                     Some(&ta_data),
                     &ta_hovered,
                     screen_width,
+                    &md_settings.borrow(),
                 );
                 if ta_response.settings_changed
                     && let Some(new_settings) = ta_response.new_settings
                 {
                     *ta_settings.borrow_mut() = new_settings;
+                }
+                if ta_response.market_data_changed
+                    && let Some(new_md) = ta_response.new_market_data_settings
+                {
+                    *md_settings.borrow_mut() = new_md;
                 }
             }
 
@@ -2995,6 +3225,22 @@ impl AppState {
                     self.ensure_ta_computed();
                 }
                 self.update_ta_buffers();
+            }
+        }
+
+        // Update market data settings if changed
+        let new_md_settings = md_settings.into_inner();
+        let md_changed = new_md_settings.show_volume_profile
+            != self.document.market_data_settings.show_volume_profile
+            || new_md_settings.show_depth_heatmap
+                != self.document.market_data_settings.show_depth_heatmap;
+
+        if md_changed {
+            self.document.market_data_settings = new_md_settings;
+            if self.document.market_data_settings.show_volume_profile
+                || self.document.market_data_settings.show_depth_heatmap
+            {
+                self.update_market_data_buffers();
             }
         }
 
@@ -3226,6 +3472,20 @@ impl AppState {
                 render_pass.draw(0..6, 0..self.graphics.renderer.guideline_count);
             }
 
+            // Render depth heatmap (behind candles)
+            if self.document.market_data_settings.show_depth_heatmap {
+                if let Some(gpu) = &self.market_data_gpu {
+                    if gpu.dh_cell_count > 0 {
+                        self.graphics.renderer.depth_heatmap_pipeline.render(
+                            &mut render_pass,
+                            &self.graphics.renderer.main_camera.bind_group,
+                            &gpu.dh_bind_group,
+                            gpu.dh_cell_count,
+                        );
+                    }
+                }
+            }
+
             // Render candle chart
             render_pass.set_pipeline(&self.graphics.renderer.candle_pipeline.pipeline);
             render_pass.set_bind_group(0, &self.graphics.renderer.main_camera.bind_group, &[]);
@@ -3333,6 +3593,20 @@ impl AppState {
                         );
                         render_pass.set_bind_group(1, &tf.ta_bind_group, &[]);
                         render_pass.draw(0..6, 0..filtered_trend_count);
+                    }
+                }
+            }
+
+            // Render volume profile (overlay on right side)
+            if self.document.market_data_settings.show_volume_profile {
+                if let Some(gpu) = &self.market_data_gpu {
+                    if gpu.vp_bucket_count > 0 {
+                        self.graphics.renderer.volume_profile_pipeline.render(
+                            &mut render_pass,
+                            &self.graphics.renderer.main_camera.bind_group,
+                            &gpu.vp_bind_group,
+                            gpu.vp_bucket_count,
+                        );
                     }
                 }
             }

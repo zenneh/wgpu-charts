@@ -144,10 +144,27 @@ pub struct PublicSpotKlineV3Api {
 // Placeholder types for other message types (not fully implemented)
 // These are needed for the oneof to compile
 
+/// Public deals (trades) data.
 #[derive(Clone, PartialEq, Message)]
 pub struct PublicDealsV3Api {
-    #[prost(bytes = "vec", tag = "1")]
-    pub data: Vec<u8>,
+    #[prost(message, repeated, tag = "1")]
+    pub deals: Vec<PublicDealV3>,
+    #[prost(string, tag = "2")]
+    pub event_type: String,
+}
+
+/// A single trade/deal entry.
+#[derive(Clone, PartialEq, Message)]
+pub struct PublicDealV3 {
+    #[prost(string, tag = "1")]
+    pub price: String,
+    #[prost(string, tag = "2")]
+    pub quantity: String,
+    /// 1 = buy, 2 = sell
+    #[prost(int32, tag = "3")]
+    pub trade_type: i32,
+    #[prost(int64, tag = "4")]
+    pub time: i64,
 }
 
 #[derive(Clone, PartialEq, Message)]
@@ -156,10 +173,26 @@ pub struct PublicIncreaseDepthsV3Api {
     pub data: Vec<u8>,
 }
 
+/// Public limit depth snapshot data.
 #[derive(Clone, PartialEq, Message)]
 pub struct PublicLimitDepthsV3Api {
-    #[prost(bytes = "vec", tag = "1")]
-    pub data: Vec<u8>,
+    #[prost(message, repeated, tag = "1")]
+    pub bids: Vec<DepthEntryV3>,
+    #[prost(message, repeated, tag = "2")]
+    pub asks: Vec<DepthEntryV3>,
+    #[prost(string, tag = "3")]
+    pub version: String,
+    #[prost(string, tag = "4")]
+    pub event_type: String,
+}
+
+/// A single depth level entry (price + quantity).
+#[derive(Clone, PartialEq, Message)]
+pub struct DepthEntryV3 {
+    #[prost(string, tag = "1")]
+    pub price: String,
+    #[prost(string, tag = "2")]
+    pub quantity: String,
 }
 
 #[derive(Clone, PartialEq, Message)]

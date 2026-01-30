@@ -35,7 +35,11 @@
       "Bash(direnv reload:*)",
       "Bash(duckdb:*)",
       "Bash(target/release/charter-backtest:*)",
-      "Bash(git stash:*)"
+      "Bash(git stash:*)",
+      "WebFetch(domain:crates.io)",
+      "Bash(gh api:*)",
+      "Bash(git checkout:*)",
+      "Bash(git merge:*)"
     ]
   }
 }

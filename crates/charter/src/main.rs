@@ -7,6 +7,7 @@ mod events;
 mod indicators;
 mod input;
 mod input_mode;
+mod market_data;
 mod replay;
 mod state;
 // mod state_legacy; // Migrated to new state module

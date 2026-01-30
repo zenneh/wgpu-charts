@@ -97,8 +97,39 @@ impl CandleDb {
 
             CREATE INDEX IF NOT EXISTS idx_candles_symbol_tf_ts
                 ON candles(symbol, timeframe, timestamp DESC);
+
+            CREATE TABLE IF NOT EXISTS trades (
+                symbol TEXT NOT NULL,
+                trade_id BIGINT NOT NULL,
+                timestamp BIGINT NOT NULL,
+                price REAL NOT NULL,
+                quantity REAL NOT NULL,
+                is_buyer_maker BOOLEAN NOT NULL,
+                PRIMARY KEY (symbol, trade_id)
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_trades_symbol_ts
+                ON trades(symbol, timestamp DESC);
+
+            CREATE TABLE IF NOT EXISTS depth_snapshots (
+                symbol TEXT NOT NULL,
+                snapshot_id BIGINT NOT NULL,
+                side TEXT NOT NULL,
+                price REAL NOT NULL,
+                quantity REAL NOT NULL,
+                PRIMARY KEY (symbol, snapshot_id, side, price)
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_depth_symbol_snapshot
+                ON depth_snapshots(symbol, snapshot_id DESC);
             "#,
         )?;
+
+        // Add validated column to existing databases (safe to run repeatedly)
+        self.conn.execute_batch(
+            "ALTER TABLE candles ADD COLUMN IF NOT EXISTS validated BOOLEAN DEFAULT FALSE;",
+        )?;
+
         Ok(())
     }
 
@@ -116,8 +147,8 @@ impl CandleDb {
         let tf_minutes = timeframe.minutes();
         let mut stmt = self.conn.prepare(
             r#"
-            INSERT OR REPLACE INTO candles (symbol, timeframe, timestamp, open, high, low, close, volume)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            INSERT OR REPLACE INTO candles (symbol, timeframe, timestamp, open, high, low, close, volume, validated)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, FALSE)
             "#,
         )?;
 
@@ -390,6 +421,344 @@ impl CandleDb {
     }
 }
 
+// -- Candle validation methods --
+
+impl CandleDb {
+    /// Validate candles for a symbol+timeframe. Returns (valid_count, deleted_count).
+    ///
+    /// Checks:
+    ///   1. OHLC consistency (high >= open/close, low <= open/close, all > 0, finite)
+    ///   2. Close/open continuity (prev.close ≈ next.open within tolerance)
+    ///
+    /// Invalid candles are deleted. Valid unvalidated candles are marked validated=true.
+    pub fn validate_candles(
+        &self,
+        symbol: &str,
+        timeframe: SyncTimeframe,
+        tolerance_pct: f64,
+    ) -> Result<(u64, u64)> {
+        let tf = timeframe.minutes();
+        let mut total_deleted: u64 = 0;
+
+        // Step 1: Delete OHLC-inconsistent candles
+        let ohlc_deleted = self.conn.execute(
+            r#"
+            DELETE FROM candles
+            WHERE symbol = ? AND timeframe = ? AND validated = FALSE
+              AND (
+                high < open OR high < close OR
+                low > open OR low > close OR
+                high < low OR
+                open <= 0 OR high <= 0 OR low <= 0 OR close <= 0 OR
+                volume < 0 OR
+                open != open OR high != high OR low != low OR close != close
+              )
+            "#,
+            params![symbol, tf],
+        )? as u64;
+        total_deleted += ohlc_deleted;
+
+        // Step 2: Detect continuity breaks using LAG window function.
+        // We scan ALL candles (not just unvalidated) to catch breaks at
+        // boundaries between old and newly-fetched data. Only candles that are
+        // part of a break AND still unvalidated get deleted.
+        let mut stmt = self.conn.prepare(
+            r#"
+            WITH ordered AS (
+                SELECT timestamp,
+                       open,
+                       validated,
+                       LAG(close) OVER (ORDER BY timestamp ASC) AS prev_close,
+                       LAG(timestamp) OVER (ORDER BY timestamp ASC) AS prev_timestamp,
+                       LAG(validated) OVER (ORDER BY timestamp ASC) AS prev_validated
+                FROM candles
+                WHERE symbol = ? AND timeframe = ?
+            )
+            SELECT timestamp, prev_timestamp, validated, prev_validated FROM ordered
+            WHERE prev_close IS NOT NULL
+              AND ABS(open - prev_close) / GREATEST(prev_close, 0.0001) > ?
+            "#,
+        )?;
+
+        let bad_pairs: Vec<(i64, i64, bool, bool)> = stmt
+            .query_map(params![symbol, tf, tolerance_pct], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, bool>(2)?,
+                    row.get::<_, bool>(3)?,
+                ))
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+
+        if !bad_pairs.is_empty() {
+            // Collect timestamps to delete: for each break, delete candles that
+            // are unvalidated (newly fetched). If both sides are validated, delete
+            // both so the re-fetch can resolve which was wrong.
+            let mut timestamps_to_delete: Vec<i64> = Vec::new();
+            for (ts, prev_ts, validated, prev_validated) in &bad_pairs {
+                if !validated || !prev_validated {
+                    // At least one side is new — delete the unvalidated side(s)
+                    if !validated {
+                        timestamps_to_delete.push(*ts);
+                    }
+                    if !prev_validated {
+                        timestamps_to_delete.push(*prev_ts);
+                    }
+                } else {
+                    // Both validated — delete both to let re-fetch resolve
+                    timestamps_to_delete.push(*ts);
+                    timestamps_to_delete.push(*prev_ts);
+                }
+            }
+            timestamps_to_delete.sort();
+            timestamps_to_delete.dedup();
+
+            // Delete in batches using parameterized IN clause
+            for chunk in timestamps_to_delete.chunks(500) {
+                let placeholders: String = chunk.iter().map(|_| "?").collect::<Vec<_>>().join(", ");
+                let sql = format!(
+                    "DELETE FROM candles WHERE symbol = ? AND timeframe = ? AND timestamp IN ({})",
+                    placeholders
+                );
+                let mut stmt = self.conn.prepare(&sql)?;
+
+                let mut param_values: Vec<Box<dyn duckdb::ToSql>> = Vec::new();
+                param_values.push(Box::new(symbol.to_string()));
+                param_values.push(Box::new(tf));
+                for ts in chunk {
+                    param_values.push(Box::new(*ts));
+                }
+                let param_refs: Vec<&dyn duckdb::ToSql> =
+                    param_values.iter().map(|p| p.as_ref()).collect();
+
+                let deleted = stmt.execute(param_refs.as_slice())? as u64;
+                total_deleted += deleted;
+            }
+        }
+
+        // Step 3: Mark remaining unvalidated candles as valid
+        let valid_count = self.conn.execute(
+            "UPDATE candles SET validated = TRUE WHERE symbol = ? AND timeframe = ? AND validated = FALSE",
+            params![symbol, tf],
+        )? as u64;
+
+        Ok((valid_count, total_deleted))
+    }
+
+    /// Count unvalidated candles for a symbol+timeframe.
+    pub fn count_unvalidated(&self, symbol: &str, timeframe: SyncTimeframe) -> Result<u64> {
+        let mut stmt = self.conn.prepare(
+            "SELECT COUNT(*) FROM candles WHERE symbol = ? AND timeframe = ? AND validated = FALSE",
+        )?;
+        let count: u64 = stmt.query_row(params![symbol, timeframe.minutes()], |row| row.get(0))?;
+        Ok(count)
+    }
+
+    /// Reset validation status for candles in a time range (used after re-sync).
+    pub fn reset_validation(
+        &self,
+        symbol: &str,
+        timeframe: SyncTimeframe,
+        start_ms: i64,
+        end_ms: i64,
+    ) -> Result<u64> {
+        let count = self.conn.execute(
+            "UPDATE candles SET validated = FALSE WHERE symbol = ? AND timeframe = ? AND timestamp >= ? AND timestamp <= ?",
+            params![symbol, timeframe.minutes(), start_ms, end_ms],
+        )? as u64;
+        Ok(count)
+    }
+}
+
+/// A trade record for database storage.
+#[derive(Debug, Clone)]
+pub struct TradeRecord {
+    pub trade_id: i64,
+    pub timestamp_ms: i64,
+    pub price: f64,
+    pub quantity: f64,
+    pub is_buyer_maker: bool,
+}
+
+/// A depth level (price + quantity).
+#[derive(Debug, Clone)]
+pub struct DepthLevel {
+    pub price: f64,
+    pub quantity: f64,
+}
+
+impl CandleDb {
+    /// Insert a batch of trades into the database.
+    pub fn insert_trades_batch(&self, symbol: &str, trades: &[TradeRecord]) -> Result<usize> {
+        if trades.is_empty() {
+            return Ok(0);
+        }
+
+        let mut stmt = self.conn.prepare(
+            "INSERT OR REPLACE INTO trades (symbol, trade_id, timestamp, price, quantity, is_buyer_maker)
+             VALUES (?, ?, ?, ?, ?, ?)",
+        )?;
+
+        let mut count = 0;
+        for trade in trades {
+            stmt.execute(params![
+                symbol,
+                trade.trade_id,
+                trade.timestamp_ms,
+                trade.price,
+                trade.quantity,
+                trade.is_buyer_maker,
+            ])?;
+            count += 1;
+        }
+
+        Ok(count)
+    }
+
+    /// Insert a depth snapshot into the database.
+    pub fn insert_depth_snapshot(
+        &self,
+        symbol: &str,
+        snapshot_id: i64,
+        bids: &[(f64, f64)],
+        asks: &[(f64, f64)],
+    ) -> Result<usize> {
+        let mut stmt = self.conn.prepare(
+            "INSERT OR REPLACE INTO depth_snapshots (symbol, snapshot_id, side, price, quantity)
+             VALUES (?, ?, ?, ?, ?)",
+        )?;
+
+        let mut count = 0;
+        for (price, qty) in bids {
+            stmt.execute(params![symbol, snapshot_id, "bid", price, qty])?;
+            count += 1;
+        }
+        for (price, qty) in asks {
+            stmt.execute(params![symbol, snapshot_id, "ask", price, qty])?;
+            count += 1;
+        }
+
+        Ok(count)
+    }
+
+    /// Load trades within a time range.
+    pub fn load_trades_range(
+        &self,
+        symbol: &str,
+        start_ms: i64,
+        end_ms: i64,
+    ) -> Result<Vec<TradeRecord>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT trade_id, timestamp, price, quantity, is_buyer_maker
+             FROM trades
+             WHERE symbol = ? AND timestamp >= ? AND timestamp <= ?
+             ORDER BY timestamp ASC",
+        )?;
+
+        let trades: Vec<TradeRecord> = stmt
+            .query_map(params![symbol, start_ms, end_ms], |row| {
+                Ok(TradeRecord {
+                    trade_id: row.get(0)?,
+                    timestamp_ms: row.get(1)?,
+                    price: row.get(2)?,
+                    quantity: row.get(3)?,
+                    is_buyer_maker: row.get(4)?,
+                })
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+
+        Ok(trades)
+    }
+
+    /// Load depth snapshots within a time range.
+    /// Returns Vec of (snapshot_id, bids, asks).
+    pub fn load_depth_snapshots_range(
+        &self,
+        symbol: &str,
+        start_ms: i64,
+        end_ms: i64,
+    ) -> Result<Vec<(i64, Vec<DepthLevel>, Vec<DepthLevel>)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT snapshot_id, side, price, quantity
+             FROM depth_snapshots
+             WHERE symbol = ? AND snapshot_id >= ? AND snapshot_id <= ?
+             ORDER BY snapshot_id ASC, side ASC, price ASC",
+        )?;
+
+        let rows: Vec<(i64, String, f64, f64)> = stmt
+            .query_map(params![symbol, start_ms, end_ms], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, f64>(2)?,
+                    row.get::<_, f64>(3)?,
+                ))
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+
+        // Group by snapshot_id
+        let mut result: Vec<(i64, Vec<DepthLevel>, Vec<DepthLevel>)> = Vec::new();
+        let mut current_id: Option<i64> = None;
+        let mut current_bids: Vec<DepthLevel> = Vec::new();
+        let mut current_asks: Vec<DepthLevel> = Vec::new();
+
+        for (sid, side, price, quantity) in rows {
+            if current_id != Some(sid) {
+                if let Some(id) = current_id {
+                    result.push((
+                        id,
+                        std::mem::take(&mut current_bids),
+                        std::mem::take(&mut current_asks),
+                    ));
+                }
+                current_id = Some(sid);
+            }
+            let level = DepthLevel { price, quantity };
+            if side == "bid" {
+                current_bids.push(level);
+            } else {
+                current_asks.push(level);
+            }
+        }
+        if let Some(id) = current_id {
+            result.push((id, current_bids, current_asks));
+        }
+
+        Ok(result)
+    }
+
+    /// Get the newest trade timestamp for a symbol.
+    pub fn get_newest_trade_timestamp(&self, symbol: &str) -> Result<Option<i64>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT MAX(timestamp) FROM trades WHERE symbol = ?")?;
+        let result: Option<i64> = stmt.query_row([symbol], |row| row.get(0)).ok();
+        Ok(result)
+    }
+
+    /// Purge old trade and depth data beyond retention cutoffs.
+    /// Returns (trades_deleted, depth_deleted).
+    pub fn purge_old_data(
+        &self,
+        symbol: &str,
+        trades_cutoff_ms: i64,
+        depth_cutoff_ms: i64,
+    ) -> Result<(u64, u64)> {
+        let trades_deleted = self.conn.execute(
+            "DELETE FROM trades WHERE symbol = ? AND timestamp < ?",
+            params![symbol, trades_cutoff_ms],
+        )? as u64;
+
+        let depth_deleted = self.conn.execute(
+            "DELETE FROM depth_snapshots WHERE symbol = ? AND snapshot_id < ?",
+            params![symbol, depth_cutoff_ms],
+        )? as u64;
+
+        Ok((trades_deleted, depth_deleted))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -489,5 +858,102 @@ mod tests {
         let loaded = db.load_candles("TEST").unwrap();
         assert_eq!(loaded.len(), 3);
         assert!((loaded[0].open - 100.0).abs() < 0.01); // 1m, not 5m's 98.0
+    }
+
+    #[test]
+    fn test_validate_valid_candles() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.duckdb");
+        let db = CandleDb::open(&db_path).unwrap();
+
+        let base_ts = 1700000000.0;
+        // 3 consecutive valid candles with matching close→open
+        let candles = vec![
+            Candle::new(base_ts, 100.0, 105.0, 99.0, 104.0, 1000.0),
+            Candle::new(base_ts + 60.0, 104.0, 108.0, 103.0, 107.0, 1500.0),
+            Candle::new(base_ts + 120.0, 107.0, 110.0, 106.0, 109.0, 2000.0),
+        ];
+        db.insert_candles("TEST", SyncTimeframe::Min1, &candles).unwrap();
+
+        let (valid, deleted) = db.validate_candles("TEST", SyncTimeframe::Min1, 0.001).unwrap();
+        assert_eq!(valid, 3);
+        assert_eq!(deleted, 0);
+
+        // All should be marked validated now
+        let unvalidated = db.count_unvalidated("TEST", SyncTimeframe::Min1).unwrap();
+        assert_eq!(unvalidated, 0);
+    }
+
+    #[test]
+    fn test_validate_ohlc_inconsistent() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.duckdb");
+        let db = CandleDb::open(&db_path).unwrap();
+
+        let base_ts = 1700000000.0;
+        // Candle 2 is OHLC-invalid: high (103) < open (104).
+        // After it's deleted, candles 1 and 3 remain. Candle 3 open must match
+        // candle 1 close (104.0) within tolerance to avoid a continuity deletion.
+        let candles = vec![
+            Candle::new(base_ts, 100.0, 105.0, 99.0, 104.0, 1000.0),         // valid
+            Candle::new(base_ts + 60.0, 104.0, 103.0, 100.0, 102.0, 500.0),  // invalid: high < open
+            Candle::new(base_ts + 120.0, 104.0, 110.0, 103.0, 109.0, 2000.0), // valid, open ≈ prev close
+        ];
+        db.insert_candles("TEST", SyncTimeframe::Min1, &candles).unwrap();
+
+        let (valid, deleted) = db.validate_candles("TEST", SyncTimeframe::Min1, 0.001).unwrap();
+        assert_eq!(deleted, 1); // the OHLC-invalid candle
+        assert_eq!(valid, 2);   // remaining 2 are valid
+
+        let total = db.get_candle_count_for_timeframe("TEST", SyncTimeframe::Min1).unwrap();
+        assert_eq!(total, 2);
+    }
+
+    #[test]
+    fn test_validate_continuity_break() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.duckdb");
+        let db = CandleDb::open(&db_path).unwrap();
+
+        let base_ts = 1700000000.0;
+        // Candle 2 open (200.0) doesn't match candle 1 close (104.0) — huge discontinuity
+        let candles = vec![
+            Candle::new(base_ts, 100.0, 105.0, 99.0, 104.0, 1000.0),
+            Candle::new(base_ts + 60.0, 200.0, 210.0, 195.0, 205.0, 1500.0),
+            Candle::new(base_ts + 120.0, 205.0, 210.0, 200.0, 208.0, 2000.0),
+        ];
+        db.insert_candles("TEST", SyncTimeframe::Min1, &candles).unwrap();
+
+        let (_valid, deleted) = db.validate_candles("TEST", SyncTimeframe::Min1, 0.001).unwrap();
+        // Both the discontinuous candle AND its predecessor should be deleted
+        assert!(deleted >= 2, "expected at least 2 deleted, got {}", deleted);
+        // Only the 3rd candle (or none) should remain valid
+        let total = db.get_candle_count_for_timeframe("TEST", SyncTimeframe::Min1).unwrap();
+        assert!(total <= 1, "expected at most 1 remaining, got {}", total);
+    }
+
+    #[test]
+    fn test_reset_validation() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.duckdb");
+        let db = CandleDb::open(&db_path).unwrap();
+
+        let base_ts = 1700000000.0;
+        let candles = vec![
+            Candle::new(base_ts, 100.0, 105.0, 99.0, 104.0, 1000.0),
+            Candle::new(base_ts + 60.0, 104.0, 108.0, 103.0, 107.0, 1500.0),
+        ];
+        db.insert_candles("TEST", SyncTimeframe::Min1, &candles).unwrap();
+
+        // Validate first
+        db.validate_candles("TEST", SyncTimeframe::Min1, 0.001).unwrap();
+        assert_eq!(db.count_unvalidated("TEST", SyncTimeframe::Min1).unwrap(), 0);
+
+        // Reset validation for the range
+        let ts_ms_start = (base_ts * 1000.0) as i64;
+        let ts_ms_end = ((base_ts + 60.0) * 1000.0) as i64;
+        let reset = db.reset_validation("TEST", SyncTimeframe::Min1, ts_ms_start, ts_ms_end).unwrap();
+        assert_eq!(reset, 2);
+        assert_eq!(db.count_unvalidated("TEST", SyncTimeframe::Min1).unwrap(), 2);
     }
 }

@@ -5,6 +5,16 @@ use mexc_api::{SpotWebSocket, SubscriptionBuilder, types::WsEvent};
 use tokio::sync::mpsc;
 
 use crate::mexc::ws_kline_to_candle;
+use crate::validation;
+
+/// Trade data from live WebSocket feed.
+#[derive(Debug, Clone)]
+pub struct TradeData {
+    pub price: f32,
+    pub quantity: f32,
+    pub is_buy: bool,
+    pub timestamp: i64,
+}
 
 /// Events emitted by the live data manager.
 #[derive(Debug, Clone)]
@@ -15,6 +25,17 @@ pub enum LiveDataEvent {
         candle: Candle,
         /// Whether the candle is closed (complete) or still forming.
         is_closed: bool,
+    },
+    /// A batch of trades received.
+    TradesBatch {
+        trades: Vec<TradeData>,
+        timestamp: i64,
+    },
+    /// A depth snapshot received.
+    DepthSnapshot {
+        bids: Vec<(f32, f32)>,
+        asks: Vec<(f32, f32)>,
+        timestamp: i64,
     },
     /// WebSocket connected successfully.
     Connected,
@@ -39,7 +60,7 @@ impl LiveDataManager {
         }
     }
 
-    /// Subscribe to live kline updates for a symbol.
+    /// Subscribe to live kline, trade, and depth updates for a symbol.
     ///
     /// Returns a receiver for live data events.
     pub async fn subscribe(
@@ -59,9 +80,11 @@ impl LiveDataManager {
         let mut ws = SpotWebSocket::new();
         let ws_rx = ws.connect().await?;
 
-        // Subscribe to 1-minute klines
+        // Subscribe to klines, trades, and depth
         let channels = SubscriptionBuilder::new()
             .klines(&self.symbol, "1m")
+            .trades(&self.symbol)
+            .depth_limit(&self.symbol, 20)
             .build();
         ws.subscribe(&channels).await?;
 
@@ -136,15 +159,101 @@ async fn process_ws_events(
 
                 last_kline_time = Some(current_time);
 
-                println!("Got candle event");
+                if !validation::validate_candle(&candle) {
+                    continue;
+                }
 
                 if event_tx
                     .send(LiveDataEvent::CandleUpdate { candle, is_closed })
                     .await
                     .is_err()
                 {
-                    // Receiver dropped, exit
                     break;
+                }
+            }
+            WsEvent::Trade {
+                symbol,
+                trades,
+                timestamp,
+            } => {
+                if symbol.to_uppercase() != expected_symbol {
+                    continue;
+                }
+
+                let trade_data: Vec<TradeData> = trades
+                    .iter()
+                    .filter_map(|t| {
+                        let price: f32 = t.price.0.try_into().unwrap_or(0.0);
+                        let quantity: f32 = t.quantity.0.try_into().unwrap_or(0.0);
+                        let td = TradeData {
+                            price,
+                            quantity,
+                            is_buy: t.is_buy(),
+                            timestamp: t.time,
+                        };
+                        if validation::validate_trade(&td) {
+                            Some(td)
+                        } else {
+                            None
+                        }
+                    })
+                    .collect();
+
+                if !trade_data.is_empty() {
+                    if event_tx
+                        .send(LiveDataEvent::TradesBatch {
+                            trades: trade_data,
+                            timestamp,
+                        })
+                        .await
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+            }
+            WsEvent::Depth {
+                symbol,
+                bids,
+                asks,
+                timestamp,
+                ..
+            } => {
+                if symbol.to_uppercase() != expected_symbol {
+                    continue;
+                }
+
+                let bid_levels: Vec<(f32, f32)> = bids
+                    .iter()
+                    .map(|b| {
+                        (
+                            b.price.0.try_into().unwrap_or(0.0),
+                            b.quantity.0.try_into().unwrap_or(0.0),
+                        )
+                    })
+                    .collect();
+                let ask_levels: Vec<(f32, f32)> = asks
+                    .iter()
+                    .map(|a| {
+                        (
+                            a.price.0.try_into().unwrap_or(0.0),
+                            a.quantity.0.try_into().unwrap_or(0.0),
+                        )
+                    })
+                    .collect();
+
+                if validation::validate_depth(&bid_levels, &ask_levels) {
+                    if event_tx
+                        .send(LiveDataEvent::DepthSnapshot {
+                            bids: bid_levels,
+                            asks: ask_levels,
+                            timestamp,
+                        })
+                        .await
+                        .is_err()
+                    {
+                        break;
+                    }
                 }
             }
             WsEvent::Ping | WsEvent::Pong => {

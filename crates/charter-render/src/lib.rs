@@ -9,16 +9,19 @@ pub mod renderer;
 pub use camera::{Camera, CameraUniform};
 pub use gpu_context::GpuContext;
 pub use gpu_types::{
-    aggregate_candles_lod, aggregate_volume_lod, AnchorGpu, CandleGpu, DrawingHRayGpu,
-    DrawingRayGpu, DrawingRectGpu, DrawingRenderParams, GuidelineGpu, GuidelineParams,
-    IndicatorParams, IndicatorPointGpu, LevelGpu, LodConfig, RangeGpu, RenderParams,
-    TaRenderParams, TrendGpu, VolumeGpu, VolumeRenderParams, MAX_DRAWING_ANCHORS,
-    MAX_DRAWING_HRAYS, MAX_DRAWING_RAYS, MAX_DRAWING_RECTS, MAX_GUIDELINES, MAX_TA_LEVELS,
-    MAX_TA_RANGES, MAX_TA_TRENDS,
+    aggregate_candles_lod, aggregate_volume_lod, AnchorGpu, CandleGpu,
+    DepthHeatmapCellGpu, DepthHeatmapParams, DrawingHRayGpu, DrawingRayGpu, DrawingRectGpu,
+    DrawingRenderParams, GuidelineGpu, GuidelineParams, IndicatorParams, IndicatorPointGpu,
+    LevelGpu, LodConfig, RangeGpu, RenderParams, TaRenderParams, TrendGpu, VolumeGpu,
+    VolumeProfileBucketGpu, VolumeProfileParams, VolumeRenderParams, MAX_DRAWING_ANCHORS,
+    MAX_DRAWING_HRAYS, MAX_DRAWING_RAYS, MAX_DRAWING_RECTS, MAX_GUIDELINES,
+    MAX_DEPTH_LEVELS, MAX_TA_LEVELS,
+    MAX_TA_RANGES, MAX_TA_TRENDS, MAX_VOLUME_PROFILE_BUCKETS,
 };
 pub use pipeline::{
-    CandlePipeline, DrawingCounts, DrawingPipeline, DrawingRenderData, GuidelinePipeline,
-    IndicatorPipeline, InstancedPipeline, Pipeline, SharedLayouts, TaPipeline, VolumePipeline,
+    CandlePipeline, DepthHeatmapPipeline, DrawingCounts, DrawingPipeline, DrawingRenderData,
+    GuidelinePipeline, IndicatorPipeline, InstancedPipeline, Pipeline, SharedLayouts, TaPipeline,
+    VolumeProfilePipeline, VolumePipeline,
 };
 pub use renderer::{CameraBundle, ChartRenderer, LodData, TimeframeData};
 

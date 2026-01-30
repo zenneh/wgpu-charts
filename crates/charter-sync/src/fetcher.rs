@@ -48,7 +48,7 @@ impl HistoricalFetcher {
     }
 
     /// Convert SyncTimeframe to MEXC KlineInterval.
-    fn to_kline_interval(tf: SyncTimeframe) -> KlineInterval {
+    pub fn kline_interval(tf: SyncTimeframe) -> KlineInterval {
         match tf {
             SyncTimeframe::Min1 => KlineInterval::OneMinute,
             SyncTimeframe::Min5 => KlineInterval::FiveMinutes,
@@ -71,7 +71,7 @@ impl HistoricalFetcher {
         let candle_duration_ms = timeframe.millis();
         let start_time = end_time - (1000 * candle_duration_ms);
 
-        let interval = Self::to_kline_interval(timeframe);
+        let interval = Self::kline_interval(timeframe);
         let klines = self
             .api
             .market()
@@ -83,7 +83,15 @@ impl HistoricalFetcher {
                 Some(1000), // Max batch size
             )
             .await
-            .context("Failed to fetch klines")?;
+            .with_context(|| {
+                format!(
+                    "klines {} {} [{} -> {}]",
+                    self.symbol,
+                    timeframe.mexc_interval(),
+                    start_time,
+                    end_time
+                )
+            })?;
 
         if klines.is_empty() {
             return Ok(FetchBatch {
@@ -133,7 +141,9 @@ impl HistoricalFetcher {
     ) {
         let mut current_end = end_time_ms.unwrap_or_else(Self::now_ms);
         let mut consecutive_empty = 0;
+        let mut consecutive_errors = 0u32;
         let candle_duration_ms = timeframe.millis();
+        const MAX_RETRIES: u32 = 3;
 
         log::info!(
             "Starting backward fetch ({}) from {} to {:?}",
@@ -156,6 +166,7 @@ impl HistoricalFetcher {
 
             match self.fetch_batch_tf(timeframe, Some(current_end)).await {
                 Ok(batch) => {
+                    consecutive_errors = 0;
                     let oldest = batch.oldest_ts;
                     let candle_count = batch.candles.len();
 
@@ -190,9 +201,25 @@ impl HistoricalFetcher {
                     }
                 }
                 Err(e) => {
-                    log::error!("Error in backward fetch: {}", e);
-                    let _ = tx.send(Err(e)).await;
-                    break;
+                    consecutive_errors += 1;
+                    if consecutive_errors >= MAX_RETRIES {
+                        log::error!(
+                            "Backward fetch failed after {} retries: {:#}",
+                            MAX_RETRIES,
+                            e
+                        );
+                        let _ = tx.send(Err(e)).await;
+                        break;
+                    }
+                    let backoff_ms = 1000 * 2u64.pow(consecutive_errors - 1);
+                    log::warn!(
+                        "Backward fetch error (attempt {}/{}), retrying in {}ms: {:#}",
+                        consecutive_errors,
+                        MAX_RETRIES,
+                        backoff_ms,
+                        e
+                    );
+                    tokio::time::sleep(std::time::Duration::from_millis(backoff_ms)).await;
                 }
             }
         }
@@ -208,7 +235,9 @@ impl HistoricalFetcher {
         let now = Self::now_ms();
         let candle_duration_ms = timeframe.millis();
         let mut current_start = from_ms + candle_duration_ms;
-        let interval = Self::to_kline_interval(timeframe);
+        let interval = Self::kline_interval(timeframe);
+        let mut consecutive_errors = 0u32;
+        const MAX_RETRIES: u32 = 3;
 
         while current_start < now {
             let end_time = (current_start + 1000 * candle_duration_ms).min(now);
@@ -226,6 +255,8 @@ impl HistoricalFetcher {
                 .await
             {
                 Ok(klines) => {
+                    consecutive_errors = 0;
+
                     if klines.is_empty() {
                         break;
                     }
@@ -267,8 +298,25 @@ impl HistoricalFetcher {
                     }
                 }
                 Err(e) => {
-                    let _ = tx.send(Err(anyhow::anyhow!("{}", e))).await;
-                    break;
+                    consecutive_errors += 1;
+                    if consecutive_errors >= MAX_RETRIES {
+                        log::error!(
+                            "Forward fetch failed after {} retries: {:#}",
+                            MAX_RETRIES,
+                            e
+                        );
+                        let _ = tx.send(Err(anyhow::anyhow!("{:#}", e))).await;
+                        break;
+                    }
+                    let backoff_ms = 1000 * 2u64.pow(consecutive_errors - 1);
+                    log::warn!(
+                        "Forward fetch error (attempt {}/{}), retrying in {}ms: {:#}",
+                        consecutive_errors,
+                        MAX_RETRIES,
+                        backoff_ms,
+                        e
+                    );
+                    tokio::time::sleep(std::time::Duration::from_millis(backoff_ms)).await;
                 }
             }
         }

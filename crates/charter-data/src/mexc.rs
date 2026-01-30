@@ -1,8 +1,10 @@
-//! MEXC API data source for loading candle data.
+//! MEXC API data source for loading candle and trade data.
 
 use charter_core::Candle;
 use mexc_api::{types::KlineInterval, MexcClient, SpotApi};
 use rust_decimal::prelude::ToPrimitive;
+
+use crate::live::TradeData;
 
 /// MEXC data source for fetching kline data.
 pub struct MexcSource {
@@ -18,6 +20,74 @@ impl MexcSource {
         Self {
             symbol: symbol.to_uppercase(),
         }
+    }
+
+    /// Fetch recent aggregate trades via REST API.
+    ///
+    /// Fetches trades from the last `minutes` minutes in batches of 1000.
+    /// Returns a flat list of `TradeData` suitable for volume profile.
+    pub async fn fetch_recent_trades(&self, minutes: u32) -> anyhow::Result<Vec<TradeData>> {
+        let client = MexcClient::public()?;
+        let spot = SpotApi::new(client);
+        let market = spot.market();
+
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)?
+            .as_millis() as i64;
+        let start_ms = now_ms - (minutes as i64 * 60 * 1000);
+
+        let mut all_trades = Vec::new();
+        let mut current_start = start_ms;
+
+        // Fetch in 1000-trade batches
+        while current_start < now_ms {
+            let batch = market
+                .agg_trades(
+                    &self.symbol,
+                    None,
+                    Some(current_start),
+                    Some(now_ms),
+                    Some(1000),
+                )
+                .await?;
+
+            if batch.is_empty() {
+                break;
+            }
+
+            let last_time = batch.last().map(|t| t.time).unwrap_or(now_ms);
+
+            for t in &batch {
+                let price = t.price.0.to_f32().unwrap_or(0.0);
+                let quantity = t.qty.0.to_f32().unwrap_or(0.0);
+                if price > 0.0 && quantity > 0.0 {
+                    all_trades.push(TradeData {
+                        price,
+                        quantity,
+                        is_buy: !t.is_buyer_maker,
+                        timestamp: t.time,
+                    });
+                }
+            }
+
+            // Move window forward past the last trade we got
+            if last_time <= current_start {
+                break; // No progress, avoid infinite loop
+            }
+            current_start = last_time + 1;
+
+            // Rate limit: small delay between batches
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+
+        eprintln!(
+            "[mexc] fetched {} historical trades for {} (last {} min)",
+            all_trades.len(),
+            self.symbol,
+            minutes
+        );
+
+        Ok(all_trades)
     }
 
     /// Load initial candle data from MEXC API.

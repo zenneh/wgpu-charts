@@ -73,6 +73,34 @@ impl TaDisplaySettings {
     }
 }
 
+/// Settings for market data display.
+#[derive(Debug, Clone)]
+pub struct MarketDataDisplaySettings {
+    /// Show volume profile bars.
+    pub show_volume_profile: bool,
+    /// Show depth heatmap grid.
+    pub show_depth_heatmap: bool,
+}
+
+impl Default for MarketDataDisplaySettings {
+    fn default() -> Self {
+        Self {
+            show_volume_profile: false,
+            show_depth_heatmap: false,
+        }
+    }
+}
+
+impl MarketDataDisplaySettings {
+    /// Create from config.
+    pub fn from_config(config: &charter_config::MarketDataConfig) -> Self {
+        Self {
+            show_volume_profile: config.show_volume_profile,
+            show_depth_heatmap: config.show_depth_heatmap,
+        }
+    }
+}
+
 /// Document state containing all persistent chart data.
 ///
 /// This includes:
@@ -101,6 +129,9 @@ pub struct DocumentState {
     /// Registry of technical indicators (MACD, etc.).
     pub indicators: IndicatorRegistry,
 
+    /// Market data display settings.
+    pub market_data_settings: MarketDataDisplaySettings,
+
     /// Index of currently hovered range (if any).
     pub hovered_range: Option<usize>,
 
@@ -121,6 +152,7 @@ impl DocumentState {
             ta_data,
             ta_settings: TaDisplaySettings::default(),
             indicators: IndicatorRegistry::new(),
+            market_data_settings: MarketDataDisplaySettings::default(),
             hovered_range: None,
             hovered_level: None,
         }

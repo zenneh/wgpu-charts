@@ -460,6 +460,54 @@ fn parse_protobuf_message(data: &[u8]) -> Option<WsEvent> {
                 timestamp,
             })
         }
+        push_data_body::Body::PublicDeals(deals_data) => {
+            let trades: Vec<crate::types::WsTrade> = deals_data
+                .deals
+                .iter()
+                .map(|d| crate::types::WsTrade {
+                    price: StringDecimal::from_string(d.price.clone()),
+                    quantity: StringDecimal::from_string(d.quantity.clone()),
+                    side: d.trade_type,
+                    time: d.time,
+                })
+                .collect();
+
+            Some(WsEvent::Trade {
+                symbol,
+                trades,
+                timestamp,
+            })
+        }
+        push_data_body::Body::PublicLimitDepths(depth_data) => {
+            let bids: Vec<crate::types::WsDepthLevel> = depth_data
+                .bids
+                .iter()
+                .map(|e| crate::types::WsDepthLevel {
+                    price: StringDecimal::from_string(e.price.clone()),
+                    quantity: StringDecimal::from_string(e.quantity.clone()),
+                })
+                .collect();
+            let asks: Vec<crate::types::WsDepthLevel> = depth_data
+                .asks
+                .iter()
+                .map(|e| crate::types::WsDepthLevel {
+                    price: StringDecimal::from_string(e.price.clone()),
+                    quantity: StringDecimal::from_string(e.quantity.clone()),
+                })
+                .collect();
+
+            Some(WsEvent::Depth {
+                symbol,
+                bids,
+                asks,
+                version: if depth_data.version.is_empty() {
+                    None
+                } else {
+                    Some(depth_data.version)
+                },
+                timestamp,
+            })
+        }
         // Other message types not fully implemented yet
         _ => Some(WsEvent::Unknown {
             raw: format!("Protobuf channel: {}", channel),

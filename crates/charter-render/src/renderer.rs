@@ -10,8 +10,8 @@ use crate::gpu_types::{
     RenderParams, VolumeGpu, VolumeRenderParams, aggregate_candles_lod, aggregate_volume_lod,
 };
 use crate::pipeline::{
-    CandlePipeline, CurrentPricePipeline, GuidelinePipeline, IndicatorPipeline, SharedLayouts,
-    TaPipeline, VolumePipeline,
+    CandlePipeline, CurrentPricePipeline, DepthHeatmapPipeline, GuidelinePipeline,
+    IndicatorPipeline, SharedLayouts, TaPipeline, VolumeProfilePipeline, VolumePipeline,
 };
 use crate::{
     BASE_CANDLE_WIDTH, CANDLE_SPACING, MIN_CANDLE_PIXELS, STATS_PANEL_WIDTH, VOLUME_HEIGHT_RATIO,
@@ -134,6 +134,8 @@ pub struct ChartRenderer {
     pub indicator_pipeline: IndicatorPipeline,
     pub ta_pipeline: TaPipeline,
     pub current_price_pipeline: CurrentPricePipeline,
+    pub volume_profile_pipeline: VolumeProfilePipeline,
+    pub depth_heatmap_pipeline: DepthHeatmapPipeline,
 
     pub main_camera: CameraBundle,
     pub volume_camera: CameraBundle,
@@ -245,6 +247,10 @@ impl ChartRenderer {
             &guideline_params_buffer,
         );
 
+        // Market data pipelines
+        let volume_profile_pipeline = VolumeProfilePipeline::new(device, format, &shared);
+        let depth_heatmap_pipeline = DepthHeatmapPipeline::new(device, format, &shared);
+
         // Current price line
         let current_price_pipeline = CurrentPricePipeline::new(device, format, &shared);
         let current_price_params_buffer = current_price_pipeline.create_params_buffer(device);
@@ -259,6 +265,8 @@ impl ChartRenderer {
             indicator_pipeline,
             ta_pipeline,
             current_price_pipeline,
+            volume_profile_pipeline,
+            depth_heatmap_pipeline,
             main_camera,
             volume_camera,
             render_params_buffer,

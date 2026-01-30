@@ -4,7 +4,7 @@
 //! which TA elements (ranges, levels) are displayed on the chart.
 
 use crate::replay::TimeframeTaData;
-use crate::state::TaDisplaySettings;
+use crate::state::{MarketDataDisplaySettings, TaDisplaySettings};
 use charter_render::STATS_PANEL_WIDTH;
 use charter_ta::{CandleDirection, LevelState, LevelType};
 
@@ -130,6 +130,10 @@ pub struct TaPanelResponse {
     pub settings_changed: bool,
     /// The new settings (if changed).
     pub new_settings: Option<TaDisplaySettings>,
+    /// Whether market data settings were changed.
+    pub market_data_changed: bool,
+    /// The new market data settings (if changed).
+    pub new_market_data_settings: Option<MarketDataDisplaySettings>,
 }
 
 /// Shows the Technical Analysis control panel.
@@ -151,9 +155,11 @@ pub fn show_ta_panel(
     ta_data: Option<&TimeframeTaData>,
     hovered: &TaHoveredInfo,
     screen_width: f32,
+    market_data_settings: &MarketDataDisplaySettings,
 ) -> TaPanelResponse {
     let mut response = TaPanelResponse::default();
     let mut ta_settings = settings.clone();
+    let mut md_settings = market_data_settings.clone();
 
     // Get counts from TA data
     let (range_count, level_count) = ta_data
@@ -181,6 +187,15 @@ pub fn show_ta_panel(
                 ui.checkbox(&mut ta_settings.show_active_levels, "Active");
                 ui.checkbox(&mut ta_settings.show_hit_levels, "Hit");
                 ui.checkbox(&mut ta_settings.show_broken_levels, "Broken");
+
+                ui.separator();
+                ui.checkbox(&mut ta_settings.show_trends, "Show Trends");
+                if ta_settings.show_trends {
+                    ui.label("Trend States:");
+                    ui.checkbox(&mut ta_settings.show_active_trends, "Active");
+                    ui.checkbox(&mut ta_settings.show_hit_trends, "Hit");
+                    ui.checkbox(&mut ta_settings.show_broken_trends, "Broken");
+                }
 
                 ui.separator();
                 ui.label(format!("Ranges: {}", range_count));
@@ -247,6 +262,12 @@ pub fn show_ta_panel(
                     ui.label(format!("  Hits: {}", hits));
                 }
             }
+
+            // Market Data section
+            ui.separator();
+            ui.label("Market Data:");
+            ui.checkbox(&mut md_settings.show_volume_profile, "Volume Profile");
+            ui.checkbox(&mut md_settings.show_depth_heatmap, "Depth Heatmap");
         });
 
     // Check if settings changed
@@ -256,11 +277,24 @@ pub fn show_ta_panel(
         || ta_settings.show_greedy_levels != settings.show_greedy_levels
         || ta_settings.show_active_levels != settings.show_active_levels
         || ta_settings.show_hit_levels != settings.show_hit_levels
-        || ta_settings.show_broken_levels != settings.show_broken_levels;
+        || ta_settings.show_broken_levels != settings.show_broken_levels
+        || ta_settings.show_trends != settings.show_trends
+        || ta_settings.show_active_trends != settings.show_active_trends
+        || ta_settings.show_hit_trends != settings.show_hit_trends
+        || ta_settings.show_broken_trends != settings.show_broken_trends;
 
     if changed {
         response.settings_changed = true;
         response.new_settings = Some(ta_settings);
+    }
+
+    // Check if market data settings changed
+    let md_changed = md_settings.show_volume_profile != market_data_settings.show_volume_profile
+        || md_settings.show_depth_heatmap != market_data_settings.show_depth_heatmap;
+
+    if md_changed {
+        response.market_data_changed = true;
+        response.new_market_data_settings = Some(md_settings);
     }
 
     response
