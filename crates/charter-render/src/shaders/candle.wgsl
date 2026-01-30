@@ -5,17 +5,16 @@ struct CameraUniform {
 @group(0) @binding(0)
 var<uniform> camera: CameraUniform;
 
-// Packed candle data in storage buffer (8 bytes per candle instead of 16)
-// Values are normalized u16 packed into u32:
-//   open_high: open (lower 16 bits) | high (upper 16 bits)
-//   low_close: low (lower 16 bits) | close (upper 16 bits)
-struct PackedCandle {
-    open_high: u32,
-    low_close: u32,
+// Candle data in storage buffer (16 bytes per candle, full f32 precision)
+struct Candle {
+    open: f32,
+    high: f32,
+    low: f32,
+    close: f32,
 };
 
 struct CandleArray {
-    candles: array<PackedCandle>,
+    candles: array<Candle>,
 };
 
 @group(1) @binding(0)
@@ -32,9 +31,6 @@ struct RenderParams {
     x_max: f32,
     y_min: f32,
     y_max: f32,
-    // Price denormalization: price = price_min + normalized * price_range
-    price_min: f32,
-    price_range: f32,
     // Minimum body height for doji candles
     min_body_height: f32,
     _padding: f32,
@@ -42,23 +38,6 @@ struct RenderParams {
 
 @group(1) @binding(1)
 var<uniform> params: RenderParams;
-
-// Unpack and denormalize a packed candle
-fn unpack_candle(packed: PackedCandle) -> vec4<f32> {
-    // Extract u16 values from packed u32s
-    let open_norm = f32(packed.open_high & 0xFFFFu) / 65535.0;
-    let high_norm = f32((packed.open_high >> 16u) & 0xFFFFu) / 65535.0;
-    let low_norm = f32(packed.low_close & 0xFFFFu) / 65535.0;
-    let close_norm = f32((packed.low_close >> 16u) & 0xFFFFu) / 65535.0;
-
-    // Denormalize to actual prices
-    let open = params.price_min + open_norm * params.price_range;
-    let high = params.price_min + high_norm * params.price_range;
-    let low = params.price_min + low_norm * params.price_range;
-    let close = params.price_min + close_norm * params.price_range;
-
-    return vec4<f32>(open, high, low, close);
-}
 
 struct VertexOutput {
     @builtin(position) clip_position: vec4<f32>,
@@ -78,14 +57,12 @@ fn vs_main(
 
     // Get the actual candle index (accounting for viewport culling offset)
     let candle_index = params.first_visible + instance_index;
-    let packed = candle_data.candles[candle_index];
+    let candle = candle_data.candles[candle_index];
 
-    // Unpack and denormalize candle data (50% memory savings)
-    let candle = unpack_candle(packed);
-    let open = candle.x;
-    let high = candle.y;
-    let low = candle.z;
-    let close = candle.w;
+    let open = candle.open;
+    let high = candle.high;
+    let low = candle.low;
+    let close = candle.close;
 
     // Calculate candle properties
     let x_center = f32(candle_index) * params.candle_spacing;

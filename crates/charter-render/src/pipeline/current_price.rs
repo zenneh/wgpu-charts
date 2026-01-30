@@ -5,9 +5,8 @@
 
 use std::ops::Range;
 
-use wgpu::util::DeviceExt;
-
 use crate::gpu_types::CurrentPriceParams;
+use crate::pipeline::shared::SharedLayouts;
 use crate::pipeline::traits::Pipeline;
 
 /// Pipeline for rendering the current price line.
@@ -20,7 +19,7 @@ impl CurrentPricePipeline {
     pub fn new(
         device: &wgpu::Device,
         format: wgpu::TextureFormat,
-        camera_bind_group_layout: &wgpu::BindGroupLayout,
+        shared: &SharedLayouts,
     ) -> Self {
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("Current Price Shader"),
@@ -28,62 +27,29 @@ impl CurrentPricePipeline {
         });
 
         let bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            entries: &[wgpu::BindGroupLayoutEntry {
-                binding: 0,
-                visibility: wgpu::ShaderStages::VERTEX | wgpu::ShaderStages::FRAGMENT,
-                ty: wgpu::BindingType::Buffer {
-                    ty: wgpu::BufferBindingType::Uniform,
-                    has_dynamic_offset: false,
-                    min_binding_size: None,
-                },
-                count: None,
-            }],
+            entries: &[SharedLayouts::uniform_entry(
+                0,
+                wgpu::ShaderStages::VERTEX | wgpu::ShaderStages::FRAGMENT,
+            )],
             label: Some("current_price_bind_group_layout"),
         });
 
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("Current Price Pipeline Layout"),
-            bind_group_layouts: &[camera_bind_group_layout, &bind_group_layout],
+            bind_group_layouts: &[&shared.camera_bind_group_layout, &bind_group_layout],
             push_constant_ranges: &[],
         });
 
-        let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("Current Price Pipeline"),
-            layout: Some(&pipeline_layout),
-            vertex: wgpu::VertexState {
-                module: &shader,
-                entry_point: Some("vs_main"),
-                buffers: &[],
-                compilation_options: wgpu::PipelineCompilationOptions::default(),
-            },
-            fragment: Some(wgpu::FragmentState {
-                module: &shader,
-                entry_point: Some("fs_main"),
-                targets: &[Some(wgpu::ColorTargetState {
-                    format,
-                    blend: Some(wgpu::BlendState::ALPHA_BLENDING),
-                    write_mask: wgpu::ColorWrites::ALL,
-                })],
-                compilation_options: wgpu::PipelineCompilationOptions::default(),
-            }),
-            primitive: wgpu::PrimitiveState {
-                topology: wgpu::PrimitiveTopology::TriangleList,
-                strip_index_format: None,
-                front_face: wgpu::FrontFace::Ccw,
-                cull_mode: None,
-                polygon_mode: wgpu::PolygonMode::Fill,
-                unclipped_depth: false,
-                conservative: false,
-            },
-            depth_stencil: None,
-            multisample: wgpu::MultisampleState {
-                count: 1,
-                mask: !0,
-                alpha_to_coverage_enabled: false,
-            },
-            multiview: None,
-            cache: None,
-        });
+        let pipeline = SharedLayouts::create_render_pipeline(
+            device,
+            "Current Price Pipeline",
+            &pipeline_layout,
+            &shader,
+            "vs_main",
+            "fs_main",
+            format,
+            wgpu::BlendState::ALPHA_BLENDING,
+        );
 
         Self {
             pipeline,
@@ -93,11 +59,7 @@ impl CurrentPricePipeline {
 
     pub fn create_params_buffer(&self, device: &wgpu::Device) -> wgpu::Buffer {
         let params = CurrentPriceParams::default();
-        device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("Current Price Params Buffer"),
-            contents: bytemuck::cast_slice(&[params]),
-            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-        })
+        SharedLayouts::create_uniform_buffer(device, "Current Price Params Buffer", &params)
     }
 
     pub fn create_bind_group(
@@ -105,14 +67,12 @@ impl CurrentPricePipeline {
         device: &wgpu::Device,
         params_buffer: &wgpu::Buffer,
     ) -> wgpu::BindGroup {
-        device.create_bind_group(&wgpu::BindGroupDescriptor {
-            layout: &self.bind_group_layout,
-            entries: &[wgpu::BindGroupEntry {
-                binding: 0,
-                resource: params_buffer.as_entire_binding(),
-            }],
-            label: Some("Current Price Bind Group"),
-        })
+        SharedLayouts::create_bind_group(
+            device,
+            "Current Price Bind Group",
+            &self.bind_group_layout,
+            &[params_buffer],
+        )
     }
 }
 

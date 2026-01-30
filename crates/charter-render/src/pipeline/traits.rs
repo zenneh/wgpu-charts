@@ -70,7 +70,12 @@ pub trait Pipeline {
         data_bind_group: &'a wgpu::BindGroup,
         vertex_range: Range<u32>,
         instance_range: Range<u32>,
-    );
+    ) {
+        render_pass.set_pipeline(self.pipeline());
+        render_pass.set_bind_group(0, camera_bind_group, &[]);
+        render_pass.set_bind_group(1, data_bind_group, &[]);
+        render_pass.draw(vertex_range, instance_range);
+    }
 
     /// Returns a reference to the underlying wgpu render pipeline.
     ///

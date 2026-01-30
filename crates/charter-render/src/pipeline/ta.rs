@@ -1,11 +1,7 @@
 //! Technical Analysis rendering pipeline.
 
-use std::ops::Range;
-
-use wgpu::util::DeviceExt;
-
 use crate::gpu_types::{LevelGpu, RangeGpu, TaRenderParams, TrendGpu, MAX_TA_LEVELS, MAX_TA_RANGES, MAX_TA_TRENDS};
-use crate::pipeline::traits::InstancedPipeline;
+use crate::pipeline::shared::SharedLayouts;
 
 /// Pipeline for rendering technical analysis elements (ranges, levels, and trends).
 pub struct TaPipeline {
@@ -19,7 +15,7 @@ impl TaPipeline {
     pub fn new(
         device: &wgpu::Device,
         format: wgpu::TextureFormat,
-        camera_bind_group_layout: &wgpu::BindGroupLayout,
+        shared: &SharedLayouts,
     ) -> Self {
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("TA Shader"),
@@ -30,175 +26,58 @@ impl TaPipeline {
             device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
                 entries: &[
                     // Ranges storage buffer
-                    wgpu::BindGroupLayoutEntry {
-                        binding: 0,
-                        visibility: wgpu::ShaderStages::VERTEX,
-                        ty: wgpu::BindingType::Buffer {
-                            ty: wgpu::BufferBindingType::Storage { read_only: true },
-                            has_dynamic_offset: false,
-                            min_binding_size: None,
-                        },
-                        count: None,
-                    },
+                    SharedLayouts::storage_entry(0, wgpu::ShaderStages::VERTEX),
                     // Levels storage buffer
-                    wgpu::BindGroupLayoutEntry {
-                        binding: 1,
-                        visibility: wgpu::ShaderStages::VERTEX,
-                        ty: wgpu::BindingType::Buffer {
-                            ty: wgpu::BufferBindingType::Storage { read_only: true },
-                            has_dynamic_offset: false,
-                            min_binding_size: None,
-                        },
-                        count: None,
-                    },
+                    SharedLayouts::storage_entry(1, wgpu::ShaderStages::VERTEX),
                     // TA params uniform
-                    wgpu::BindGroupLayoutEntry {
-                        binding: 2,
-                        visibility: wgpu::ShaderStages::VERTEX,
-                        ty: wgpu::BindingType::Buffer {
-                            ty: wgpu::BufferBindingType::Uniform,
-                            has_dynamic_offset: false,
-                            min_binding_size: None,
-                        },
-                        count: None,
-                    },
+                    SharedLayouts::uniform_entry(2, wgpu::ShaderStages::VERTEX),
                     // Trends storage buffer
-                    wgpu::BindGroupLayoutEntry {
-                        binding: 3,
-                        visibility: wgpu::ShaderStages::VERTEX,
-                        ty: wgpu::BindingType::Buffer {
-                            ty: wgpu::BufferBindingType::Storage { read_only: true },
-                            has_dynamic_offset: false,
-                            min_binding_size: None,
-                        },
-                        count: None,
-                    },
+                    SharedLayouts::storage_entry(3, wgpu::ShaderStages::VERTEX),
                 ],
                 label: Some("ta_bind_group_layout"),
             });
 
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("TA Pipeline Layout"),
-            bind_group_layouts: &[camera_bind_group_layout, &ta_bind_group_layout],
+            bind_group_layouts: &[&shared.camera_bind_group_layout, &ta_bind_group_layout],
             push_constant_ranges: &[],
         });
 
         // Range rendering pipeline
-        let range_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("TA Range Pipeline"),
-            layout: Some(&pipeline_layout),
-            vertex: wgpu::VertexState {
-                module: &shader,
-                entry_point: Some("vs_range"),
-                buffers: &[],
-                compilation_options: wgpu::PipelineCompilationOptions::default(),
-            },
-            fragment: Some(wgpu::FragmentState {
-                module: &shader,
-                entry_point: Some("fs_range"),
-                targets: &[Some(wgpu::ColorTargetState {
-                    format,
-                    blend: Some(wgpu::BlendState::ALPHA_BLENDING),
-                    write_mask: wgpu::ColorWrites::ALL,
-                })],
-                compilation_options: wgpu::PipelineCompilationOptions::default(),
-            }),
-            primitive: wgpu::PrimitiveState {
-                topology: wgpu::PrimitiveTopology::TriangleList,
-                strip_index_format: None,
-                front_face: wgpu::FrontFace::Ccw,
-                cull_mode: None,
-                polygon_mode: wgpu::PolygonMode::Fill,
-                unclipped_depth: false,
-                conservative: false,
-            },
-            depth_stencil: None,
-            multisample: wgpu::MultisampleState {
-                count: 1,
-                mask: !0,
-                alpha_to_coverage_enabled: false,
-            },
-            multiview: None,
-            cache: None,
-        });
+        let range_pipeline = SharedLayouts::create_render_pipeline(
+            device,
+            "TA Range Pipeline",
+            &pipeline_layout,
+            &shader,
+            "vs_range",
+            "fs_range",
+            format,
+            wgpu::BlendState::ALPHA_BLENDING,
+        );
 
         // Level rendering pipeline
-        let level_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("TA Level Pipeline"),
-            layout: Some(&pipeline_layout),
-            vertex: wgpu::VertexState {
-                module: &shader,
-                entry_point: Some("vs_level"),
-                buffers: &[],
-                compilation_options: wgpu::PipelineCompilationOptions::default(),
-            },
-            fragment: Some(wgpu::FragmentState {
-                module: &shader,
-                entry_point: Some("fs_level"),
-                targets: &[Some(wgpu::ColorTargetState {
-                    format,
-                    blend: Some(wgpu::BlendState::ALPHA_BLENDING),
-                    write_mask: wgpu::ColorWrites::ALL,
-                })],
-                compilation_options: wgpu::PipelineCompilationOptions::default(),
-            }),
-            primitive: wgpu::PrimitiveState {
-                topology: wgpu::PrimitiveTopology::TriangleList,
-                strip_index_format: None,
-                front_face: wgpu::FrontFace::Ccw,
-                cull_mode: None,
-                polygon_mode: wgpu::PolygonMode::Fill,
-                unclipped_depth: false,
-                conservative: false,
-            },
-            depth_stencil: None,
-            multisample: wgpu::MultisampleState {
-                count: 1,
-                mask: !0,
-                alpha_to_coverage_enabled: false,
-            },
-            multiview: None,
-            cache: None,
-        });
+        let level_pipeline = SharedLayouts::create_render_pipeline(
+            device,
+            "TA Level Pipeline",
+            &pipeline_layout,
+            &shader,
+            "vs_level",
+            "fs_level",
+            format,
+            wgpu::BlendState::ALPHA_BLENDING,
+        );
 
         // Trend rendering pipeline
-        let trend_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("TA Trend Pipeline"),
-            layout: Some(&pipeline_layout),
-            vertex: wgpu::VertexState {
-                module: &shader,
-                entry_point: Some("vs_trend"),
-                buffers: &[],
-                compilation_options: wgpu::PipelineCompilationOptions::default(),
-            },
-            fragment: Some(wgpu::FragmentState {
-                module: &shader,
-                entry_point: Some("fs_trend"),
-                targets: &[Some(wgpu::ColorTargetState {
-                    format,
-                    blend: Some(wgpu::BlendState::ALPHA_BLENDING),
-                    write_mask: wgpu::ColorWrites::ALL,
-                })],
-                compilation_options: wgpu::PipelineCompilationOptions::default(),
-            }),
-            primitive: wgpu::PrimitiveState {
-                topology: wgpu::PrimitiveTopology::TriangleList,
-                strip_index_format: None,
-                front_face: wgpu::FrontFace::Ccw,
-                cull_mode: None,
-                polygon_mode: wgpu::PolygonMode::Fill,
-                unclipped_depth: false,
-                conservative: false,
-            },
-            depth_stencil: None,
-            multisample: wgpu::MultisampleState {
-                count: 1,
-                mask: !0,
-                alpha_to_coverage_enabled: false,
-            },
-            multiview: None,
-            cache: None,
-        });
+        let trend_pipeline = SharedLayouts::create_render_pipeline(
+            device,
+            "TA Trend Pipeline",
+            &pipeline_layout,
+            &shader,
+            "vs_trend",
+            "fs_trend",
+            format,
+            wgpu::BlendState::ALPHA_BLENDING,
+        );
 
         Self {
             range_pipeline,
@@ -218,11 +97,7 @@ impl TaPipeline {
             };
             MAX_TA_RANGES
         ];
-        device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("TA Range Buffer"),
-            contents: bytemuck::cast_slice(&initial_ranges),
-            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
-        })
+        SharedLayouts::create_storage_buffer(device, "TA Range Buffer", &initial_ranges)
     }
 
     pub fn create_level_buffer(&self, device: &wgpu::Device) -> wgpu::Buffer {
@@ -239,11 +114,7 @@ impl TaPipeline {
             };
             MAX_TA_LEVELS
         ];
-        device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("TA Level Buffer"),
-            contents: bytemuck::cast_slice(&initial_levels),
-            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
-        })
+        SharedLayouts::create_storage_buffer(device, "TA Level Buffer", &initial_levels)
     }
 
     pub fn create_params_buffer(&self, device: &wgpu::Device) -> wgpu::Buffer {
@@ -257,11 +128,7 @@ impl TaPipeline {
             level_count: 0,
             trend_count: 0,
         };
-        device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("TA Params Buffer"),
-            contents: bytemuck::cast_slice(&[params]),
-            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-        })
+        SharedLayouts::create_uniform_buffer(device, "TA Params Buffer", &params)
     }
 
     pub fn create_trend_buffer(&self, device: &wgpu::Device) -> wgpu::Buffer {
@@ -278,11 +145,7 @@ impl TaPipeline {
             };
             MAX_TA_TRENDS
         ];
-        device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("TA Trend Buffer"),
-            contents: bytemuck::cast_slice(&initial_trends),
-            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
-        })
+        SharedLayouts::create_storage_buffer(device, "TA Trend Buffer", &initial_trends)
     }
 
     pub fn create_bind_group(
@@ -293,28 +156,12 @@ impl TaPipeline {
         params_buffer: &wgpu::Buffer,
         trend_buffer: &wgpu::Buffer,
     ) -> wgpu::BindGroup {
-        device.create_bind_group(&wgpu::BindGroupDescriptor {
-            layout: &self.ta_bind_group_layout,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: range_buffer.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: level_buffer.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 2,
-                    resource: params_buffer.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 3,
-                    resource: trend_buffer.as_entire_binding(),
-                },
-            ],
-            label: Some("TA Bind Group"),
-        })
+        SharedLayouts::create_bind_group(
+            device,
+            "TA Bind Group",
+            &self.ta_bind_group_layout,
+            &[range_buffer, level_buffer, params_buffer, trend_buffer],
+        )
     }
 
     /// Renders TA ranges.
@@ -384,89 +231,3 @@ impl TaPipeline {
 /// Number of vertices per TA element (2 triangles = 6 vertices).
 const VERTICES_PER_TA_ELEMENT: u32 = 6;
 
-/// Wrapper for rendering TA ranges through the Pipeline trait.
-pub struct TaRangePipeline<'a>(pub &'a TaPipeline);
-
-impl<'a> crate::pipeline::traits::Pipeline for TaRangePipeline<'a> {
-    type BindGroupData = wgpu::BindGroup;
-
-    fn render<'b>(
-        &'b self,
-        render_pass: &mut wgpu::RenderPass<'b>,
-        camera_bind_group: &'b wgpu::BindGroup,
-        data_bind_group: &'b wgpu::BindGroup,
-        vertex_range: Range<u32>,
-        instance_range: Range<u32>,
-    ) {
-        render_pass.set_pipeline(&self.0.range_pipeline);
-        render_pass.set_bind_group(0, camera_bind_group, &[]);
-        render_pass.set_bind_group(1, data_bind_group, &[]);
-        render_pass.draw(vertex_range, instance_range);
-    }
-
-    fn pipeline(&self) -> &wgpu::RenderPipeline {
-        &self.0.range_pipeline
-    }
-}
-
-impl<'a> InstancedPipeline for TaRangePipeline<'a> {
-    const VERTICES_PER_INSTANCE: u32 = VERTICES_PER_TA_ELEMENT;
-}
-
-/// Wrapper for rendering TA levels through the Pipeline trait.
-pub struct TaLevelPipeline<'a>(pub &'a TaPipeline);
-
-impl<'a> crate::pipeline::traits::Pipeline for TaLevelPipeline<'a> {
-    type BindGroupData = wgpu::BindGroup;
-
-    fn render<'b>(
-        &'b self,
-        render_pass: &mut wgpu::RenderPass<'b>,
-        camera_bind_group: &'b wgpu::BindGroup,
-        data_bind_group: &'b wgpu::BindGroup,
-        vertex_range: Range<u32>,
-        instance_range: Range<u32>,
-    ) {
-        render_pass.set_pipeline(&self.0.level_pipeline);
-        render_pass.set_bind_group(0, camera_bind_group, &[]);
-        render_pass.set_bind_group(1, data_bind_group, &[]);
-        render_pass.draw(vertex_range, instance_range);
-    }
-
-    fn pipeline(&self) -> &wgpu::RenderPipeline {
-        &self.0.level_pipeline
-    }
-}
-
-impl<'a> InstancedPipeline for TaLevelPipeline<'a> {
-    const VERTICES_PER_INSTANCE: u32 = VERTICES_PER_TA_ELEMENT;
-}
-
-/// Wrapper for rendering TA trends through the Pipeline trait.
-pub struct TaTrendPipeline<'a>(pub &'a TaPipeline);
-
-impl<'a> crate::pipeline::traits::Pipeline for TaTrendPipeline<'a> {
-    type BindGroupData = wgpu::BindGroup;
-
-    fn render<'b>(
-        &'b self,
-        render_pass: &mut wgpu::RenderPass<'b>,
-        camera_bind_group: &'b wgpu::BindGroup,
-        data_bind_group: &'b wgpu::BindGroup,
-        vertex_range: Range<u32>,
-        instance_range: Range<u32>,
-    ) {
-        render_pass.set_pipeline(&self.0.trend_pipeline);
-        render_pass.set_bind_group(0, camera_bind_group, &[]);
-        render_pass.set_bind_group(1, data_bind_group, &[]);
-        render_pass.draw(vertex_range, instance_range);
-    }
-
-    fn pipeline(&self) -> &wgpu::RenderPipeline {
-        &self.0.trend_pipeline
-    }
-}
-
-impl<'a> InstancedPipeline for TaTrendPipeline<'a> {
-    const VERTICES_PER_INSTANCE: u32 = VERTICES_PER_TA_ELEMENT;
-}

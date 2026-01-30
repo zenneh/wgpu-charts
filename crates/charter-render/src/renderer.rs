@@ -6,15 +6,16 @@ use charter_core::Candle;
 
 use crate::camera::{Camera, CameraUniform};
 use crate::gpu_types::{
-    aggregate_candles_lod, aggregate_volume_lod, CandleGpu, CurrentPriceParams, GuidelineGpu,
-    GuidelineParams, LodConfig, PackedCandleGpu, PriceNormalization, RenderParams, VolumeGpu,
-    VolumeRenderParams, MAX_GUIDELINES,
+    CandleGpu, CurrentPriceParams, GuidelineGpu, GuidelineParams, LodConfig, MAX_GUIDELINES,
+    RenderParams, VolumeGpu, VolumeRenderParams, aggregate_candles_lod, aggregate_volume_lod,
 };
 use crate::pipeline::{
-    CandlePipeline, CurrentPricePipeline, GuidelinePipeline, IndicatorPipeline, TaPipeline,
-    VolumePipeline,
+    CandlePipeline, CurrentPricePipeline, GuidelinePipeline, IndicatorPipeline, SharedLayouts,
+    TaPipeline, VolumePipeline,
 };
-use crate::{BASE_CANDLE_WIDTH, CANDLE_SPACING, MIN_CANDLE_PIXELS, STATS_PANEL_WIDTH, VOLUME_HEIGHT_RATIO};
+use crate::{
+    BASE_CANDLE_WIDTH, CANDLE_SPACING, MIN_CANDLE_PIXELS, STATS_PANEL_WIDTH, VOLUME_HEIGHT_RATIO,
+};
 
 /// LOD data for a single level.
 pub struct LodData {
@@ -30,15 +31,13 @@ pub struct LodData {
 /// Pre-computed timeframe data with GPU buffers for candles, volume, and TA.
 pub struct TimeframeData {
     pub candles: Vec<Candle>,
-    /// Full resolution candle buffer (LOD 0) - uses packed u16 format.
+    /// Full resolution candle buffer (LOD 0).
     pub candle_buffer: wgpu::Buffer,
     pub candle_bind_group: wgpu::BindGroup,
     pub volume_buffer: wgpu::Buffer,
     pub volume_bind_group: wgpu::BindGroup,
     pub count: u32,
     pub max_volume: f32,
-    /// Price normalization parameters for packed candles.
-    pub price_normalization: PriceNormalization,
     /// LOD levels for zoomed-out rendering.
     pub lod_levels: Vec<LodData>,
     /// LOD configuration.
@@ -57,57 +56,87 @@ pub struct TimeframeData {
 impl TimeframeData {
     /// Get the LOD data for a given candles-per-pixel density.
     /// Returns (candle_bind_group, volume_bind_group, count, factor, max_volume).
-    pub fn lod_for_density(&self, candles_per_pixel: f32) -> (&wgpu::BindGroup, &wgpu::BindGroup, u32, usize, f32) {
+    pub fn lod_for_density(
+        &self,
+        candles_per_pixel: f32,
+    ) -> (&wgpu::BindGroup, &wgpu::BindGroup, u32, usize, f32) {
         let desired_factor = self.lod_config.factor_for_density(candles_per_pixel);
 
         // If full resolution is desired, return it immediately
         if desired_factor == 1 {
-            return (&self.candle_bind_group, &self.volume_bind_group, self.count, 1, self.max_volume);
+            return (
+                &self.candle_bind_group,
+                &self.volume_bind_group,
+                self.count,
+                1,
+                self.max_volume,
+            );
         }
 
         // Try to find exact match first
         if let Some(lod) = self.lod_levels.iter().find(|l| l.factor == desired_factor) {
-            return (&lod.candle_bind_group, &lod.volume_bind_group, lod.count, lod.factor, lod.max_volume);
+            return (
+                &lod.candle_bind_group,
+                &lod.volume_bind_group,
+                lod.count,
+                lod.factor,
+                lod.max_volume,
+            );
         }
 
         // Find the closest available LOD level (prefer slightly higher detail)
-        let closest_lod = self.lod_levels.iter()
-            .min_by_key(|lod| {
-                let diff = (lod.factor as i32 - desired_factor as i32).abs();
-                // Prefer lower factors (higher detail) when equally close
-                if lod.factor < desired_factor {
-                    diff * 10 // Penalize less detailed options less
-                } else {
-                    diff * 15 // Penalize more detailed options more
-                }
-            });
+        let closest_lod = self.lod_levels.iter().min_by_key(|lod| {
+            let diff = (lod.factor as i32 - desired_factor as i32).abs();
+            // Prefer lower factors (higher detail) when equally close
+            if lod.factor < desired_factor {
+                diff * 10 // Penalize less detailed options less
+            } else {
+                diff * 15 // Penalize more detailed options more
+            }
+        });
 
         if let Some(lod) = closest_lod {
-            (&lod.candle_bind_group, &lod.volume_bind_group, lod.count, lod.factor, lod.max_volume)
+            (
+                &lod.candle_bind_group,
+                &lod.volume_bind_group,
+                lod.count,
+                lod.factor,
+                lod.max_volume,
+            )
         } else {
             // Fallback to full resolution if no LOD levels exist
-            (&self.candle_bind_group, &self.volume_bind_group, self.count, 1, self.max_volume)
+            (
+                &self.candle_bind_group,
+                &self.volume_bind_group,
+                self.count,
+                1,
+                self.max_volume,
+            )
         }
     }
 }
 
+/// Grouped camera resources: camera state + GPU buffer + bind group.
+pub struct CameraBundle {
+    pub camera: Camera,
+    pub uniform: CameraUniform,
+    pub buffer: wgpu::Buffer,
+    pub bind_group: wgpu::BindGroup,
+}
+
 /// Coordinates all GPU rendering pipelines.
 pub struct ChartRenderer {
+    pub shared_layouts: SharedLayouts,
+
     pub candle_pipeline: CandlePipeline,
     pub volume_pipeline: VolumePipeline,
     pub guideline_pipeline: GuidelinePipeline,
     pub indicator_pipeline: IndicatorPipeline,
     pub ta_pipeline: TaPipeline,
+    pub current_price_pipeline: CurrentPricePipeline,
 
-    pub camera: Camera,
-    pub camera_uniform: CameraUniform,
-    pub camera_buffer: wgpu::Buffer,
-    pub camera_bind_group: wgpu::BindGroup,
-
-    pub volume_camera: Camera,
-    pub volume_camera_uniform: CameraUniform,
-    pub volume_camera_buffer: wgpu::Buffer,
-    pub volume_camera_bind_group: wgpu::BindGroup,
+    pub main_camera: CameraBundle,
+    pub volume_camera: CameraBundle,
 
     pub render_params_buffer: wgpu::Buffer,
     pub volume_params_buffer: wgpu::Buffer,
@@ -116,16 +145,12 @@ pub struct ChartRenderer {
     pub guideline_params_buffer: wgpu::Buffer,
     pub guideline_bind_group: wgpu::BindGroup,
     pub guideline_count: u32,
-    pub guideline_values: Vec<f32>, // Y-values for price labels
+    pub guideline_values: Vec<f32>,
 
-    // Current price line (dotted line at current price when ws connected)
-    pub current_price_pipeline: CurrentPricePipeline,
     pub current_price_params_buffer: wgpu::Buffer,
     pub current_price_bind_group: wgpu::BindGroup,
     pub current_price: Option<f32>,
-    /// Open price of the current candle (for determining bullish/bearish color)
     current_price_open: f32,
-    /// X bounds for current price line
     current_price_x_min: f32,
     current_price_x_max: f32,
 
@@ -150,12 +175,13 @@ impl ChartRenderer {
         height: u32,
         initial_candles: &[Candle],
     ) -> Self {
-        // Create pipelines
-        let candle_pipeline = CandlePipeline::new(device, format);
-        let volume_pipeline = VolumePipeline::new(device, format, &candle_pipeline.camera_bind_group_layout);
-        let guideline_pipeline = GuidelinePipeline::new(device, format, &candle_pipeline.camera_bind_group_layout);
-        let indicator_pipeline = IndicatorPipeline::new(device, format, &candle_pipeline.camera_bind_group_layout);
-        let ta_pipeline = TaPipeline::new(device, format, &candle_pipeline.camera_bind_group_layout);
+        // Create shared layouts and pipelines
+        let shared = SharedLayouts::new(device);
+        let candle_pipeline = CandlePipeline::new(device, format, &shared);
+        let volume_pipeline = VolumePipeline::new(device, format, &shared);
+        let guideline_pipeline = GuidelinePipeline::new(device, format, &shared);
+        let indicator_pipeline = IndicatorPipeline::new(device, format, &shared);
+        let ta_pipeline = TaPipeline::new(device, format, &shared);
 
         // Camera setup
         let mut camera = Camera::new();
@@ -177,20 +203,15 @@ impl ChartRenderer {
         let aspect = width as f32 / height as f32;
         camera_uniform.update_view_proj(&camera, aspect);
 
-        let camera_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("Camera Buffer"),
-            contents: bytemuck::cast_slice(&[camera_uniform]),
-            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-        });
+        let (camera_buffer, camera_bind_group) =
+            shared.create_camera_resources(device, "Camera", &camera_uniform);
 
-        let camera_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            layout: &candle_pipeline.camera_bind_group_layout,
-            entries: &[wgpu::BindGroupEntry {
-                binding: 0,
-                resource: camera_buffer.as_entire_binding(),
-            }],
-            label: Some("camera_bind_group"),
-        });
+        let main_camera = CameraBundle {
+            camera,
+            uniform: camera_uniform,
+            buffer: camera_buffer,
+            bind_group: camera_bind_group,
+        };
 
         // Volume camera
         let mut volume_camera = Camera::new();
@@ -200,20 +221,15 @@ impl ChartRenderer {
         let mut volume_camera_uniform = CameraUniform::new();
         volume_camera_uniform.update_view_proj(&volume_camera, aspect);
 
-        let volume_camera_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("Volume Camera Buffer"),
-            contents: bytemuck::cast_slice(&[volume_camera_uniform]),
-            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-        });
+        let (volume_camera_buffer, volume_camera_bind_group) =
+            shared.create_camera_resources(device, "Volume Camera", &volume_camera_uniform);
 
-        let volume_camera_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            layout: &candle_pipeline.camera_bind_group_layout,
-            entries: &[wgpu::BindGroupEntry {
-                binding: 0,
-                resource: volume_camera_buffer.as_entire_binding(),
-            }],
-            label: Some("volume_camera_bind_group"),
-        });
+        let volume_camera = CameraBundle {
+            camera: volume_camera,
+            uniform: volume_camera_uniform,
+            buffer: volume_camera_buffer,
+            bind_group: volume_camera_bind_group,
+        };
 
         // Render params
         let render_params_buffer = candle_pipeline.create_render_params_buffer(device);
@@ -221,30 +237,30 @@ impl ChartRenderer {
 
         // Guidelines
         let guideline_buffer = guideline_pipeline.create_guideline_buffer(device);
-        let guideline_params_buffer = guideline_pipeline.create_guideline_params_buffer(device, x_max, price_range);
-        let guideline_bind_group = guideline_pipeline.create_bind_group(device, &guideline_buffer, &guideline_params_buffer);
+        let guideline_params_buffer =
+            guideline_pipeline.create_guideline_params_buffer(device, x_max, price_range);
+        let guideline_bind_group = guideline_pipeline.create_bind_group(
+            device,
+            &guideline_buffer,
+            &guideline_params_buffer,
+        );
 
         // Current price line
-        let current_price_pipeline =
-            CurrentPricePipeline::new(device, format, &candle_pipeline.camera_bind_group_layout);
+        let current_price_pipeline = CurrentPricePipeline::new(device, format, &shared);
         let current_price_params_buffer = current_price_pipeline.create_params_buffer(device);
         let current_price_bind_group =
             current_price_pipeline.create_bind_group(device, &current_price_params_buffer);
 
         Self {
+            shared_layouts: shared,
             candle_pipeline,
             volume_pipeline,
             guideline_pipeline,
             indicator_pipeline,
             ta_pipeline,
-            camera,
-            camera_uniform,
-            camera_buffer,
-            camera_bind_group,
+            current_price_pipeline,
+            main_camera,
             volume_camera,
-            volume_camera_uniform,
-            volume_camera_buffer,
-            volume_camera_bind_group,
             render_params_buffer,
             volume_params_buffer,
             guideline_buffer,
@@ -252,7 +268,6 @@ impl ChartRenderer {
             guideline_bind_group,
             guideline_count: 0,
             guideline_values: Vec::new(),
-            current_price_pipeline,
             current_price_params_buffer,
             current_price_bind_group,
             current_price: None,
@@ -284,17 +299,19 @@ impl ChartRenderer {
         label: &str,
         lod_config: LodConfig,
     ) -> TimeframeData {
-        // Compute price normalization for packed candles (50% memory savings)
-        let price_normalization = PriceNormalization::from_candles(&candles);
-
-        // Pack candles to u16 format (8 bytes per candle instead of 16)
-        let packed_candles = price_normalization.pack_candles(&candles);
+        // Convert candles to GPU format (full f32 precision)
+        let candles_gpu: Vec<CandleGpu> = candles.iter().map(CandleGpu::from).collect();
 
         // Ensure we have at least one element for GPU buffers (wgpu doesn't allow zero-sized buffers)
-        let candles_for_buffer = if packed_candles.is_empty() {
-            vec![PackedCandleGpu { open: 0, high: 0, low: 0, close: 0 }]
+        let candles_for_buffer = if candles_gpu.is_empty() {
+            vec![CandleGpu {
+                open: 0.0,
+                high: 0.0,
+                low: 0.0,
+                close: 0.0,
+            }]
         } else {
-            packed_candles
+            candles_gpu.clone()
         };
 
         let candle_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -314,7 +331,12 @@ impl ChartRenderer {
 
         // Ensure we have at least one element for GPU buffers
         let volume_for_buffer = if volume_gpu.is_empty() {
-            vec![VolumeGpu { volume: 0.0, is_bullish: 1, _padding1: 0.0, _padding2: 0.0 }]
+            vec![VolumeGpu {
+                volume: 0.0,
+                is_bullish: 1,
+                _padding1: 0.0,
+                _padding2: 0.0,
+            }]
         } else {
             volume_gpu.clone()
         };
@@ -331,25 +353,23 @@ impl ChartRenderer {
             &self.volume_params_buffer,
         );
 
-        // Create LOD levels using packed candles
-        let candles_gpu: Vec<CandleGpu> = candles.iter().map(CandleGpu::from).collect();
+        // Create LOD levels
         let mut lod_levels = Vec::new();
 
         // Generate LOD levels based on configuration
         for &factor in lod_config.factors() {
             // Only create LOD if we have enough candles (at least 5x the factor for meaningful aggregation)
             if candles_gpu.len() > factor * 5 {
-                // Aggregate then pack for LOD
-                let lod_candles_gpu = aggregate_candles_lod(&candles_gpu, factor);
-                let lod_packed = price_normalization.pack_candles_gpu(&lod_candles_gpu);
+                let lod_candles = aggregate_candles_lod(&candles_gpu, factor);
                 let lod_volume = aggregate_volume_lod(&volume_gpu, &candles_gpu, factor);
                 let lod_max_volume = lod_volume.iter().map(|v| v.volume).fold(0.0f32, f32::max);
 
-                let lod_candle_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                    label: Some(&format!("Candle Buffer {} LOD {}", label, factor)),
-                    contents: bytemuck::cast_slice(&lod_packed),
-                    usage: wgpu::BufferUsages::STORAGE,
-                });
+                let lod_candle_buffer =
+                    device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                        label: Some(&format!("Candle Buffer {} LOD {}", label, factor)),
+                        contents: bytemuck::cast_slice(&lod_candles),
+                        usage: wgpu::BufferUsages::STORAGE,
+                    });
 
                 let lod_candle_bind_group = self.candle_pipeline.create_bind_group(
                     device,
@@ -357,11 +377,12 @@ impl ChartRenderer {
                     &self.render_params_buffer,
                 );
 
-                let lod_volume_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                    label: Some(&format!("Volume Buffer {} LOD {}", label, factor)),
-                    contents: bytemuck::cast_slice(&lod_volume),
-                    usage: wgpu::BufferUsages::STORAGE,
-                });
+                let lod_volume_buffer =
+                    device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                        label: Some(&format!("Volume Buffer {} LOD {}", label, factor)),
+                        contents: bytemuck::cast_slice(&lod_volume),
+                        usage: wgpu::BufferUsages::STORAGE,
+                    });
 
                 let lod_volume_bind_group = self.volume_pipeline.create_bind_group(
                     device,
@@ -374,7 +395,7 @@ impl ChartRenderer {
                     candle_bind_group: lod_candle_bind_group,
                     volume_buffer: lod_volume_buffer,
                     volume_bind_group: lod_volume_bind_group,
-                    count: lod_packed.len() as u32,
+                    count: lod_candles.len() as u32,
                     max_volume: lod_max_volume,
                     factor,
                 });
@@ -404,7 +425,6 @@ impl ChartRenderer {
             volume_bind_group,
             count,
             max_volume,
-            price_normalization,
             lod_levels,
             lod_config,
             ta_range_buffer,
@@ -427,17 +447,19 @@ impl ChartRenderer {
         candles: Vec<Candle>,
         label: &str,
     ) -> TimeframeData {
-        // Compute price normalization for packed candles
-        let price_normalization = PriceNormalization::from_candles(&candles);
-
-        // Pack candles to u16 format
-        let packed_candles = price_normalization.pack_candles(&candles);
+        // Convert candles to GPU format (full f32 precision)
+        let candles_gpu: Vec<CandleGpu> = candles.iter().map(CandleGpu::from).collect();
 
         // Ensure we have at least one element for GPU buffers
-        let candles_for_buffer = if packed_candles.is_empty() {
-            vec![PackedCandleGpu { open: 0, high: 0, low: 0, close: 0 }]
+        let candles_for_buffer = if candles_gpu.is_empty() {
+            vec![CandleGpu {
+                open: 0.0,
+                high: 0.0,
+                low: 0.0,
+                close: 0.0,
+            }]
         } else {
-            packed_candles
+            candles_gpu.clone()
         };
 
         let candle_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -456,7 +478,12 @@ impl ChartRenderer {
         let max_volume = candles.iter().map(|c| c.volume).fold(0.0f32, f32::max);
 
         let volume_for_buffer = if volume_gpu.is_empty() {
-            vec![VolumeGpu { volume: 0.0, is_bullish: 1, _padding1: 0.0, _padding2: 0.0 }]
+            vec![VolumeGpu {
+                volume: 0.0,
+                is_bullish: 1,
+                _padding1: 0.0,
+                _padding2: 0.0,
+            }]
         } else {
             volume_gpu.clone()
         };
@@ -474,22 +501,21 @@ impl ChartRenderer {
         );
 
         // Create LOD levels
-        let candles_gpu: Vec<CandleGpu> = candles.iter().map(CandleGpu::from).collect();
         let mut lod_levels = Vec::new();
         let lod_config = existing.lod_config.clone();
 
         for &factor in lod_config.factors() {
             if candles_gpu.len() > factor * 5 {
-                let lod_candles_gpu = aggregate_candles_lod(&candles_gpu, factor);
-                let lod_packed = price_normalization.pack_candles_gpu(&lod_candles_gpu);
+                let lod_candles = aggregate_candles_lod(&candles_gpu, factor);
                 let lod_volume = aggregate_volume_lod(&volume_gpu, &candles_gpu, factor);
                 let lod_max_volume = lod_volume.iter().map(|v| v.volume).fold(0.0f32, f32::max);
 
-                let lod_candle_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                    label: Some(&format!("Candle Buffer {} LOD {}", label, factor)),
-                    contents: bytemuck::cast_slice(&lod_packed),
-                    usage: wgpu::BufferUsages::STORAGE,
-                });
+                let lod_candle_buffer =
+                    device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                        label: Some(&format!("Candle Buffer {} LOD {}", label, factor)),
+                        contents: bytemuck::cast_slice(&lod_candles),
+                        usage: wgpu::BufferUsages::STORAGE,
+                    });
 
                 let lod_candle_bind_group = self.candle_pipeline.create_bind_group(
                     device,
@@ -497,11 +523,12 @@ impl ChartRenderer {
                     &self.render_params_buffer,
                 );
 
-                let lod_volume_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                    label: Some(&format!("Volume Buffer {} LOD {}", label, factor)),
-                    contents: bytemuck::cast_slice(&lod_volume),
-                    usage: wgpu::BufferUsages::STORAGE,
-                });
+                let lod_volume_buffer =
+                    device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                        label: Some(&format!("Volume Buffer {} LOD {}", label, factor)),
+                        contents: bytemuck::cast_slice(&lod_volume),
+                        usage: wgpu::BufferUsages::STORAGE,
+                    });
 
                 let lod_volume_bind_group = self.volume_pipeline.create_bind_group(
                     device,
@@ -514,7 +541,7 @@ impl ChartRenderer {
                     candle_bind_group: lod_candle_bind_group,
                     volume_buffer: lod_volume_buffer,
                     volume_bind_group: lod_volume_bind_group,
-                    count: lod_packed.len() as u32,
+                    count: lod_candles.len() as u32,
                     max_volume: lod_max_volume,
                     factor,
                 });
@@ -544,7 +571,6 @@ impl ChartRenderer {
             volume_bind_group,
             count,
             max_volume,
-            price_normalization,
             lod_levels,
             lod_config,
             ta_range_buffer,
@@ -569,22 +595,26 @@ impl ChartRenderer {
         let chart_height = self.config_height as f32 * (1.0 - VOLUME_HEIGHT_RATIO);
         let aspect = chart_width / chart_height;
 
-        self.camera_uniform.update_view_proj(&self.camera, aspect);
+        self.main_camera
+            .uniform
+            .update_view_proj(&self.main_camera.camera, aspect);
         queue.write_buffer(
-            &self.camera_buffer,
+            &self.main_camera.buffer,
             0,
-            bytemuck::cast_slice(&[self.camera_uniform]),
+            bytemuck::cast_slice(&[self.main_camera.uniform]),
         );
 
-        self.volume_camera.position[0] = self.camera.position[0];
-        self.volume_camera.scale[0] = self.camera.scale[0];
+        self.volume_camera.camera.position[0] = self.main_camera.camera.position[0];
+        self.volume_camera.camera.scale[0] = self.main_camera.camera.scale[0];
         // Use the same aspect ratio as the chart for X alignment
         // The Y scaling is handled by the volume camera's scale[1] and viewport
-        self.volume_camera_uniform.update_view_proj(&self.volume_camera, aspect);
+        self.volume_camera
+            .uniform
+            .update_view_proj(&self.volume_camera.camera, aspect);
         queue.write_buffer(
-            &self.volume_camera_buffer,
+            &self.volume_camera.buffer,
             0,
-            bytemuck::cast_slice(&[self.volume_camera_uniform]),
+            bytemuck::cast_slice(&[self.volume_camera.uniform]),
         );
     }
 
@@ -592,8 +622,8 @@ impl ChartRenderer {
         let chart_width = self.config_width as f32 - STATS_PANEL_WIDTH;
         let chart_height = self.config_height as f32 * (1.0 - VOLUME_HEIGHT_RATIO);
         let aspect = chart_width / chart_height;
-        let (x_min, x_max) = self.camera.visible_x_range(aspect);
-        let (y_min, y_max) = self.camera.visible_y_range(aspect);
+        let (x_min, x_max) = self.main_camera.camera.visible_x_range(aspect);
+        let (y_min, y_max) = self.main_camera.camera.visible_y_range(aspect);
 
         let visible_width = x_max - x_min;
 
@@ -602,16 +632,24 @@ impl ChartRenderer {
         self.candles_per_pixel = visible_candles_approx / chart_width;
 
         // Select appropriate LOD based on density
-        let desired_factor = timeframe.lod_config.factor_for_density(self.candles_per_pixel);
+        let desired_factor = timeframe
+            .lod_config
+            .factor_for_density(self.candles_per_pixel);
 
         // Find the best available LOD factor
         self.current_lod_factor = if desired_factor == 1 {
             1
-        } else if let Some(lod) = timeframe.lod_levels.iter().find(|l| l.factor == desired_factor) {
+        } else if let Some(lod) = timeframe
+            .lod_levels
+            .iter()
+            .find(|l| l.factor == desired_factor)
+        {
             lod.factor
         } else {
             // Find closest available LOD level
-            timeframe.lod_levels.iter()
+            timeframe
+                .lod_levels
+                .iter()
                 .min_by_key(|lod| {
                     let diff = (lod.factor as i32 - desired_factor as i32).abs();
                     if lod.factor < desired_factor {
@@ -626,10 +664,12 @@ impl ChartRenderer {
 
         // Compute effective values based on LOD
         let effective_spacing = CANDLE_SPACING * self.current_lod_factor as f32;
-        let effective_candle_count = (timeframe.candles.len() + self.current_lod_factor - 1) / self.current_lod_factor;
+        let effective_candle_count =
+            (timeframe.candles.len() + self.current_lod_factor - 1) / self.current_lod_factor;
 
         let first_idx = ((x_min / effective_spacing).floor() as i32 - 1).max(0) as u32;
-        let last_idx = ((x_max / effective_spacing).ceil() as i32 + 1).min(effective_candle_count as i32) as u32;
+        let last_idx = ((x_max / effective_spacing).ceil() as i32 + 1)
+            .min(effective_candle_count as i32) as u32;
 
         self.visible_start = first_idx;
         self.visible_count = if last_idx > first_idx {
@@ -640,7 +680,8 @@ impl ChartRenderer {
 
         let world_units_per_pixel = visible_width / chart_width;
         let min_world_width = MIN_CANDLE_PIXELS * world_units_per_pixel;
-        let desired_width = (BASE_CANDLE_WIDTH * self.current_lod_factor as f32).max(min_world_width);
+        let desired_width =
+            (BASE_CANDLE_WIDTH * self.current_lod_factor as f32).max(min_world_width);
         // Ensure candle width never exceeds spacing to prevent overlap
         let candle_width = desired_width.min(effective_spacing * 0.95);
 
@@ -668,8 +709,6 @@ impl ChartRenderer {
             x_max,
             y_min,
             y_max,
-            price_min: timeframe.price_normalization.price_min,
-            price_range: timeframe.price_normalization.price_range,
             min_body_height,
             _padding: 0.0,
         };
@@ -690,7 +729,11 @@ impl ChartRenderer {
                 .map(|c| c.volume)
                 .fold(0.0f32, f32::max)
                 .max(1.0)
-        } else if let Some(lod) = timeframe.lod_levels.iter().find(|l| l.factor == self.current_lod_factor) {
+        } else if let Some(lod) = timeframe
+            .lod_levels
+            .iter()
+            .find(|l| l.factor == self.current_lod_factor)
+        {
             lod.max_volume
         } else {
             timeframe.max_volume
@@ -714,7 +757,7 @@ impl ChartRenderer {
     fn update_guidelines(&mut self, queue: &wgpu::Queue, x_min: f32, x_max: f32) {
         let chart_height = self.config_height as f32 * (1.0 - VOLUME_HEIGHT_RATIO);
         let aspect = (self.config_width as f32 - STATS_PANEL_WIDTH) / chart_height;
-        let (y_min, y_max) = self.camera.visible_y_range(aspect);
+        let (y_min, y_max) = self.main_camera.camera.visible_y_range(aspect);
 
         let price_range = y_max - y_min;
 
@@ -782,11 +825,9 @@ impl ChartRenderer {
             return;
         }
 
-        let (min_price, max_price) = candles
-            .iter()
-            .fold((f32::MAX, f32::MIN), |(min, max), c| {
-                (min.min(c.low), max.max(c.high))
-            });
+        let (min_price, max_price) = candles.iter().fold((f32::MAX, f32::MIN), |(min, max), c| {
+            (min.min(c.low), max.max(c.high))
+        });
         let price_center = (min_price + max_price) / 2.0;
         let price_range = (max_price - min_price) * 1.1;
 
@@ -796,8 +837,8 @@ impl ChartRenderer {
         let aspect = self.config_width as f32 / self.config_height as f32;
         let x_scale = x_max / 2.0 / aspect;
 
-        self.camera.position = [x_center, price_center];
-        self.camera.scale = [x_scale, price_range / 2.0];
+        self.main_camera.camera.position = [x_center, price_center];
+        self.main_camera.camera.scale = [x_scale, price_range / 2.0];
 
         self.update_camera(queue);
     }
@@ -812,7 +853,14 @@ impl ChartRenderer {
 
     /// Update the current price line. Set to None to hide it.
     /// `open_price` is the open price of the current candle, used to determine color (bullish/bearish).
-    pub fn set_current_price(&mut self, queue: &wgpu::Queue, price: Option<f32>, open_price: f32, x_min: f32, x_max: f32) {
+    pub fn set_current_price(
+        &mut self,
+        queue: &wgpu::Queue,
+        price: Option<f32>,
+        open_price: f32,
+        x_min: f32,
+        x_max: f32,
+    ) {
         self.current_price = price;
         self.current_price_open = open_price;
         self.current_price_x_min = x_min;
@@ -821,17 +869,17 @@ impl ChartRenderer {
         // Determine color based on candle direction (bullish = green, bearish = red)
         let (r, g, b) = if let Some(close) = price {
             if close >= open_price {
-                (0.0, 0.8, 0.4)  // Green for bullish (close >= open)
+                (0.0, 0.8, 0.4) // Green for bullish (close >= open)
             } else {
-                (0.8, 0.2, 0.2)  // Red for bearish (close < open)
+                (0.8, 0.2, 0.2) // Red for bearish (close < open)
             }
         } else {
-            (1.0, 0.843, 0.0)  // Default gold/yellow when no price
+            (1.0, 0.843, 0.0) // Default gold/yellow when no price
         };
 
         let chart_height = self.config_height as f32 * (1.0 - VOLUME_HEIGHT_RATIO);
         let aspect = (self.config_width as f32 - STATS_PANEL_WIDTH) / chart_height;
-        let (y_min, y_max) = self.camera.visible_y_range(aspect);
+        let (y_min, y_max) = self.main_camera.camera.visible_y_range(aspect);
         let price_range = y_max - y_min;
         let world_units_per_pixel = price_range / chart_height;
         // 1.0 for exactly 1 pixel thickness
@@ -869,16 +917,16 @@ impl ChartRenderer {
 
         // Determine color based on candle direction (bullish = green, bearish = red)
         let (r, g, b) = if price >= self.current_price_open {
-            (0.0, 0.8, 0.4)  // Green for bullish (close >= open)
+            (0.0, 0.8, 0.4) // Green for bullish (close >= open)
         } else {
-            (0.8, 0.2, 0.2)  // Red for bearish (close < open)
+            (0.8, 0.2, 0.2) // Red for bearish (close < open)
         };
 
         let chart_height = self.config_height as f32 * (1.0 - VOLUME_HEIGHT_RATIO);
         let chart_width = self.config_width as f32 - STATS_PANEL_WIDTH;
         let aspect = chart_width / chart_height;
-        let (y_min, y_max) = self.camera.visible_y_range(aspect);
-        let (x_min, x_max) = self.camera.visible_x_range(aspect);
+        let (y_min, y_max) = self.main_camera.camera.visible_y_range(aspect);
+        let (x_min, x_max) = self.main_camera.camera.visible_x_range(aspect);
         let price_range = y_max - y_min;
         let world_units_per_pixel = price_range / chart_height;
         // 1.0 for exactly 1 pixel thickness
@@ -911,14 +959,11 @@ impl ChartRenderer {
     }
 
     /// Render the current price line.
-    pub fn render_current_price<'a>(
-        &'a self,
-        render_pass: &mut wgpu::RenderPass<'a>,
-    ) {
+    pub fn render_current_price<'a>(&'a self, render_pass: &mut wgpu::RenderPass<'a>) {
         if self.current_price.is_some() {
             self.current_price_pipeline.render_line(
                 render_pass,
-                &self.camera_bind_group,
+                &self.main_camera.bind_group,
                 &self.current_price_bind_group,
             );
         }

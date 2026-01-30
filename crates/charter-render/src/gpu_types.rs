@@ -23,104 +23,6 @@ impl From<&Candle> for CandleGpu {
     }
 }
 
-/// Packed GPU-compatible candle data (8 bytes) - 50% memory reduction.
-/// Values are normalized to u16 (0-65535) based on price_min and price_range.
-/// Shader denormalizes: price = price_min + (packed_value / 65535.0) * price_range
-#[repr(C)]
-#[derive(Debug, Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
-pub struct PackedCandleGpu {
-    pub open: u16,
-    pub high: u16,
-    pub low: u16,
-    pub close: u16,
-}
-
-impl PackedCandleGpu {
-    /// Create a packed candle from normalized values.
-    pub fn from_normalized(open: f32, high: f32, low: f32, close: f32) -> Self {
-        Self {
-            open: (open.clamp(0.0, 1.0) * 65535.0) as u16,
-            high: (high.clamp(0.0, 1.0) * 65535.0) as u16,
-            low: (low.clamp(0.0, 1.0) * 65535.0) as u16,
-            close: (close.clamp(0.0, 1.0) * 65535.0) as u16,
-        }
-    }
-}
-
-/// Normalization parameters for packed candles.
-#[derive(Debug, Clone, Copy)]
-pub struct PriceNormalization {
-    pub price_min: f32,
-    pub price_range: f32, // price_max - price_min
-}
-
-impl PriceNormalization {
-    /// Compute normalization parameters from candles.
-    pub fn from_candles(candles: &[Candle]) -> Self {
-        if candles.is_empty() {
-            return Self {
-                price_min: 0.0,
-                price_range: 1.0,
-            };
-        }
-
-        let mut min_price = f32::MAX;
-        let mut max_price = f32::MIN;
-
-        for c in candles {
-            min_price = min_price.min(c.low);
-            max_price = max_price.max(c.high);
-        }
-
-        // Add small padding to avoid edge cases
-        let padding = (max_price - min_price) * 0.001;
-        min_price -= padding;
-        max_price += padding;
-
-        let range = (max_price - min_price).max(0.001); // Avoid division by zero
-
-        Self {
-            price_min: min_price,
-            price_range: range,
-        }
-    }
-
-    /// Normalize a price value to 0.0-1.0 range.
-    pub fn normalize(&self, price: f32) -> f32 {
-        (price - self.price_min) / self.price_range
-    }
-
-    /// Pack candles using this normalization.
-    pub fn pack_candles(&self, candles: &[Candle]) -> Vec<PackedCandleGpu> {
-        candles
-            .iter()
-            .map(|c| {
-                PackedCandleGpu::from_normalized(
-                    self.normalize(c.open),
-                    self.normalize(c.high),
-                    self.normalize(c.low),
-                    self.normalize(c.close),
-                )
-            })
-            .collect()
-    }
-
-    /// Pack CandleGpu values using this normalization.
-    pub fn pack_candles_gpu(&self, candles: &[CandleGpu]) -> Vec<PackedCandleGpu> {
-        candles
-            .iter()
-            .map(|c| {
-                PackedCandleGpu::from_normalized(
-                    self.normalize(c.open),
-                    self.normalize(c.high),
-                    self.normalize(c.low),
-                    self.normalize(c.close),
-                )
-            })
-            .collect()
-    }
-}
-
 /// GPU-compatible volume bar data.
 #[repr(C)]
 #[derive(Debug, Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
@@ -166,9 +68,6 @@ pub struct RenderParams {
     /// Visible Y range for GPU-side culling.
     pub y_min: f32,
     pub y_max: f32,
-    /// Price denormalization: price = price_min + normalized * price_range
-    pub price_min: f32,
-    pub price_range: f32,
     /// Minimum body height for doji candles (should be small, ~1 pixel).
     pub min_body_height: f32,
     pub _padding: f32,
@@ -201,16 +100,16 @@ pub const MAX_GUIDELINES: usize = 32;
 #[repr(C)]
 #[derive(Debug, Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct CurrentPriceParams {
-    pub y_value: f32,           // Price level
-    pub x_min: f32,             // Left edge
-    pub x_max: f32,             // Right edge
-    pub line_thickness: f32,    // Thickness in world units
-    pub r: f32,                 // Red component
-    pub g: f32,                 // Green component
-    pub b: f32,                 // Blue component
-    pub visible: u32,           // 1 = visible, 0 = hidden
-    pub dot_spacing: f32,       // Spacing between dots in world units
-    pub screen_width: f32,      // Screen width in pixels
+    pub y_value: f32,        // Price level
+    pub x_min: f32,          // Left edge
+    pub x_max: f32,          // Right edge
+    pub line_thickness: f32, // Thickness in world units
+    pub r: f32,              // Red component
+    pub g: f32,              // Green component
+    pub b: f32,              // Blue component
+    pub visible: u32,        // 1 = visible, 0 = hidden
+    pub dot_spacing: f32,    // Spacing between dots in world units
+    pub screen_width: f32,   // Screen width in pixels
     pub _padding1: f32,
     pub _padding2: f32,
 }
@@ -222,7 +121,7 @@ impl Default for CurrentPriceParams {
             x_min: 0.0,
             x_max: 0.0,
             line_thickness: 0.0,
-            r: 1.0,      // Yellow/gold color
+            r: 1.0, // Yellow/gold color
             g: 0.843,
             b: 0.0,
             visible: 0,
@@ -411,7 +310,10 @@ impl LodConfig {
             thresholds.push((factor as f32) / 2.0);
         }
 
-        Self { factors, thresholds }
+        Self {
+            factors,
+            thresholds,
+        }
     }
 
     /// Create a configuration with linear spacing between factors.
@@ -426,7 +328,10 @@ impl LodConfig {
             factor += step;
         }
 
-        Self { factors, thresholds }
+        Self {
+            factors,
+            thresholds,
+        }
     }
 }
 
@@ -443,7 +348,12 @@ pub fn aggregate_candles_lod(candles: &[CandleGpu], factor: usize) -> Vec<Candle
             let close = chunk.last().map(|c| c.close).unwrap_or(0.0);
             let high = chunk.iter().map(|c| c.high).fold(f32::MIN, f32::max);
             let low = chunk.iter().map(|c| c.low).fold(f32::MAX, f32::min);
-            CandleGpu { open, high, low, close }
+            CandleGpu {
+                open,
+                high,
+                low,
+                close,
+            }
         })
         .collect()
 }
@@ -451,7 +361,11 @@ pub fn aggregate_candles_lod(candles: &[CandleGpu], factor: usize) -> Vec<Candle
 /// Aggregates volume for LOD rendering.
 /// The is_bullish flag is determined by comparing the aggregated period's
 /// first open price with the last close price (net price movement).
-pub fn aggregate_volume_lod(volumes: &[VolumeGpu], candles: &[CandleGpu], factor: usize) -> Vec<VolumeGpu> {
+pub fn aggregate_volume_lod(
+    volumes: &[VolumeGpu],
+    candles: &[CandleGpu],
+    factor: usize,
+) -> Vec<VolumeGpu> {
     if factor <= 1 {
         return volumes.to_vec();
     }

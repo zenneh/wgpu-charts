@@ -12,6 +12,7 @@ use crate::gpu_types::{
     AnchorGpu, DrawingHRayGpu, DrawingRayGpu, DrawingRectGpu, DrawingRenderParams,
     MAX_DRAWING_ANCHORS, MAX_DRAWING_HRAYS, MAX_DRAWING_RAYS, MAX_DRAWING_RECTS,
 };
+use crate::pipeline::shared::SharedLayouts;
 
 /// Number of vertices per drawing element (2 triangles = 6 vertices).
 const VERTICES_PER_ELEMENT: u32 = 6;
@@ -392,7 +393,7 @@ impl DrawingPipeline {
     pub fn new(
         device: &wgpu::Device,
         format: wgpu::TextureFormat,
-        camera_bind_group_layout: &wgpu::BindGroupLayout,
+        shared: &SharedLayouts,
     ) -> Self {
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("Drawing Shader"),
@@ -402,119 +403,79 @@ impl DrawingPipeline {
         let bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             entries: &[
                 // Horizontal rays storage buffer
-                wgpu::BindGroupLayoutEntry {
-                    binding: 0,
-                    visibility: wgpu::ShaderStages::VERTEX,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Storage { read_only: true },
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
-                    },
-                    count: None,
-                },
+                SharedLayouts::storage_entry(0, wgpu::ShaderStages::VERTEX),
                 // Rays storage buffer
-                wgpu::BindGroupLayoutEntry {
-                    binding: 1,
-                    visibility: wgpu::ShaderStages::VERTEX,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Storage { read_only: true },
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
-                    },
-                    count: None,
-                },
+                SharedLayouts::storage_entry(1, wgpu::ShaderStages::VERTEX),
                 // Rectangles storage buffer
-                wgpu::BindGroupLayoutEntry {
-                    binding: 2,
-                    visibility: wgpu::ShaderStages::VERTEX,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Storage { read_only: true },
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
-                    },
-                    count: None,
-                },
+                SharedLayouts::storage_entry(2, wgpu::ShaderStages::VERTEX),
                 // Anchors storage buffer
-                wgpu::BindGroupLayoutEntry {
-                    binding: 3,
-                    visibility: wgpu::ShaderStages::VERTEX,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Storage { read_only: true },
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
-                    },
-                    count: None,
-                },
+                SharedLayouts::storage_entry(3, wgpu::ShaderStages::VERTEX),
                 // Params uniform
-                wgpu::BindGroupLayoutEntry {
-                    binding: 4,
-                    visibility: wgpu::ShaderStages::VERTEX,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Uniform,
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
-                    },
-                    count: None,
-                },
+                SharedLayouts::uniform_entry(4, wgpu::ShaderStages::VERTEX),
             ],
             label: Some("drawing_bind_group_layout"),
         });
 
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("Drawing Pipeline Layout"),
-            bind_group_layouts: &[camera_bind_group_layout, &bind_group_layout],
+            bind_group_layouts: &[&shared.camera_bind_group_layout, &bind_group_layout],
             push_constant_ranges: &[],
         });
 
         // Create pipelines for each drawing type
-        let hray_pipeline = Self::create_pipeline(
+        let hray_pipeline = SharedLayouts::create_render_pipeline(
             device,
+            "Drawing HRay Pipeline",
             &pipeline_layout,
             &shader,
             "vs_hray",
             "fs_hray",
-            "Drawing HRay Pipeline",
             format,
+            wgpu::BlendState::ALPHA_BLENDING,
         );
 
-        let ray_pipeline = Self::create_pipeline(
+        let ray_pipeline = SharedLayouts::create_render_pipeline(
             device,
+            "Drawing Ray Pipeline",
             &pipeline_layout,
             &shader,
             "vs_ray",
             "fs_ray",
-            "Drawing Ray Pipeline",
             format,
+            wgpu::BlendState::ALPHA_BLENDING,
         );
 
-        let rect_fill_pipeline = Self::create_pipeline(
+        let rect_fill_pipeline = SharedLayouts::create_render_pipeline(
             device,
+            "Drawing Rect Fill Pipeline",
             &pipeline_layout,
             &shader,
             "vs_rect_fill",
             "fs_rect_fill",
-            "Drawing Rect Fill Pipeline",
             format,
+            wgpu::BlendState::ALPHA_BLENDING,
         );
 
-        let rect_border_pipeline = Self::create_pipeline(
+        let rect_border_pipeline = SharedLayouts::create_render_pipeline(
             device,
+            "Drawing Rect Border Pipeline",
             &pipeline_layout,
             &shader,
             "vs_rect_border",
             "fs_rect_border",
-            "Drawing Rect Border Pipeline",
             format,
+            wgpu::BlendState::ALPHA_BLENDING,
         );
 
-        let anchor_pipeline = Self::create_pipeline(
+        let anchor_pipeline = SharedLayouts::create_render_pipeline(
             device,
+            "Drawing Anchor Pipeline",
             &pipeline_layout,
             &shader,
             "vs_anchor",
             "fs_anchor",
-            "Drawing Anchor Pipeline",
             format,
+            wgpu::BlendState::ALPHA_BLENDING,
         );
 
         Self {
@@ -525,54 +486,6 @@ impl DrawingPipeline {
             anchor_pipeline,
             bind_group_layout,
         }
-    }
-
-    fn create_pipeline(
-        device: &wgpu::Device,
-        layout: &wgpu::PipelineLayout,
-        shader: &wgpu::ShaderModule,
-        vs_entry: &str,
-        fs_entry: &str,
-        label: &str,
-        format: wgpu::TextureFormat,
-    ) -> wgpu::RenderPipeline {
-        device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some(label),
-            layout: Some(layout),
-            vertex: wgpu::VertexState {
-                module: shader,
-                entry_point: Some(vs_entry),
-                buffers: &[],
-                compilation_options: wgpu::PipelineCompilationOptions::default(),
-            },
-            fragment: Some(wgpu::FragmentState {
-                module: shader,
-                entry_point: Some(fs_entry),
-                targets: &[Some(wgpu::ColorTargetState {
-                    format,
-                    blend: Some(wgpu::BlendState::ALPHA_BLENDING),
-                    write_mask: wgpu::ColorWrites::ALL,
-                })],
-                compilation_options: wgpu::PipelineCompilationOptions::default(),
-            }),
-            primitive: wgpu::PrimitiveState {
-                topology: wgpu::PrimitiveTopology::TriangleList,
-                strip_index_format: None,
-                front_face: wgpu::FrontFace::Ccw,
-                cull_mode: None,
-                polygon_mode: wgpu::PolygonMode::Fill,
-                unclipped_depth: false,
-                conservative: false,
-            },
-            depth_stencil: None,
-            multisample: wgpu::MultisampleState {
-                count: 1,
-                mask: !0,
-                alpha_to_coverage_enabled: false,
-            },
-            multiview: None,
-            cache: None,
-        })
     }
 
     // =========================================================================
@@ -594,11 +507,7 @@ impl DrawingPipeline {
             };
             MAX_DRAWING_HRAYS
         ];
-        device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("Drawing HRay Buffer"),
-            contents: bytemuck::cast_slice(&initial),
-            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
-        })
+        SharedLayouts::create_storage_buffer(device, "Drawing HRay Buffer", &initial)
     }
 
     /// Create the ray buffer.
@@ -616,11 +525,7 @@ impl DrawingPipeline {
             };
             MAX_DRAWING_RAYS
         ];
-        device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("Drawing Ray Buffer"),
-            contents: bytemuck::cast_slice(&initial),
-            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
-        })
+        SharedLayouts::create_storage_buffer(device, "Drawing Ray Buffer", &initial)
     }
 
     /// Create the rectangle buffer.
@@ -642,11 +547,7 @@ impl DrawingPipeline {
             };
             MAX_DRAWING_RECTS
         ];
-        device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("Drawing Rect Buffer"),
-            contents: bytemuck::cast_slice(&initial),
-            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
-        })
+        SharedLayouts::create_storage_buffer(device, "Drawing Rect Buffer", &initial)
     }
 
     /// Create the anchor buffer.
@@ -660,11 +561,7 @@ impl DrawingPipeline {
             };
             MAX_DRAWING_ANCHORS
         ];
-        device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("Drawing Anchor Buffer"),
-            contents: bytemuck::cast_slice(&initial),
-            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
-        })
+        SharedLayouts::create_storage_buffer(device, "Drawing Anchor Buffer", &initial)
     }
 
     /// Create the params buffer.
@@ -683,11 +580,7 @@ impl DrawingPipeline {
             _padding1: 0,
             _padding2: 0,
         };
-        device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("Drawing Params Buffer"),
-            contents: bytemuck::cast_slice(&[params]),
-            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-        })
+        SharedLayouts::create_uniform_buffer(device, "Drawing Params Buffer", &params)
     }
 
     /// Create the bind group.
@@ -700,32 +593,12 @@ impl DrawingPipeline {
         anchor_buffer: &wgpu::Buffer,
         params_buffer: &wgpu::Buffer,
     ) -> wgpu::BindGroup {
-        device.create_bind_group(&wgpu::BindGroupDescriptor {
-            layout: &self.bind_group_layout,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: hray_buffer.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: ray_buffer.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 2,
-                    resource: rect_buffer.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 3,
-                    resource: anchor_buffer.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 4,
-                    resource: params_buffer.as_entire_binding(),
-                },
-            ],
-            label: Some("Drawing Bind Group"),
-        })
+        SharedLayouts::create_bind_group(
+            device,
+            "Drawing Bind Group",
+            &self.bind_group_layout,
+            &[hray_buffer, ray_buffer, rect_buffer, anchor_buffer, params_buffer],
+        )
     }
 
     // =========================================================================
